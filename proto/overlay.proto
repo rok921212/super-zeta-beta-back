@@ -1,0 +1,156 @@
+// overlay.proto — wire schema for the public-overlay socket broadcasts
+// (liveMatchUpdate / overallDataUpdate on the round:${tid}:${rid}:* rooms).
+//
+// This file is the source of truth for Render_hosted/test-back. There is no
+// monorepo/shared-package tooling across the three repos in this project
+// (backend, front, desktop-app each have their own .git), so front/src/proto
+// keeps a hand-mirrored copy — same manual-sync convention already used for
+// the VIEWS_NEEDING_* tables (see Bulkpublic.controller.js). If you change a
+// field here, update front/src/proto/overlay.proto to match, then regenerate
+// both sides (`npm run proto:gen` in each repo).
+//
+// Player's frequently-changing stat/state fields (below) use `optional` —
+// this is what backs the player-level delta in matchTeamDiff.js's
+// computeChangedPlayerFields: the backend only sets a field on an included
+// player when it actually changed since the previous tick, and proto3's
+// `optional` gives that free, native wire-presence tracking (an unset
+// optional field costs 0 bytes — cheaper than any hand-rolled bitmask).
+// protobufjs implements `optional` as a synthetic one-field oneof, and its
+// generated toObject() respects that field's real presence regardless of
+// the `defaults` option (defaults only backfills genuinely-non-optional
+// zero-valued fields) — so PublicThemeRenderer.tsx's decodeWireMessage
+// needs NO change to keep using `{ defaults: true }`; an absent optional
+// field already decodes as absent, not 0. Verified in
+// scripts/verify-protobuf-delta.js. The client then merges a present field
+// onto the previously-known player rather than replacing it. Identity
+// fields (uId/docId/teamId/etc.) and rarely-changing display strings
+// (playerName/picUrl/etc.) are NOT optional — they're cheap, change rarely,
+// and always riding along keeps the merge logic simpler.
+syntax = "proto3";
+package overlay;
+
+message Vec3 {
+  float x = 1;
+  float y = 2;
+  float z = 3;
+}
+
+// Shared by both the live-match tier (liveMatchUpdate) and the
+// overall-standings tier (overallDataUpdate) — aggregateOverallTeams
+// (overall.controller.js) carries the same NUMERIC_PLAYER_FIELDS list as the
+// live path, so a separate summary message isn't justified by field count.
+message Player {
+  string uId = 1;
+  string playerName = 2;
+  string playerOpenId = 3;
+  string picUrl = 4;
+  string showPicUrl = 5;
+  string character = 6;
+  // Confirmed via matchData.model.js (schema says String) vs. the actual hot
+  // live-tick assignment in pubgApiMatchData.controller.js (`teamIdfromApi:
+  // team.slot`, a Number, at both finalPlayer construction sites) — this
+  // path genuinely sends a number, so the wire type follows the real data,
+  // not the (inconsistent) Mongoose schema declaration.
+  int32 teamIdfromApi = 7;
+  int32 teamId = 8;
+  string teamName = 9;
+
+  optional Vec3 location = 10;
+  optional int32 health = 11;
+  optional int32 healthMax = 12;
+  optional int32 liveState = 13;
+  optional bool isFiring = 14;
+  optional bool bHasDied = 15;
+  optional bool isOutsideBlueCircle = 16;
+
+  optional int32 killNum = 20;
+  optional int32 killNumBeforeDie = 21;
+  optional int32 gotAirDropNum = 22;
+  optional int32 maxKillDistance = 23;
+  optional int32 damage = 24;
+  optional int32 killNumInVehicle = 25;
+  optional int32 killNumByGrenade = 26;
+  // AIKillNum/BossKillNum/inDamage/outsideBlueCircleTime/PoisonTotalDamage/
+  // UseSelfRescueTime/UseEmergencyCallTime deliberately stay NON-optional —
+  // protobufCodec.js's toProtoPlayer already hardcodes them to 0
+  // unconditionally (confirmed dead weight, no view reads them), and proto3
+  // already omits a non-optional zero-valued scalar from the wire for free,
+  // so there's nothing for `optional` to buy here.
+  int32 AIKillNum = 27;
+  int32 BossKillNum = 28;
+  optional int32 rank = 29;
+  int32 inDamage = 30;
+  optional int32 headShotNum = 31;
+  optional int32 survivalTime = 32;
+  optional int32 driveDistance = 33;
+  optional int32 marchDistance = 34;
+  optional int32 assists = 35;
+  int32 outsideBlueCircleTime = 36;
+  optional int32 knockouts = 37;
+  optional int32 rescueTimes = 38;
+  optional int32 useSmokeGrenadeNum = 39;
+  optional int32 useFragGrenadeNum = 40;
+  optional int32 useBurnGrenadeNum = 41;
+  optional int32 useFlashGrenadeNum = 42;
+  int32 PoisonTotalDamage = 43;
+  int32 UseSelfRescueTime = 44;
+  int32 UseEmergencyCallTime = 45;
+  optional int32 contribution = 46;
+  optional int32 heal = 47;
+  // matchData.model.js's playerStatsSchema declares `{ _id: true }` — every
+  // player subdoc gets its OWN Mongo ObjectId, separate from `uId` (PUBG's
+  // player identifier). front's shared Player type (unsortteams.ts) treats
+  // `_id` as required (used for React keys / ref lookups / merge-by-id), so
+  // it must survive the wire regardless of encoding. Proto identifiers
+  // can't start with `_` (grammar: letter first), so this is named `docId`
+  // here and remapped back to `_id` client-side immediately after decode —
+  // see PublicThemeRenderer.tsx's remapProtoPlayer.
+  string docId = 48;
+}
+
+message Team {
+  // teamMatchDataSchema.teamId is itself a Mongo ObjectId reference to the
+  // Team collection (`ref: 'Team'`) — NOT a PUBG numeric id (that's
+  // Player.teamIdfromApi/teamId above). Separately, the team SUBDOC itself
+  // also gets its own Mongo _id (`{ _id: true }` on the schema) — two
+  // distinct ObjectIds. front's shared Team type (unsortteams.ts) requires
+  // `_id` and optionally reads `teamId`, and PublicThemeRenderer's merge
+  // keys off `String(t.teamId ?? t._id)` — both must survive the wire
+  // as separate values, not be collapsed into one. `docId` -> `_id` remap
+  // client-side, same reasoning as Player.docId above.
+  string teamId = 1;
+  string docId = 2;
+  string teamName = 3;
+  string teamTag = 4;
+  string teamLogo = 5;
+  int32 slot = 6;
+  int32 placePoints = 7;
+  int32 rank = 8;            // live-tier only
+  int32 wwcd = 9;            // overall-tier only
+  int32 matchesPlayed = 10;  // overall-tier only
+  repeated Player players = 11;
+}
+
+// liveMatchUpdate payload. Deliberately has NO deadTeamList field — verified
+// the frontend never reads matchData.deadTeamList off the wire (it computes
+// its own client-side; see PublicThemeRenderer.tsx's DeadTeamListEntry
+// comment: "No longer sourced from the backend's matchData.deadTeamList
+// field").
+message MatchDataPayload {
+  string matchId = 1;
+  repeated Team teams = 2;
+  reserved 3; // isPartialTeams — only set by Bulkpublic.controller.js's HTTP-bulk diffing path, never the direct socket-emit path this schema covers. Reserved as a future on-ramp, not populated today.
+}
+
+// overallDataUpdate payload. Matches the plain object actually built at the
+// three real emit call sites (pubgApiMatchData.controller.js,
+// matchData.controller.js, overall.controller.js) — NOT
+// Bulkpublic.controller.js's HTTP-only getOverallForRound shape (which adds
+// totalMatches and is unrelated to this socket path).
+message OverallDataPayload {
+  string tournamentId = 1;
+  string roundId = 2;
+  string matchId = 3;
+  repeated Team teams = 4;
+  string createdAt = 5; // ISO string
+}

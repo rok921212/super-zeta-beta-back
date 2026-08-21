@@ -1,0 +1,396 @@
+const mongoose = require('mongoose');
+const Match = require('../models/match.model');
+const MatchData = require('../models/matchData.model');
+const Round = require('../models/round.model');
+const Tournament = require('../models/tournament.model');
+const { getSocket } = require('../socket');
+const { encodeMsgpack } = require('../utils/msgpackCodec');
+const { emitToRoomSplitByFormat } = require('../utils/roomEmit');
+const { toProtoOverallDataPayload } = require('../utils/protobufCodec');
+
+// Numeric player fields to aggregate (sum)
+const NUMERIC_PLAYER_FIELDS = [
+  'health',
+  'healthMax',
+  'liveState',
+  'killNum',
+  'killNumBeforeDie',
+  'gotAirDropNum',
+  'maxKillDistance',
+  'damage',
+  'heal',
+  'killNumInVehicle',
+  'killNumByGrenade',
+  'AIKillNum',
+  'BossKillNum',
+  'rank',
+  'inDamage',
+  'headShotNum',
+  'survivalTime',
+  'driveDistance',
+  'marchDistance',
+  'assists',
+  'outsideBlueCircleTime',
+  'knockouts',
+  'rescueTimes',
+  'useSmokeGrenadeNum',
+  'useFragGrenadeNum',
+  'useBurnGrenadeNum',
+  'useFlashGrenadeNum',
+  'PoisonTotalDamage',
+  'UseSelfRescueTime',
+  'UseEmergencyCallTime',
+  'contribution'
+];
+
+// `|| 0` doesn't catch a negative number (e.g. PCOB's raw -1 "not populated
+// yet" sentinel on fields like rank) since it's truthy — same bug class
+// documented in pubgApiMatchData.controller.js's `nonNeg`. Guard explicitly
+// so a leaked negative never sums straight into the round-wide aggregate.
+const nonNeg = (v) => (typeof v === 'number' && v > 0) ? Math.trunc(v) : 0;
+
+function sumNumericFields(target, source, fields) {
+  for (const f of fields) {
+    const a = nonNeg(Number(target[f]));
+    const b = nonNeg(Number(source[f]));
+    target[f] = a + b;
+  }
+}
+
+// Build an initial player aggregate object based on incoming player doc
+function buildInitialAggPlayer(p) {
+  const base = {
+    uId: p.uId || '',
+    _id: p._id, // MongoDB player ObjectId
+    playerName: p.playerName || '',
+    playerOpenId: p.playerOpenId || '',
+    picUrl: p.picUrl || '',
+    showPicUrl: p.showPicUrl || '',
+    character: p.character || '',
+    isFiring: false,
+    bHasDied: false,
+    location: { x: 0, y: 0, z: 0 },
+    health: 0,
+    healthMax: 0,
+    liveState: 0,
+    killNum: 0,
+    killNumBeforeDie: 0,
+    playerKey: p.playerKey || '',
+    gotAirDropNum: 0,
+    maxKillDistance: 0,
+    damage: 0,
+    heal: 0,
+    killNumInVehicle: 0,
+    killNumByGrenade: 0,
+    AIKillNum: 0,
+    BossKillNum: 0,
+    rank: 0,
+    isOutsideBlueCircle: false,
+    inDamage: 0,
+    headShotNum: 0,
+    survivalTime: 0,
+    driveDistance: 0,
+    marchDistance: 0,
+    assists: 0,
+    outsideBlueCircleTime: 0,
+    knockouts: 0,
+    rescueTimes: 0,
+    useSmokeGrenadeNum: 0,
+    useFragGrenadeNum: 0,
+    useBurnGrenadeNum: 0,
+    useFlashGrenadeNum: 0,
+    PoisonTotalDamage: 0,
+    UseSelfRescueTime: 0,
+    UseEmergencyCallTime: 0,
+    teamIdfromApi: p.teamIdfromApi || '',
+    contribution: 0,
+  };
+  return base;
+}
+
+// Helper function to compute overall aggregated matchData for a round
+// Helper: within a single match, a player's uId can appear multiple times as
+// progressive snapshots (stats are cumulative, not deltas). Keep only the
+// "final" snapshot — the one with the greatest survivalTime.
+function dedupPlayersWithinMatch(players) {
+  const map = new Map();
+  for (const p of players || []) {
+    const key = p.uId || '';
+    const current = map.get(key);
+    if (!current) {
+      map.set(key, { ...p });
+      continue;
+    }
+    const currentSurvival = Number(current.survivalTime || 0);
+    const incomingSurvival = Number(p.survivalTime || 0);
+    if (incomingSurvival >= currentSurvival) {
+      map.set(key, { ...p });
+    }
+  }
+  return Array.from(map.values());
+}
+
+// Shared aggregation core — turns an array of already-resolved MatchData docs
+// into standings. Used by both computeOverallMatchDataForRound (below) and
+// Bulkpublic.controller.js's getOverallForRound, so the dashboard/live-socket
+// path and the public bulk/overlay path always compute the exact same
+// numbers instead of drifting apart via two hand-maintained implementations.
+//
+// Player aggregation is scoped PER TEAM (a Map on each aggTeam), not one map
+// shared across every team in the round — a global map would silently merge
+// one player's stats onto every team that happens to share their uId (see
+// the cross-team playerId collision fixed in pubgApiMatchData.controller.js's
+// uidToTeam building).
+function aggregateOverallTeams(matchDataDocs) {
+  // Deduplicate MatchData documents by matchId (there should only be one
+  // per match, but if duplicates ever exist, keep the most recently updated one)
+  const uniqueMatchDatasMap = new Map();
+  for (const md of matchDataDocs || []) {
+    const key = md.matchId.toString();
+    const existingDoc = uniqueMatchDatasMap.get(key);
+    if (
+      !existingDoc ||
+      (md.updatedAt && existingDoc.updatedAt && new Date(md.updatedAt) > new Date(existingDoc.updatedAt))
+    ) {
+      uniqueMatchDatasMap.set(key, md);
+    }
+  }
+  const uniqueMatchDatas = Array.from(uniqueMatchDatasMap.values());
+
+  // Deduplicate players within each match's teams by uId, keeping the final snapshot
+  const deduplicatedMatchDatas = uniqueMatchDatas.map(md => ({
+    ...md,
+    teams: (md.teams || []).map(team => ({
+      ...team,
+      players: dedupPlayersWithinMatch(team.players),
+    })),
+  }));
+
+  const teamsMap = new Map(); // key: teamId string -> aggregated team (players Map scoped per team)
+
+  for (const md of deduplicatedMatchDatas) {
+    const seenTeamIds = new Set();
+    for (const team of md.teams || []) {
+      const teamKey = team.teamId.toString();
+      // Defensive: two teams[] subdocuments sharing a teamId within the
+      // SAME MatchData would otherwise double-count placePoints/wwcd.
+      if (seenTeamIds.has(teamKey)) {
+        console.warn(`[aggregateOverallTeams] duplicate teamId ${teamKey} in matchData ${md._id} — skipping to avoid double-counting`);
+        continue;
+      }
+      seenTeamIds.add(teamKey);
+
+      if (!teamsMap.has(teamKey)) {
+        teamsMap.set(teamKey, {
+          teamId: team.teamId,
+          teamName: team.teamName || '',
+          teamTag: team.teamTag || '',
+          teamLogo: team.teamLogo || '',
+          slot: Number.isFinite(team.slot) ? team.slot : 0,
+          placePoints: 0,
+          wwcd: 0,
+          matchIds: new Set(),  // track distinct matches this team appeared in
+          players: new Map(),   // uId -> aggregated player, scoped to THIS team
+        });
+      }
+
+      const aggTeam = teamsMap.get(teamKey);
+      // Identity fields (name/tag/logo) reflect the LATEST match, not the
+      // first — a mid-round rebrand/logo change should propagate to the
+      // overall standings. Matches the player identity fields below, which
+      // already overwrite on every truthy value instead of only-if-empty.
+      if (team.teamName) aggTeam.teamName = team.teamName;
+      if (team.teamTag) aggTeam.teamTag = team.teamTag;
+      if (team.teamLogo) aggTeam.teamLogo = team.teamLogo;
+
+      if (Number.isFinite(team.slot)) {
+        aggTeam.slot = Math.min(aggTeam.slot || team.slot, team.slot);
+      }
+
+      aggTeam.placePoints += Number(team.placePoints || 0);
+      // Prefer the real computed rank; only fall back to the placePoints
+      // heuristic for older docs written before `rank` was persisted.
+      const isWinner = team.rank === 1 || (!team.rank && Number(team.placePoints || 0) === 10);
+      if (isWinner) {
+        aggTeam.wwcd += 1;
+      }
+
+      aggTeam.matchIds.add(md.matchId.toString());
+
+      // Aggregate players per-team by uId (sum each match's final stats across matches)
+      for (const p of team.players || []) {
+        const pKey = p.uId || p._id.toString();
+        if (!aggTeam.players.has(pKey)) {
+          aggTeam.players.set(pKey, buildInitialAggPlayer(p));
+        }
+        const aggPlayer = aggTeam.players.get(pKey);
+
+        if (p.playerName) aggPlayer.playerName = p.playerName;
+        if (p.picUrl) aggPlayer.picUrl = p.picUrl;
+        if (p.showPicUrl) aggPlayer.showPicUrl = p.showPicUrl;
+        if (p.character) aggPlayer.character = p.character;
+        if (p.playerOpenId) aggPlayer.playerOpenId = p.playerOpenId;
+        if (p.uId) aggPlayer.uId = p.uId;
+        if (p.teamIdfromApi) aggPlayer.teamIdfromApi = p.teamIdfromApi;
+
+        sumNumericFields(aggPlayer, p, NUMERIC_PLAYER_FIELDS);
+      }
+    }
+  }
+
+  // Convert to arrays, sort teams by slot asc, expose matchesPlayed
+  const aggregatedTeams = Array.from(teamsMap.values()).map(t => ({
+    teamId: t.teamId,
+    teamName: t.teamName,
+    teamTag: t.teamTag,
+    teamLogo: t.teamLogo,
+    slot: t.slot || 0,
+    placePoints: t.placePoints,
+    wwcd: t.wwcd,
+    matchesPlayed: t.matchIds.size,
+    players: Array.from(t.players.values()),
+  })).sort((a, b) => (a.slot || 0) - (b.slot || 0));
+
+  // Final safety net: no duplicate uId within a team's players
+  for (const t of aggregatedTeams) {
+    t.players = Array.from(new Map(t.players.map(p => [p.uId, p])).values());
+  }
+
+  return aggregatedTeams;
+}
+
+// ─── Round/Match metadata cache ───────────────────────────────────────────
+// computeOverallMatchDataForRound runs on the live-emit hot path (every
+// changed tick, per active match) and previously paid 4 DB round trips just
+// to re-verify round/match existence and re-fetch the round's match list —
+// data that essentially never changes tick-to-tick. Cache it briefly per
+// (roundId, userId); a short TTL means any real structural change (a match
+// added/removed from the round) is picked up within a few seconds instead
+// of instantly, which is an acceptable tradeoff on this path.
+const ROUND_META_TTL_MS = 5000;
+const roundMetaCache = new Map(); // `${roundId}:${userId||''}` -> { matchIds, matchIdSet, provisioned, expiresAt }
+
+async function getRoundMeta(tournamentId, roundId, userId) {
+  const cacheKey = `${roundId}:${userId || ''}`;
+  const cached = roundMetaCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached;
+
+  // Verify round exists (skip ownership for public routes)
+  const round = await Round.findOne({ _id: roundId, tournamentId, ...(userId && { createdBy: userId }) }).lean();
+  if (!round) throw new Error('Round not found');
+
+  // Fetch all matches for this tournament/round
+  const matches = await Match.find({ tournamentId, roundId, ...(userId && { userId }) }, { _id: 1, matchNo: 1 }).sort({ matchNo: 1 }).lean();
+  const matchIds = matches.map(m => m._id);
+  const matchIdSet = new Set(matchIds.map(id => id.toString()));
+
+  const entry = { matchIds, matchIdSet, provisioned: false, expiresAt: Date.now() + ROUND_META_TTL_MS };
+  roundMetaCache.set(cacheKey, entry);
+  return entry;
+}
+
+const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, userId) => {
+  const meta = await getRoundMeta(tournamentId, roundId, userId);
+
+  // matchId existence/ownership is now a membership check against the
+  // already-scoped (tournamentId/roundId/userId) match list instead of a
+  // separate Match.findOne round trip.
+  if (!meta.matchIdSet.has(String(matchId))) throw new Error('Match not found');
+
+  const { matchIds } = meta;
+  if (!matchIds || matchIds.length === 0) {
+    return [];
+  }
+
+  // Ensure matchData exists for each match (create if missing). Once a
+  // round has been fully "provisioned" (every match has a MatchData doc),
+  // that stays true forever — MatchData docs are never deleted out from
+  // under a match — so skip re-checking existence on every tick and only
+  // do it once per cache window.
+  if (!meta.provisioned) {
+    const existing = await MatchData.find({ matchId: { $in: matchIds }, ...(userId && { userId }) }).select('_id matchId').lean();
+    const existingMap = new Map(existing.map(md => [md.matchId.toString(), md._id]));
+
+    // Required lazily (not at module top level): matchData.controller.js also
+    // requires this file (for computeOverallMatchDataForRound), and a
+    // top-level circular require here previously left createMatchDataForMatchDoc
+    // resolved to undefined depending on which module loaded first — silently
+    // skipping MatchData creation (and that match's points) for any match that
+    // never got a MatchData doc. Requiring it here, after both modules have
+    // finished loading, always gets the real function.
+    const { createMatchDataForMatchDoc } = require('./matchData.controller');
+
+    let allPresent = true;
+    for (const m of matchIds) {
+      if (!existingMap.has(m.toString())) {
+        allPresent = false;
+        try {
+          await createMatchDataForMatchDoc(m);
+        } catch (e) {
+          console.warn('Could not create MatchData for match', m.toString(), e?.message || e);
+        }
+      }
+    }
+    meta.provisioned = true; // best-effort: don't retry every tick even if a create failed
+  }
+
+  // Load all matchData after attempting creation
+  const matchDatas = await MatchData.find({ matchId: { $in: matchIds }, ...(userId && { userId }) }).lean();
+
+  // MatchData.find({$in: matchIds}) does not guarantee results come back in
+  // matchIds order — but aggregateOverallTeams treats "last processed" as
+  // the source of truth for identity fields (teamName/teamTag/teamLogo/
+  // picUrl/etc.), so processing order must reflect real match order.
+  // matchIds is already matchNo-sorted (see getRoundMeta), so re-order by it.
+  const matchDataByMatchId = new Map(matchDatas.map(md => [md.matchId.toString(), md]));
+  const orderedMatchDatas = matchIds.map(id => matchDataByMatchId.get(id.toString())).filter(Boolean);
+
+  return aggregateOverallTeams(orderedMatchDatas);
+};
+
+// GET overall aggregated matchData for a round in a tournament
+// Response mirrors matchData structure: { teams: [ { teamId, teamName, teamTag, teamLogo, slot, placePoints, players: [...] } ] }
+const getOverallMatchDataForRound = async (req, res) => {
+  try {
+    const userId = req.session && req.session.userId;
+
+    const { tournamentId, roundId, matchId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(tournamentId) || !mongoose.Types.ObjectId.isValid(roundId) || !mongoose.Types.ObjectId.isValid(matchId)) {
+      return res.status(400).json({ error: 'Invalid tournamentId, roundId, or matchId' });
+    }
+
+    const aggregatedTeams = await computeOverallMatchDataForRound(tournamentId, roundId, matchId, userId);
+
+    // Emit overall data via socket for real-time updates — scoped to this
+    // tournament/round's room (was a global io.emit(), leaking every
+    // tournament's standings to every connected socket).
+    try {
+      const io = getSocket();
+      const room = `round:${tournamentId}:${roundId}:overall`;
+      console.log(`[bw][overall] overallDataUpdate (HTTP-triggered) -> ${room} teams=${aggregatedTeams.length}`);
+      // This room is the public overlay's (PublicThemeRenderer.tsx) —
+      // always encoded (protobuf or msgpack per each socket's negotiated
+      // format), unlike the plain-JSON user:${userId} emits used elsewhere
+      // for the authenticated dashboard.
+      emitToRoomSplitByFormat(io, room, 'overallDataUpdate', {
+        protoMessageName: 'OverallDataPayload',
+        mapToProto: toProtoOverallDataPayload,
+        data: { tournamentId, roundId, matchId, teams: aggregatedTeams, createdAt: new Date() },
+        volatile: false,
+      });
+    } catch (socketError) {
+      console.warn('Failed to emit overall data via socket:', socketError.message);
+    }
+
+    return res.json({ tournamentId, roundId, matchId, ...(userId && { userId }), teams: aggregatedTeams, createdAt: new Date() });
+  } catch (error) {
+    console.error('Error generating overall matchData:', error);
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+module.exports = {
+  getOverallMatchDataForRound,
+  computeOverallMatchDataForRound,
+  aggregateOverallTeams,
+};
