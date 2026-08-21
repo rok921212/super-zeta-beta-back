@@ -958,8 +958,8 @@ function startLiveMatchUpdater() {
       console.log(`[bw][room] socket ${socket.id} leaveRoundRoom tournamentId=${tournamentId} roundId=${roundId}`);
     });
 
-    socket.on('disconnect', () => {
-      console.log(c('dim', `[socket] client disconnected: ${socket.id}`));
+    socket.on('disconnect', (reason) => {
+      console.log(c('dim', `[socket] client disconnected: ${socket.id} (reason=${reason})`));
       clearSocketWireFormat(socket.id);
       const userId = socketIdToUserId.get(socket.id);
       socketIdToUserId.delete(socket.id);
