@@ -613,7 +613,6 @@ function startLiveMatchUpdater() {
     const sessionUserId = socket.request.session?.userId;
     if (sessionUserId) {
       socket.join(`user:${sessionUserId}`);
-      console.log(c('cyan', `[socket] dashboard auto-joined room user:${sessionUserId} (${socket.id})`));
 
       // Bandwidth: this dashboard socket can declare msgpack support for the
       // user: room's liveMatchUpdate via ?msgpackLiveUpdate=1 on the connect
@@ -622,7 +621,7 @@ function startLiveMatchUpdater() {
       // splitUserRoomForLiveUpdate below for why).
       const supportsMsgpack = socket.handshake.query?.msgpackLiveUpdate === '1';
       socket.data.supportsMsgpackLiveUpdate = supportsMsgpack;
-      console.log(`[bw][wire-format] dashboard socket ${socket.id} supportsMsgpackLiveUpdate=${supportsMsgpack} (query=${JSON.stringify(socket.handshake.query?.msgpackLiveUpdate)})`);
+      console.log(c('cyan', `[socket] dashboard joined user:${sessionUserId} (${socket.id}) wire=${supportsMsgpack ? 'msgpack' : 'json'}`));
     }
 
     // Each relay identifies which user it belongs to before pushing data.
@@ -648,19 +647,55 @@ function startLiveMatchUpdater() {
     if (typeof callback === 'function') callback(payload);
   };
 
-  if (!relayToken) {
-    console.warn(c('yellow', `[socket] registerRelay from ${socket.id} missing relayToken`));
-    ack({ ok: false, reason: 'missing relayToken' });
-    return;
-  }
+  // DIAGNOSTIC: logged unconditionally, before any await, so a registerRelay
+  // that never gets this far (vs. one that arrives but then stalls/dies
+  // inside the DB lookup below) is distinguishable from the outside.
+  const registerStartedAt = Date.now();
+  console.log(c('dim', `[socket][registerRelay] received from ${socket.id} (mongoose readyState=${mongoose.connection.readyState})`));
 
-  const user = await User.findOne({ relayToken }).select('_id').lean();
-  if (!user) {
-    console.warn(c('yellow', `[socket] registerRelay from ${socket.id} presented an unknown relayToken`));
-    ack({ ok: false, reason: 'unknown relayToken' });
-    return;
-  }
-  const key = String(user._id);
+  // The entire handler used to run with no try/catch. If User.findOne below
+  // ever threw (or hung — see the race/timeout added there), this async
+  // event handler died silently: no ack() call, no log line, nothing —
+  // completely indistinguishable from the server never having received
+  // registerRelay at all. That silent-death path is what let a slow/broken
+  // Mongoose connection look identical to a transport/protocol bug from the
+  // Rust side, which only ever sees "ack timed out after 5s". Wrapping the
+  // whole handler guarantees SOME ack + log line comes back every time.
+  try {
+    if (!relayToken) {
+      console.warn(c('yellow', `[socket] registerRelay from ${socket.id} missing relayToken`));
+      ack({ ok: false, reason: 'missing relayToken' });
+      return;
+    }
+
+    // This repo has already hit "Mongoose silently stalls against Atlas
+    // when deployed on Render, but not locally" once before (see TODO.md's
+    // "Fix Render Mongoose Timeout Issue" — its bufferTimeoutMS fix never
+    // actually made it into index.js's mongoose.connect() call). Mongoose's
+    // own default bufferTimeoutMS is 10s, comfortably longer than the Rust
+    // relay's fixed 5s REGISTER_ACK_TIMEOUT (fetcher.rs) — so a buffering
+    // stall in that 5-10s window lets Rust give up and disconnect long
+    // before this line would have thrown or resolved on its own. Racing it
+    // against an explicit 3s timeout makes the failure fast and LOUD
+    // instead of silently outliving the caller.
+    const REGISTER_DB_LOOKUP_TIMEOUT_MS = 3000;
+    const user = await Promise.race([
+      User.findOne({ relayToken }).select('_id').lean(),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`User.findOne timed out after ${REGISTER_DB_LOOKUP_TIMEOUT_MS}ms (mongoose readyState=${mongoose.connection.readyState})`)),
+          REGISTER_DB_LOOKUP_TIMEOUT_MS,
+        )
+      ),
+    ]);
+    console.log(c('dim', `[socket][registerRelay] DB lookup for ${socket.id} took ${Date.now() - registerStartedAt}ms`));
+
+    if (!user) {
+      console.warn(c('yellow', `[socket] registerRelay from ${socket.id} presented an unknown relayToken`));
+      ack({ ok: false, reason: 'unknown relayToken' });
+      return;
+    }
+    const key = String(user._id);
 
   // Evict any other socket already registered for this same user — this is
   // what happens when the app restarts without a clean disconnect: the old
@@ -719,8 +754,12 @@ function startLiveMatchUpdater() {
     socket.emit('requestFullSnapshot');
   }
 
-  console.log(c('cyan', `[socket] relay registered → user ${key} (${socket.id})`));
+  console.log(c('cyan', `[socket] relay registered → user ${key} (${socket.id}, ${Date.now() - registerStartedAt}ms total)`));
   ack({ ok: true, userId: key });
+  } catch (err) {
+    console.error(c('red', `[socket][registerRelay] handler FAILED for ${socket.id} after ${Date.now() - registerStartedAt}ms: ${err.message}`));
+    ack({ ok: false, reason: 'internal error' });
+  }
 });
 
     socket.on('totalPlayerList', (raw) => {
@@ -744,6 +783,12 @@ function startLiveMatchUpdater() {
         );
         return;
       }
+
+      // Wire size (bytes actually received over the socket, compressed) —
+      // logged below alongside the tick's player counts so bandwidth usage
+      // is visible per-tick without needing a separate instrumentation pass.
+      const wireBytes = Buffer.isBuffer(raw) ? raw.length
+        : (raw instanceof ArrayBuffer ? raw.byteLength : (raw?.length ?? 0));
 
       // Decode the MessagePack binary payload back into a plain object
       // before anything else touches it.
@@ -845,11 +890,10 @@ function startLiveMatchUpdater() {
       const players = Array.from(state.players.values());
       liveApiPlayersByUser.set(userId, { players, at: Date.now() });
 
-      console.log(
-        `${c('dim', `[${new Date().toLocaleTimeString()}]`)} ` +
-        `${c('cyan', '📡 received totalPlayerList')} ` +
-        `(${c('bold', String(incomingPlayers.length))}/${players.length} players, ${isFull ? 'full' : 'delta'}, wireSeq=${wireSeq ?? 'n/a'}) user=${userId} socket=${socket.id}`
-      );
+      // BANDWIDTH + SOCKET: the one line that matters for "are we getting
+      // data, and how much is it costing us" — wire bytes actually received
+      // (post-compression), full vs delta, and player counts, per tick.
+      console.log(`[socket] rx totalPlayerList user=${userId} ${wireBytes}B ${isFull ? 'full' : 'delta'} seq=${wireSeq ?? 'n/a'} players=${incomingPlayers.length}/${players.length}`);
 
       // Leading+trailing per user: bursts from ONE user's relay still
       // coalesce (trailing fire), but an isolated tick (the common case at

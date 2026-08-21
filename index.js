@@ -46,14 +46,11 @@ app.use(compression());
 
 // Auto-detect production environment
 const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER === 'true' || process.env.REACT_APP_API_URL?.includes('render.com');
-console.log('🔧 Environment:', isProduction ? 'PRODUCTION' : 'DEVELOPMENT');
-console.log('🔧 NODE_ENV:', process.env.NODE_ENV);
-console.log('🔧 RENDER:', process.env.RENDER);
-console.log('🔧 REACT_APP_API_URL:', process.env.REACT_APP_API_URL);
 
 // For local development with IP addresses, treat as development
 const isLocalIP = process.env.NODE_ENV !== 'production' && !process.env.RENDER && !process.env.REACT_APP_API_URL?.includes('render.com');
-console.log('🔧 Local IP mode:', isLocalIP);
+
+console.log(`🔧 env=${isProduction ? 'production' : 'development'} NODE_ENV=${process.env.NODE_ENV} RENDER=${process.env.RENDER} localIP=${isLocalIP}`);
 
 // Force HTTPS in production to ensure backend is HTTPS (critical for iOS login)
 if (isProduction) {
@@ -574,6 +571,7 @@ async function startServer() {
       serverSelectionTimeoutMS: 10000,
       connectTimeoutMS: 10000,
       socketTimeoutMS: 45000,
+      bufferTimeoutMS: 30000,
       family: 4
     });
 

@@ -23,8 +23,6 @@ const createTournament = async (req, res) => {
 
 // --- GET ALL TOURNAMENTS (current user only) ---
 const getTournaments = async (req, res) => {
- console.log("Session in getTournaments:", req.session);
-console.log("UserID in getTournaments:", req.session?.userId);
   try {
     const tournaments = await Tournament.find({ userId: req.session.userId }).lean();
     res.json(tournaments);

@@ -92,7 +92,6 @@ setCache = async (key, value, ttlSeconds = 300, scope = 'anon') => {
 };
 
 deleteCache = async (key) => {
-  console.log('Deleting:', key);
   try {
     await redisClient.del(key);
   } catch (error) {
@@ -167,7 +166,6 @@ cacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
 
     const cached = await getCache(key);
     if (cached) {
-      console.log('CACHE HIT:', key);
       return res.json(cached);
     }
 
@@ -178,7 +176,6 @@ cacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
       // here means every request for this key returns that cached error (with
       // an implicit 200 on the cache-hit path above) until the TTL lapses.
       if (res.statusCode >= 200 && res.statusCode < 300) {
-        console.log('CACHE SAVE:', key);
         setCache(key, data, ttlSeconds, scope).catch(console.warn);
       }
       originalJson.call(this, data);
@@ -201,7 +198,6 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
 
     const cached = await getCache(key);
     if (cached) {
-      console.log('CACHE HIT:', key);
       res.set('Content-Type', 'application/msgpack');
       return res.send(encodeMsgpack(cached));
     }
@@ -209,7 +205,6 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
     res.json = function (data) {
       // See cacheMiddleware above for why this only caches on success.
       if (res.statusCode >= 200 && res.statusCode < 300) {
-        console.log('CACHE SAVE:', key);
         setCache(key, data, ttlSeconds, scope).catch(console.warn);
       }
       res.set('Content-Type', 'application/msgpack');
