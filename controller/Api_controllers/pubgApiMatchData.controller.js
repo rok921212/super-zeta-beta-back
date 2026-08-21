@@ -644,6 +644,11 @@ function startLiveMatchUpdater() {
   // Guarded so a relay build still doing a plain (non-ack) emit — where
   // socket.io hands us `callback === undefined` — is unaffected.
   const ack = (payload) => {
+    // DIAGNOSTIC: symmetric with the Rust relay's client-side ack logging
+    // (fetcher.rs await_register_ack). Covers every ack(...) call site
+    // below. No relayToken/secret logged — only the boolean outcome and,
+    // when present, the non-sensitive reason string.
+    console.log(c('dim', `[socket][registerRelay] sending ACK to ${socket.id}: ok=${payload.ok}${payload.reason ? ` reason=${payload.reason}` : ''}`));
     if (typeof callback === 'function') callback(payload);
   };
 
