@@ -3,7 +3,7 @@ const matchSelectionController = require('../controller/MatchSelection.controlle
 const isPollingActiveController = require('../controller/isPollingactive.controller.js');
 
 const requireAuth = require('../authMiddleware.js'); // your session auth
-const { cacheMiddleware } = require('../middleware/cache.js');
+const { cacheMiddleware, invalidateCacheMiddleware } = require('../middleware/cache.js');
 const router = express.Router();
 
 
@@ -12,9 +12,15 @@ const router = express.Router();
 router.get('/:matchId/polling', requireAuth, cacheMiddleware(), isPollingActiveController.getPollingStatus);
 
 // PATCH update polling status for a specific match inside a specific tournament & round
+// invalidateCacheMiddleware() with no keysOrFn: this also flips
+// isPollingActive off for every OTHER MatchSelection in the round
+// (updatePollingStatus's updateMany), whose matchIds aren't known from
+// req.params, so per-id prefixes can't cover them — the scope-wide
+// fallback is the documented safety net for exactly this case.
 router.patch(
   '/:tournamentId/:roundId/:matchId/polling',
   requireAuth,
+  invalidateCacheMiddleware(),
   isPollingActiveController.updatePollingStatus
 );
 
