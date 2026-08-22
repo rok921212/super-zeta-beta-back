@@ -673,6 +673,26 @@ function startLiveMatchUpdater() {
       return;
     }
 
+    // Fast path: this socket already completed a full registration earlier
+    // in its lifetime. A new socket.io connection always gets a fresh
+    // socket.data object, so socket.data.userId being set here means this
+    // can only be a keepalive re-emit on the SAME still-open connection —
+    // the Rust relay's 5s watchdog re-emits registerRelay unconditionally
+    // for the app's whole lifetime, not just on reconnect (see fetcher.rs).
+    // Nothing about this socket's identity could have changed without a new
+    // connection, so re-verifying relayToken against Mongo on every one of
+    // these is pure waste. Safe to skip unconditionally: the relay is
+    // fire-and-forget for registerRelay (fetcher.rs deliberately does NOT
+    // use emit_with_ack — an earlier version that waited on the server's
+    // ack "never once succeeded against the real deployed Render backend,
+    // only against localhost" — so it never observes this ack's timing or
+    // payload; skipping straight to it changes nothing the relay can see).
+    if (socket.data.userId) {
+      console.debug(`[socket] registerRelay keepalive from already-registered socket ${socket.id} (user=${socket.data.userId}) — skipping DB lookup`);
+      ack({ ok: true, userId: socket.data.userId });
+      return;
+    }
+
     // This repo has already hit "Mongoose silently stalls against Atlas
     // when deployed on Render, but not locally" once before (see TODO.md's
     // "Fix Render Mongoose Timeout Issue" — its bufferTimeoutMS fix never

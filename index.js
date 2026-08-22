@@ -141,6 +141,24 @@ app.use((req, res, next) => {
   next();
 });
 
+// Per-route HTTP bandwidth accounting — no equivalent existed before this
+// (the [bw][emit] logs in utils/roomEmit.js only cover WebSocket traffic).
+// `bytes` is the pre-compression JSON body size, not the actual post-gzip
+// wire bytes Render bills for — a first-pass approximation good enough to
+// rank routes by relative volume, without the extra complexity of hooking
+// below the compression() middleware.
+app.use((req, res, next) => {
+  const originalJson = res.json.bind(res);
+  res.json = (data) => {
+    try { res.locals.__bwBytes = Buffer.byteLength(JSON.stringify(data)); } catch { /* non-serializable body, skip */ }
+    return originalJson(data);
+  };
+  res.on('finish', () => {
+    console.log(`[bw][http] ${req.method} ${req.originalUrl} status=${res.statusCode} bytes=${res.locals.__bwBytes ?? res.get('content-length') ?? 'n/a'}`);
+  });
+  next();
+});
+
 // JWT auth: populates req.session = { userId } from an `Authorization:
 // Bearer <token>` header, in the same shape the rest of the codebase
 // already expects from the old session-cookie middleware — so every
@@ -296,48 +314,16 @@ app.get('/api/public/tournaments/:tournamentId/rounds/:roundId/selected-match', 
   }
 });
 
-// Public backpack data
-app.get('/api/public/bagPack/tournament/:tournamentId/round/:roundId/match/:matchId/matchdata/:matchDataId', cacheMiddleware(), async (req, res) => {
-  try {
-    const { matchDataId } = req.params;
-    const MatchData = require('./models/matchData.model');
-    const Match = require('./models/match.model');
-    const { getBackpackModel } = require('./models/bgpackModel');
-
-    const matchDataDoc = await MatchData.findById(matchDataId);
-    if (!matchDataDoc) {
-      return res.status(404).json({ error: 'MatchData not found' });
-    }
-
-    const match = await Match.findById(matchDataDoc.matchId);
-    if (!match) {
-      return res.status(404).json({ error: 'Match not found' });
-    }
-
-    const Backpack = getBackpackModel(matchDataId);
-    const data = await Backpack.find({ userId: matchDataDoc.userId });
-
-    // Remove userId from each item in data
-    const cleanedData = data.map(item => {
-      const itemObj = item.toObject();
-      delete itemObj.userId;
-      return itemObj;
-    });
-
-    res.json({
-      userId: matchDataDoc.userId,
-      tournamentId: match.tournamentId,
-      roundId: match.roundId,
-      matchId: match._id,
-      matchDataId,
-      teambackpackinfo: {
-        TeamBackPackList: cleanedData
-      }
-    });
-  } catch (error) {
-    console.error('Error getting public backpack data:', error);
-    res.status(500).json({ error: 'Failed to get public backpack data' });
-  }
+// Public backpack data — UNFINISHED FEATURE, intentionally disabled.
+// models/bgpackModel.js was never created (no other definition of
+// getBackpackModel exists anywhere in the repo), and the needsBackpack flag
+// computed in Bulkpublic.controller.js is likewise dead/unused elsewhere.
+// Every hit used to throw MODULE_NOT_FOUND and log-spam a 500; short-circuit
+// here instead so overlay theme components (which already treat
+// backpackInfo as nullable) just render with no data. Re-enable by writing
+// models/bgpackModel.js and restoring the original body from history.
+app.get('/api/public/bagPack/tournament/:tournamentId/round/:roundId/match/:matchId/matchdata/:matchDataId', (req, res) => {
+  res.json({ teambackpackinfo: { TeamBackPackList: [] } });
 });
 
 // Public groups in a tournament

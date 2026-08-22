@@ -157,15 +157,44 @@ invalidateKeysByPrefix = async (scope, prefixes) => {
 // (e.g. the live PUBG-API pipeline writing straight to MongoDB), so the write
 // path can invalidate by a resource id (matchId/roundId) instead of needing
 // to know which user sessions happen to have it cached.
+// Response Cache-Control, separate from the Redis TTL above: the Redis
+// cache only ever saved Mongo load, never egress bytes — nothing here used
+// to set an HTTP caching header at all, so index.js's blanket
+// `no-store` for /api/* (set earlier in the middleware chain, overwritten
+// by whatever runs later) was the last word on every single response,
+// cached or not, meaning the client re-fetched the full body every time
+// regardless of a Redis hit. Deliberately shorter than ttlSeconds:
+// invalidateCacheMiddleware below can only clear the server-side Redis
+// entry on a write — it has no way to reach into a browser's already-cached
+// copy, so a long browser max-age would mean staleness after an edit with
+// no way to shorten it. 30s bounds that window while still absorbing rapid
+// repeat polling of the same URL.
+const BROWSER_CACHE_MAX_AGE = 30;
+
+// `private` when this is genuinely per-user data (the default session/user
+// scoping, no scopeFn override) — e.g. /teams' hiddenBy/createdBy
+// filtering means two users can get different bodies for the same URL, so
+// a shared/proxy cache must not reuse one user's response for another.
+// `public` otherwise: the sessionID/'anon' fallback already means the
+// Redis cache itself is shared across anonymous callers, and a scopeFn
+// (resource-id-based, e.g. matchId/roundId) scope is for routes whose data
+// isn't viewer-specific to begin with.
+const cacheControlFor = (req, scopeFn) =>
+  (!scopeFn && req.session?.userId)
+    ? `private, max-age=${BROWSER_CACHE_MAX_AGE}`
+    : `public, max-age=${BROWSER_CACHE_MAX_AGE}`;
+
 cacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
   return async (req, res, next) => {
     if (req.method !== 'GET') return next();
 
     const scope = scopeFn ? scopeFn(req) : (req.session?.userId?.toString() || req.sessionID || 'anon');
     const key = `cache:${scope}:${req.originalUrl}`;
+    const cacheControl = cacheControlFor(req, scopeFn);
 
     const cached = await getCache(key);
     if (cached) {
+      res.set('Cache-Control', cacheControl);
       return res.json(cached);
     }
 
@@ -178,6 +207,7 @@ cacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
       if (res.statusCode >= 200 && res.statusCode < 300) {
         setCache(key, data, ttlSeconds, scope).catch(console.warn);
       }
+      res.set('Cache-Control', cacheControl);
       originalJson.call(this, data);
     };
 
@@ -195,10 +225,12 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
 
     const scope = scopeFn ? scopeFn(req) : (req.session?.userId?.toString() || req.sessionID || 'anon');
     const key = `cache:${scope}:${req.originalUrl}`;
+    const cacheControl = cacheControlFor(req, scopeFn);
 
     const cached = await getCache(key);
     if (cached) {
       res.set('Content-Type', 'application/msgpack');
+      res.set('Cache-Control', cacheControl);
       return res.send(encodeMsgpack(cached));
     }
 
@@ -208,6 +240,7 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
         setCache(key, data, ttlSeconds, scope).catch(console.warn);
       }
       res.set('Content-Type', 'application/msgpack');
+      res.set('Cache-Control', cacheControl);
       res.send(encodeMsgpack(data));
     };
 
