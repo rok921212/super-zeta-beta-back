@@ -9,7 +9,7 @@ const playerStatsSchema = new Schema({
   playerName: String,
   playerOpenId: String,
   picUrl: String,
-  showPicUrl: String,
+  showPicUrl: String, 
   character: { type: String, default: 'None' },
   isFiring: { type: Boolean, default: false },
   bHasDied: { type: Boolean, default: false },
@@ -30,18 +30,18 @@ const playerStatsSchema = new Schema({
   // top of those, not a substitute for them. Identifiers (teamId) and
   // coordinates (location) are deliberately left unclamped.
   health: { type: Number, default: 0, min: 0 },
-  healthMax: { type: Number, default: 0, min: 0 },
+  healthMax: { type: Number, default: 0, min: 0 }, //
   liveState: { type: Number, default: 0, min: 0 },
   killNum: { type: Number, default: 0, min: 0 },
-  killNumBeforeDie: { type: Number, default: 0, min: 0 },
+  killNumBeforeDie: { type: Number, default: 0, min: 0 }, //
   playerKey: { type: String, default: '' },
   gotAirDropNum: { type: Number, default: 0, min: 0 },
   maxKillDistance: { type: Number, default: 0, min: 0 },
   damage: { type: Number, default: 0, min: 0 },
   killNumInVehicle: { type: Number, default: 0, min: 0 },
   killNumByGrenade: { type: Number, default: 0, min: 0 },
-  AIKillNum: { type: Number, default: 0, min: 0 },
-  BossKillNum: { type: Number, default: 0, min: 0 },
+  AIKillNum: { type: Number, default: 0, min: 0 }, // 
+  BossKillNum: { type: Number, default: 0, min: 0 }, //
   rank: { type: Number, default: 0, min: 0 },
   isOutsideBlueCircle: { type: Boolean, default: false },
   inDamage: { type: Number, default: 0, min: 0 },
@@ -57,10 +57,10 @@ const playerStatsSchema = new Schema({
   useSmokeGrenadeNum: { type: Number, default: 0, min: 0 },
   useFragGrenadeNum: { type: Number, default: 0, min: 0 },
   useBurnGrenadeNum: { type: Number, default: 0, min: 0 },
-  useFlashGrenadeNum: { type: Number, default: 0, min: 0 },
-  PoisonTotalDamage: { type: Number, default: 0, min: 0 },
-  UseSelfRescueTime: { type: Number, default: 0, min: 0 },
-  UseEmergencyCallTime: { type: Number, default: 0, min: 0 },
+  useFlashGrenadeNum: { type: Number, default: 0, min: 0 }, 
+  PoisonTotalDamage: { type: Number, default: 0, min: 0 }, //
+  UseSelfRescueTime: { type: Number, default: 0, min: 0 }, //
+  UseEmergencyCallTime: { type: Number, default: 0, min: 0 }, // 
   teamIdfromApi: String,
   teamId: { type: Number, default: 0 },
   teamName: { type: String, default: '' },

@@ -1,9 +1,7 @@
-// Shared CORS origin allowlist for both the HTTP API (index.js) and
-// Socket.IO (socket.js). Previously each maintained its own independent
-// list and predicate, which had already drifted apart (e.g. only one of
-// them allowed http://192.168.18.6:3001, only the other allowed
-// capacitor://localhost) — this is the union of both, so nothing either
-// side used to allow gets silently dropped.
+// Shared CORS origin predicate for both the HTTP API (index.js) and
+// Socket.IO (socket.js). Origin checking is disabled — any origin is
+// allowed to connect. `allowedOrigins` is kept only for reference/docs;
+// it is no longer enforced by `isOriginAllowed`.
 const allowedOrigins = [
   "http://localhost:3001",
   "http://localhost:1420",
@@ -18,15 +16,8 @@ const allowedOrigins = [
   "http://192.168.18.6:3001",
 ];
 
-function isOriginAllowed(origin) {
-  if (!origin) return true; // no Origin header (mobile apps, curl, Postman)
-  return (
-    allowedOrigins.includes(origin) ||
-    origin.includes(".vercel.app") ||
-    origin.includes("//localhost") ||
-    origin.startsWith("capacitor://") ||
-    origin.startsWith("http://192.168.")
-  );
+function isOriginAllowed() {
+  return true;
 }
 
 module.exports = { allowedOrigins, isOriginAllowed };
