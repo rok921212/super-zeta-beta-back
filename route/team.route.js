@@ -20,6 +20,11 @@ router.post('/teams/bulk-import', requireAuth, invalidateCacheMiddleware(['cache
 // Get all teams
 router.get('/teams', cacheMiddleware(), teamController.getAllTeams);
 
+// Bulk-search teams by (teamName, teamTag) pairs (e.g. from an imported
+// CSV). POST because the row list is a body payload — but it's a read,
+// so it stays public, matching getAllTeams's per-session filtering.
+router.post('/teams/bulk-search', teamController.bulkSearchTeams);
+
 // Get a team by ID
 router.get('/teams/:id', cacheMiddleware(), teamController.getTeamById);
 

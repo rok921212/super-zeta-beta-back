@@ -52,6 +52,24 @@ function canViewTeam(userId, isAdmin, createdBy) {
   return isAdmin || !createdBy || String(createdBy) === String(userId);
 }
 
+// Shared by getAllTeams and bulkSearchTeams — same ownership/hiddenBy
+// rule, single source of truth so a visibility-rule change can't apply
+// to one read path and not the other.
+function buildVisibilityConditions(userId, isAdmin) {
+  const conditions = [];
+  if (userId) conditions.push({ hiddenBy: { $ne: userId } });
+  if (!isAdmin) {
+    conditions.push({
+      $or: [
+        { createdBy: { $exists: false } },
+        { createdBy: null },
+        ...(userId ? [{ createdBy: new mongoose.Types.ObjectId(userId) }] : []),
+      ],
+    });
+  }
+  return conditions;
+}
+
 function normalizePlayers(players) {
   if (!Array.isArray(players)) return [];
   return players
@@ -262,24 +280,12 @@ const getAllTeams = async (req, res) => {
     const search = req.query.search?.trim();
     const isAdmin = userId ? await isRequesterAdmin(req) : false;
 
-    const conditions = [];
-    if (userId) conditions.push({ hiddenBy: { $ne: userId } });
+    const conditions = buildVisibilityConditions(userId, isAdmin);
     if (search) {
       conditions.push({
         $or: [
           { teamFullName: { $regex: search, $options: 'i' } },
           { teamTag: { $regex: search, $options: 'i' } },
-        ],
-      });
-    }
-    if (!isAdmin) {
-      // Own teams + legacy/unclaimed ones only — never another user's
-      // private roster.
-      conditions.push({
-        $or: [
-          { createdBy: { $exists: false } },
-          { createdBy: null },
-          ...(userId ? [{ createdBy: new mongoose.Types.ObjectId(userId) }] : []),
         ],
       });
     }
@@ -308,6 +314,88 @@ const getAllTeams = async (req, res) => {
     res.json({ teams, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
     console.error(`[ERROR] team=getAll-failed msg=${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// ─── Bulk-search teams by (teamName, teamTag) pairs ─────────────────────
+// For reconciling an externally-prepared CSV roster/invite list against
+// the team catalog. Deliberately NOT paginated — every row needs every
+// match in one round trip. Fetches the full visible catalog once (same
+// cost getAllTeams already pays via countDocuments) and matches each row
+// in memory — avoids an unbounded regex $or (a non-anchored regex can't
+// use the teamFullName index anyway, so one collection scan is cheaper
+// than a giant multi-clause $or) and needs no regex-escaping since
+// String#includes() takes a literal.
+const MAX_BULK_SEARCH_ROWS = 1000;
+const MAX_MATCHES_PER_ROW = 50; // defensive cap — a 1-2 char query could otherwise return hundreds of teams for one row
+
+// Aggressive match key: lowercase and strip ALL whitespace (not just the
+// edges), so "CYBER HERO" / "CYBERHERO" / " Cyber  Hero " all collapse to
+// the same key. CSV rosters and the DB catalog are prepared by different
+// people at different times — inconsistent spacing shouldn't cause a
+// team that's clearly the same to be reported as unmatched.
+const normalizeForMatch = (s) => (s || '').toLowerCase().replace(/\s+/g, '');
+
+const bulkSearchTeams = async (req, res) => {
+  try {
+    const { queries } = req.body;
+    if (!Array.isArray(queries) || queries.length === 0) {
+      return res.status(400).json({ error: 'queries must be a non-empty array' });
+    }
+    if (queries.length > MAX_BULK_SEARCH_ROWS) {
+      return res.status(400).json({ error: `Cannot search more than ${MAX_BULK_SEARCH_ROWS} rows in one request` });
+    }
+
+    const rows = queries.map(q => ({
+      teamName: typeof q?.teamName === 'string' ? q.teamName.trim() : '',
+      teamTag: typeof q?.teamTag === 'string' ? q.teamTag.trim() : '',
+    }));
+    if (!rows.some(r => r.teamName || r.teamTag)) {
+      return res.status(400).json({ error: 'Every row is empty — need at least a team name or tag per row' });
+    }
+
+    const userId = req.session?.userId;
+    const isAdmin = userId ? await isRequesterAdmin(req) : false;
+    const conditions = buildVisibilityConditions(userId, isAdmin);
+    const filter = conditions.length ? { $and: conditions } : {};
+
+    const allVisibleTeams = await Team.aggregate([
+      { $match: filter },
+      { $sort: { teamFullName: 1 } },
+      { $project: { teamFullName: 1, teamTag: 1, logo: 1, teamFlag: 1, playersCount: { $size: '$players' } } },
+    ]);
+
+    const haystack = allVisibleTeams.map(t => ({
+      team: t,
+      name: normalizeForMatch(t.teamFullName),
+      tag: normalizeForMatch(t.teamTag),
+    }));
+
+    const matchedTeamIds = new Set();
+    const results = rows.map(row => {
+      const nameQ = normalizeForMatch(row.teamName);
+      const tagQ = normalizeForMatch(row.teamTag);
+      const allMatches = haystack.filter(h => (nameQ && h.name.includes(nameQ)) || (tagQ && h.tag.includes(tagQ)));
+      allMatches.forEach(h => matchedTeamIds.add(String(h.team._id)));
+      return {
+        teamName: row.teamName,
+        teamTag: row.teamTag,
+        matches: allMatches.slice(0, MAX_MATCHES_PER_ROW).map(h => h.team),
+        truncated: allMatches.length > MAX_MATCHES_PER_ROW,
+      };
+    });
+
+    const matchedRows = results.filter(r => r.matches.length > 0).length;
+    console.log(`[TEAMS] bulk-search rows=${rows.length} matchedRows=${matchedRows} teamsFound=${matchedTeamIds.size}`);
+    res.json({
+      results,
+      matchedRows,
+      unmatchedRows: rows.length - matchedRows,
+      totalTeamsFound: matchedTeamIds.size,
+    });
+  } catch (err) {
+    console.error(`[ERROR] team=bulk-search-failed msg=${err.message}`);
     res.status(500).json({ error: err.message });
   }
 };
@@ -519,6 +607,7 @@ const removeMultiplePlayersFromTeam = async (req, res) => {
 module.exports = {
   createTeam,
   bulkImportTeams,
+  bulkSearchTeams,
   getAllTeams,
   getTeamById,
   updateTeam,
