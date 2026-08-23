@@ -559,6 +559,14 @@ const userProcessing = new Map();
 const activeUserKeys = new Set();
 const userKeyToDbId = new Map();
 
+// DIAGNOSTIC (2026-08-23): throttle for the "tick ignored, not in
+// activeUserKeys" warning in triggerImmediateUpdateForUser below — ticks
+// arrive every ~1-2s from a live relay, so an unthrottled log line there
+// would flood the log for the entire duration of a stuck window instead of
+// just marking its start/extent.
+const lastActiveDropLoggedAt = new Map(); // userId -> ms timestamp
+const ACTIVE_DROP_LOG_INTERVAL_MS = 5000;
+
 // Called by isPollingactive.controller.js right after it flips a
 // MatchSelection's isPollingActive, so a newly-toggled-on user's already-
 // arriving relay ticks are accepted immediately instead of being silently
@@ -570,11 +578,16 @@ const userKeyToDbId = new Map();
 // either cache's TTL/interval, or anything on the relay/registerRelay side.
 function markUserActiveForPolling(userId) {
   const key = String(userId);
+  const wasActive = activeUserKeys.has(key);
   activeUserKeys.add(key);
   userKeyToDbId.set(key, userId);
+  if (!wasActive) console.log(`[activeUsers] + ${key} (direct mark, e.g. polling-toggle endpoint)`);
 }
 function markUserInactiveForPolling(userId) {
-  activeUserKeys.delete(String(userId));
+  const key = String(userId);
+  const wasActive = activeUserKeys.has(key);
+  activeUserKeys.delete(key);
+  if (wasActive) console.log(`[activeUsers] - ${key} (direct mark, e.g. polling-toggle endpoint)`);
 }
 
 const lastMatchDataByUserMatch = {};
@@ -619,7 +632,26 @@ function startLiveMatchUpdater() {
 
   // ── Receive live player data pushed from each user's local relay ───────────
   io.on('connection', (socket) => {
-    console.log(c('dim', `[socket] client connected: ${socket.id}`));
+    console.log(c('dim', `[socket] client connected: ${socket.id} transport=${socket.conn.transport.name}`));
+
+    // DIAGNOSTIC (2026-08-23): fills the gap identified while chasing the
+    // relay's ~2-4s connect/die flap — until now this app never logged
+    // WHY the underlying engine.io transport actually closed/errored, only
+    // the higher-level socket.io 'disconnect' (which never fires for a raw
+    // transport-level failure — see the Rust relay's own '.on("error", ...)'
+    // vs '.on("disconnect", ...)' split in fetcher.rs). Tagged with
+    // socket.id (and socket.data.userId once registerRelay sets it) so
+    // these correlate with the existing registerRelay/disconnect logs
+    // below for the same socket.
+    socket.conn.on('upgrade', () => {
+      console.log(c('dim', `[engine] upgrade socket=${socket.id} user=${socket.data?.userId ?? 'n/a'} transport=${socket.conn.transport.name}`));
+    });
+    socket.conn.on('close', (reason, description) => {
+      console.log(c('yellow', `[engine] transport close socket=${socket.id} user=${socket.data?.userId ?? 'n/a'} reason=${reason} description=${description ?? 'n/a'}`));
+    });
+    socket.conn.on('error', (err) => {
+      console.error(c('red', `[engine] transport error socket=${socket.id} user=${socket.data?.userId ?? 'n/a'} error=${err}`));
+    });
 
     // A cookie-bearing client (the dashboard) already has a verified
     // session by the time the socket handshake completes (io.engine.use
@@ -1151,9 +1183,24 @@ function startLiveMatchUpdater() {
   // pendingTrailing above), so a single slow pass costs at most one extra
   // immediate re-run instead of a full ~2s wait for the next raw PCOB tick.
   async function triggerImmediateUpdateForUser(userId) {
-    if (!activeUserKeys.has(userId)) return; // not an active/polling user — ignore
+    if (!activeUserKeys.has(userId)) {
+      // DIAGNOSTIC (2026-08-23): this was a completely silent drop before —
+      // a totalPlayerList tick can arrive, decode fine, and update
+      // liveApiPlayersByUser (see the socket handler), but never reach
+      // matchData/the broadcast because of this gate, with zero trace in
+      // the log. Throttled — see ACTIVE_DROP_LOG_INTERVAL_MS.
+      const now = Date.now();
+      const lastLogged = lastActiveDropLoggedAt.get(userId) || 0;
+      if (now - lastLogged >= ACTIVE_DROP_LOG_INTERVAL_MS) {
+        lastActiveDropLoggedAt.set(userId, now);
+        console.warn(`[trigger] user=${userId} tick ignored — not in activeUserKeys (data received but not processed)`);
+      }
+      return; // not an active/polling user — ignore
+    }
+    lastActiveDropLoggedAt.delete(userId);
     if (userProcessing.has(userId)) {
       userProcessing.set(userId, true);
+      console.debug(`[trigger] user=${userId} tick arrived mid-pass — coalescing into follow-up run`);
       return;
     }
     userProcessing.set(userId, false);
@@ -1161,8 +1208,9 @@ function startLiveMatchUpdater() {
       do {
         userProcessing.set(userId, false);
         const startedAt = Date.now();
-        await pollForUser(userId);
+        const hadChanges = await pollForUser(userId);
         const elapsed = Date.now() - startedAt;
+        console.debug(`[trigger] pollForUser(${userId}) done in ${elapsed}ms hadChanges=${hadChanges}`);
         if (elapsed > SLOW_POLL_THRESHOLD_MS) {
           console.warn(`[perf] pollForUser(${userId}) took ${elapsed}ms`);
         }
@@ -1480,7 +1528,10 @@ function startLiveMatchUpdater() {
 
     try {
       const roundIds = await getApiEnabledRoundIds();
-      if (!roundIds.length) return false;
+      if (!roundIds.length) {
+        console.warn(`[pollForUser] user=${userKey} skipped — no API-enabled rounds`);
+        return false;
+      }
 
       const selectedMatches = await MatchSelection.find({
         isSelected: true,
@@ -1488,7 +1539,10 @@ function startLiveMatchUpdater() {
         roundId:    { $in: roundIds }
       }).lean();
 
-      if (!selectedMatches.length) return false;
+      if (!selectedMatches.length) {
+        console.warn(`[pollForUser] user=${userKey} skipped — no selected+API-enabled MatchSelection found (roundIds=${roundIds.length})`);
+        return false;
+      }
 
       const liveEntry = liveApiPlayersByUser.get(String(userKey));
       const apiPlayers = liveEntry?.players || [];
@@ -1498,7 +1552,10 @@ function startLiveMatchUpdater() {
       await Promise.all(selectedMatches.map(async (selected) => {
         const selUserId = selected.userId;
 
-        if (!selected.isPollingActive) return;
+        if (!selected.isPollingActive) {
+          console.warn(`[pollForUser] user=${userKey} matchId=${selected.matchId} skipped — isPollingActive=false on this MatchSelection`);
+          return;
+        }
 
         const result = await updateMatchDataWithLiveStats(selected.matchId, selUserId, apiPlayers, apiPlayersAt);
         if (!result) return;
@@ -1753,6 +1810,12 @@ function startLiveMatchUpdater() {
       }
 
       const uniqueActiveUserIds = [...new Set(activeUserIds)];
+
+      // DIAGNOSTIC (2026-08-23): sizes for this pass, so a user dropping
+      // out below is explainable — few/no roundIds means no round has
+      // apiEnable, few/no selectedMatches means no MatchSelection matched
+      // isSelected+isPollingActive for that round set.
+      console.debug(`[discovery] pass: roundIds=${roundIds.length} selectedMatches=${selectedMatches.length} uniqueActiveUserIds=${uniqueActiveUserIds.length}`);
 
       for (const uid of uniqueActiveUserIds) {
         if (!activeUserKeys.has(uid)) {

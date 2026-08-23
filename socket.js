@@ -65,6 +65,19 @@ function initializeSocket(server) {
     next();
   });
 
+  // DIAGNOSTIC (2026-08-23): Engine.IO-level connection failures (bad
+  // handshake, transport error before a socket.io Socket even exists) never
+  // reach io.on('connection', ...) or any per-socket handler — this is the
+  // only place they're observable at all. Paired with the per-socket
+  // socket.conn.on('close'/'error') logging added in
+  // pubgApiMatchData.controller.js's io.on('connection', ...) for failures
+  // that occur AFTER a socket exists.
+  ioInstance.engine.on('connection_error', (err) => {
+    console.error(
+      `[engine] connection_error code=${err.code} message=${err.message} context=${JSON.stringify(err.context)} url=${err.req?.url}`
+    );
+  });
+
   console.log('✅ Socket.IO initialized with CORS');
 
   return ioInstance;

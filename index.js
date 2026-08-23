@@ -581,6 +581,24 @@ async function startServer() {
   }
 }
 
+// DIAGNOSTIC (2026-08-23): this app previously had no top-level safety net
+// at all — a single uncaught throw/rejection anywhere in a socket handler
+// (registerRelay, totalPlayerList, etc.) silently killed the whole process,
+// Render restarted it, and every open WebSocket was severed with no clean
+// Socket.IO disconnect packet. That is indistinguishable, from the Rust
+// relay's side, from Render's infra dropping the connection (both show up
+// there as a bare transport-level "EngineIO Error", never a
+// `disconnect`/`relayEvicted` event — see fetcher.rs's handlers). Logging
+// here (before the process necessarily exits) is what makes a future crash
+// loop provable instead of invisible.
+process.on('uncaughtException', (err) => {
+  console.error(`[fatal] uncaughtException at ${new Date().toISOString()}:`, err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error(`[fatal] unhandledRejection at ${new Date().toISOString()}:`, reason);
+});
+
 process.on('SIGTERM', async () => {
   process.exit(0);
 });
