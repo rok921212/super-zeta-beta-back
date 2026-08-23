@@ -99,6 +99,25 @@ function computeChangedPlayers(currentPlayers, previousPlayers) {
 // say, position. A team is small (~4 players), so a full comparison is
 // cheap — negligible next to the DB/roster work already done per tick — and
 // has no field list to drift out of sync later.
+// `location` is the one field that changes on nearly every tick for any
+// alive/moving player, which otherwise forces computeChangedTeams to
+// re-include most alive teams almost every tick. Views that don't render
+// player position (the vast majority — see viewDataTiers.js) get this
+// stripped so their room's payload only carries it when it actually
+// matters. NOT applied to isFiring — that's a combat-stat field, not
+// positional, and several core-tier views render off it.
+const POSITIONAL_PLAYER_FIELDS = ['location'];
+
+function stripPositionalFields(teams) {
+  return (teams || []).map((team) => {
+    if (!(team.players || []).some((p) => 'location' in p)) return team;
+    return {
+      ...team,
+      players: team.players.map(({ location, ...rest }) => rest),
+    };
+  });
+}
+
 function computeChangedTeams(currentTeams, previousTeams) {
   const prevByKey = new Map((previousTeams || []).map((t) => [teamKey(t), t]));
   const changed = [];
@@ -119,9 +138,11 @@ module.exports = {
   computeChangedTeams,
   computeChangedPlayers,
   computeChangedPlayerFields,
+  stripPositionalFields,
   teamKey,
   playerKey,
   TRACKED_FIELDS,
   DEAD_WEIGHT_PLAYER_FIELDS,
   PLAYER_IDENTITY_FIELDS,
+  POSITIONAL_PLAYER_FIELDS,
 };

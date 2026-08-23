@@ -17,14 +17,22 @@ function convertTo12Hour(time24) {
   return `${hour.toString().padStart(2, '0')}:${minute} ${ampm}`;
 }
 
-// Fetch match with groups & matchData
+// Fetch match with groups populated. Used to embed the full MatchData
+// document (every team/player stat field) here too, but no consumer
+// (front or desktop-app dashboards, or the matchUpdated/matchCreated/
+// matchDeleted socket broadcasts built from this) ever reads that field —
+// confirmed via full grep of both frontends. For a round with several
+// matches this was multiplying one match's full-roster payload (tens of
+// KB) by every match in the list for zero benefit (~1.67MB observed for
+// one round). Dropped entirely; matchData for a specific match/round is
+// what /api/public/bulk and matchDataController.tsx already fetch
+// separately when actually needed.
 async function fetchMatchWithData(match) {
   const populatedMatch = await match.populate({
     path: 'groups',
     populate: { path: 'slots.team', model: 'Team' },
   });
-  const matchData = await MatchData.findOne({ matchId: match._id });
-  return { ...populatedMatch.toObject(), matchData };
+  return populatedMatch.toObject();
 }
 
 // ✅ Create match (user-based)

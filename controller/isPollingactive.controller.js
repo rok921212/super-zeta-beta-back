@@ -2,6 +2,7 @@ const MatchSelection = require('../models/MatchSelection.model.js');
 const Round = require('../models/round.model.js');
 const mongoose = require('mongoose');
 const { getSocket } = require('../socket.js'); // ✅ updated import
+const { markUserActiveForPolling, markUserInactiveForPolling } = require('./Api_controllers/pubgApiMatchData.controller.js');
 
 // GET isPollingActive for a match (user-based)
 const getPollingStatus = async (req, res) => {
@@ -74,6 +75,17 @@ const updatePollingStatus = async (req, res) => {
 
     if (!updatedSelection) {
       return res.status(404).json({ message: 'MatchSelection not found' });
+    }
+
+    // Register this user as active for the live-ingestion path right away,
+    // instead of waiting for the next discoverAndStartPollingUsers() pass
+    // (up to 10s) — otherwise relay ticks that are already arriving for this
+    // user get silently dropped by triggerImmediateUpdateForUser() until
+    // that next pass catches up.
+    if (isPollingActive) {
+      markUserActiveForPolling(userId);
+    } else {
+      markUserInactiveForPolling(userId);
     }
 
     // --- Emit WebSocket event ---

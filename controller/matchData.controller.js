@@ -9,6 +9,7 @@ const { computeOverallMatchDataForRound } = require('./overall.controller');
 const { encodeMsgpack } = require('../utils/msgpackCodec');
 const { emitToRoomSplitByFormat } = require('../utils/roomEmit');
 const { toProtoMatchDataPayload, toProtoOverallDataPayload } = require('../utils/protobufCodec');
+const { stripPositionalFields } = require('../utils/matchTeamDiff');
 
 // ─── Shared player-template builder ───────────────────────────────────────────
 // Was previously copy-pasted 3x (create / replace / add) with small drifts
@@ -114,11 +115,23 @@ function emitOverallUpdateAsync(io, matchId, userId, matchData) {
         return;
       }
       const matchDataRoom = `round:${match.tournamentId}:${match.roundId}:matchData`;
+      const matchDataPositionalRoom = `round:${match.tournamentId}:${match.roundId}:matchDataPositional`;
       const overallRoom = `round:${match.tournamentId}:${match.roundId}:overall`;
-      console.log(`[bw][emit] emitOverallUpdateAsync: matchDataRoom=${matchDataRoom} (${io.sockets.adapter.rooms.get(matchDataRoom)?.size || 0} sockets) overallRoom=${overallRoom} (${io.sockets.adapter.rooms.get(overallRoom)?.size || 0} sockets)`);
+      console.log(`[bw][emit] emitOverallUpdateAsync: matchDataRoom=${matchDataRoom} (${io.sockets.adapter.rooms.get(matchDataRoom)?.size || 0} sockets) matchDataPositionalRoom=${matchDataPositionalRoom} (${io.sockets.adapter.rooms.get(matchDataPositionalRoom)?.size || 0} sockets) overallRoom=${overallRoom} (${io.sockets.adapter.rooms.get(overallRoom)?.size || 0} sockets)`);
 
       if (matchData) {
+        // Same core/positional split as the automatic live-tick path
+        // (pubgApiMatchData.controller.js's emitUpdates) — this is a
+        // second, separate emitter into the same rooms for manual
+        // dashboard edits, so it needs the same split or a manual edit
+        // would leak `location` straight into the core room.
         emitToRoomSplitByFormat(io, matchDataRoom, 'liveMatchUpdate', {
+          protoMessageName: 'MatchDataPayload',
+          mapToProto: toProtoMatchDataPayload,
+          data: { ...matchData, teams: stripPositionalFields(matchData.teams), matchId: String(matchId) },
+          volatile: false,
+        });
+        emitToRoomSplitByFormat(io, matchDataPositionalRoom, 'liveMatchUpdate', {
           protoMessageName: 'MatchDataPayload',
           mapToProto: toProtoMatchDataPayload,
           data: { ...matchData, matchId: String(matchId) },

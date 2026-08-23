@@ -12,11 +12,11 @@ const { getSocket } = require('../../socket');
 const { computeOverallMatchDataForRound } = require('../overall.controller');
 const { encodeMsgpack } = require('../../utils/msgpackCodec');
 const { updateDeadTeamList, hydrateMatchDataIdentity } = require('../Bulkpublic.controller');
-const { VIEWS_NEEDING_OVERALL, VIEWS_NEEDING_MATCH_DATA } = require('../../utils/viewDataTiers');
+const { VIEWS_NEEDING_OVERALL, VIEWS_NEEDING_MATCH_DATA, VIEWS_NEEDING_POSITIONAL_DATA } = require('../../utils/viewDataTiers');
 const { setSocketWireFormat, clearSocketWireFormat } = require('../../utils/socketFormatRegistry');
 const { emitToRoomSplitByFormat } = require('../../utils/roomEmit');
 const { toProtoMatchDataPayload, toProtoOverallDataPayload } = require('../../utils/protobufCodec');
-const { computeChangedTeams, TRACKED_FIELDS } = require('../../utils/matchTeamDiff');
+const { computeChangedTeams, TRACKED_FIELDS, stripPositionalFields } = require('../../utils/matchTeamDiff');
 
 // ─── In-Memory Live Match Cache ───────────────────────────────────────────────
 const liveMatchCache = new Map();
@@ -558,6 +558,25 @@ const userProcessing = new Map();
 // update when the next socket push arrives".
 const activeUserKeys = new Set();
 const userKeyToDbId = new Map();
+
+// Called by isPollingactive.controller.js right after it flips a
+// MatchSelection's isPollingActive, so a newly-toggled-on user's already-
+// arriving relay ticks are accepted immediately instead of being silently
+// dropped by triggerImmediateUpdateForUser() until the next
+// discoverAndStartPollingUsers() pass (up to 10s away). Does the exact same
+// per-user bookkeeping that function already does (see its
+// activeUserKeys.add/userKeyToDbId.set below) — this just does it early,
+// for one user, instead of waiting for the periodic sweep. Does not touch
+// either cache's TTL/interval, or anything on the relay/registerRelay side.
+function markUserActiveForPolling(userId) {
+  const key = String(userId);
+  activeUserKeys.add(key);
+  userKeyToDbId.set(key, userId);
+}
+function markUserInactiveForPolling(userId) {
+  activeUserKeys.delete(String(userId));
+}
+
 const lastMatchDataByUserMatch = {};
 const lastFingerprintByUserMatch = {}; // stores fingerprint PARTS arrays, not hashes
 
@@ -729,6 +748,12 @@ function startLiveMatchUpdater() {
   for (const [id, s] of io.sockets.sockets) {
     if (id !== socket.id && s.data?.userId === key) {
       console.log(c('yellow', `[socket] evicting stale relay ${id} for user ${key} (superseded by ${socket.id})`));
+      // Told before being killed so the Rust relay can tell "I was
+      // superseded by another device" apart from an ordinary network
+      // drop and skip its usual auto-reconnect — see fetcher.rs's
+      // "relayEvicted" handler. Same emit-then-disconnect pattern as
+      // requestFullSnapshot elsewhere in this handler.
+      s.emit('relayEvicted', { reason: 'superseded' });
       s.disconnect(true);
     }
   }
@@ -956,24 +981,35 @@ function startLiveMatchUpdater() {
       }
 
       const matchDataRoom = `round:${tournamentId}:${roundId}:matchData`;
+      const matchDataPositionalRoom = `round:${tournamentId}:${roundId}:matchDataPositional`;
       const overallRoom = `round:${tournamentId}:${roundId}:overall`;
 
       // A missing `view` means an old/pre-deploy overlay build (never sends
       // it) — treat that as "needs everything" so an already-open OBS
       // Browser Source mid-broadcast never silently goes dark because of a
       // deploy. A recognized view only joins the tier(s) it actually needs.
-      const joinMatchData = !view || VIEWS_NEEDING_MATCH_DATA.has(view);
+      //
+      // matchDataPositional's payload is a strict superset of matchData's
+      // (core fields + location), so a socket joins ONE of the two rooms,
+      // never both — joining both would double-deliver every core field on
+      // every tick a position-needing view is present in the same match.
       const joinOverall = !view || VIEWS_NEEDING_OVERALL.has(view);
+      const needsPositional = !view || VIEWS_NEEDING_POSITIONAL_DATA.has(view);
+      const needsMatchData = !view || VIEWS_NEEDING_MATCH_DATA.has(view);
+      const joinMatchDataPositional = needsPositional;
+      const joinMatchData = needsMatchData && !needsPositional;
 
-      if (joinMatchData) socket.join(matchDataRoom);
+      if (joinMatchDataPositional) socket.join(matchDataPositionalRoom);
+      else if (joinMatchData) socket.join(matchDataRoom);
       if (joinOverall) socket.join(overallRoom);
 
-      console.log(`[bw][room] socket ${socket.id} joinRoundRoom view=${view ?? '(none)'} wireFormat=${wireFormat ?? 'msgpack'} -> matchData=${joinMatchData} overall=${joinOverall}`);
+      console.log(`[bw][room] socket ${socket.id} joinRoundRoom view=${view ?? '(none)'} wireFormat=${wireFormat ?? 'msgpack'} -> matchData=${joinMatchData} matchDataPositional=${joinMatchDataPositional} overall=${joinOverall}`);
     });
 
     socket.on('leaveRoundRoom', ({ tournamentId, roundId } = {}) => {
       if (!tournamentId || !roundId) return;
       socket.leave(`round:${tournamentId}:${roundId}:matchData`);
+      socket.leave(`round:${tournamentId}:${roundId}:matchDataPositional`);
       socket.leave(`round:${tournamentId}:${roundId}:overall`);
       console.log(`[bw][room] socket ${socket.id} leaveRoundRoom tournamentId=${tournamentId} roundId=${roundId}`);
     });
@@ -1523,16 +1559,34 @@ function startLiveMatchUpdater() {
           // computeChangedTeams naturally returns the full roster.
           const changedTeams = computeChangedTeams(memoryMatch.teams, lastData?.teams);
           const matchDataRoom = `round:${selected.tournamentId}:${selected.roundId}:matchData`;
+          const matchDataPositionalRoom = `round:${selected.tournamentId}:${selected.roundId}:matchDataPositional`;
           if (changedTeams.length === 0) {
             // Structurally near-impossible: the top-level `changed` gate
             // (TRACKED_FIELDS-based) is a strict subset of what this
             // full-object comparison covers, so if `changed` fired, at
             // least one team should differ here too. Logged loudly rather
             // than silently skipped so a future divergence is visible.
-            console.warn(`[bw][delta] ${cacheKey}: change gate fired but 0 teams differ — skipping ${matchDataRoom} emit this tick`);
+            console.warn(`[bw][delta] ${cacheKey}: change gate fired but 0 teams differ — skipping ${matchDataRoom}/${matchDataPositionalRoom} emit this tick`);
           } else {
-            console.log(`[bw][delta] ${cacheKey}: ${changedTeams.length}/${memoryMatch.teams.length} teams changed -> ${matchDataRoom}`);
+            console.log(`[bw][delta] ${cacheKey}: ${changedTeams.length}/${memoryMatch.teams.length} teams changed -> ${matchDataRoom}/${matchDataPositionalRoom}`);
+            // Core tier: no `location` — the vast majority of views (kill
+            // feeds, stat panels, standings, etc.) never render position,
+            // and location is the field most likely to differ on any given
+            // tick during combat, so stripping it here is what actually
+            // shrinks the common-case payload. emitToRoomSplitByFormat
+            // no-ops (skips encode entirely) when a room is empty, so this
+            // costs nothing extra when nobody's joined either room.
             emitToRoomSplitByFormat(io, matchDataRoom, 'liveMatchUpdate', {
+              protoMessageName: 'MatchDataPayload',
+              mapToProto: toProtoMatchDataPayload,
+              data: { ...memoryMatch, teams: stripPositionalFields(changedTeams), matchId: String(selected.matchId) },
+              volatile: true,
+            });
+            // Positional tier: strict superset of the core payload (adds
+            // location back) — only mapPreview-type views join this room,
+            // and joinRoundRoom ensures a socket joins one or the other,
+            // never both.
+            emitToRoomSplitByFormat(io, matchDataPositionalRoom, 'liveMatchUpdate', {
               protoMessageName: 'MatchDataPayload',
               mapToProto: toProtoMatchDataPayload,
               data: { ...memoryMatch, teams: changedTeams, matchId: String(selected.matchId) },
@@ -1644,4 +1698,4 @@ function startLiveMatchUpdater() {
   setInterval(discoverAndStartPollingUsers, 10000);
 }
 
-module.exports = { startLiveMatchUpdater, getUnmatchedPlayers };
+module.exports = { startLiveMatchUpdater, getUnmatchedPlayers, markUserActiveForPolling, markUserInactiveForPolling };

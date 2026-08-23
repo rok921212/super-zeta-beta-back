@@ -22,22 +22,13 @@ const { aggregateOverallTeams } = require('./overall.controller');
    drifting apart within this repo.
 -------------------------------------------------------------------- */
 const { VIEWS_NEEDING_OVERALL, VIEWS_NEEDING_MATCH_DATA } = require('../utils/viewDataTiers');
-const VIEWS_NEEDING_BACKPACK = new Set(['Upper']);
 const VIEWS_NEEDING_MATCHES_LIST = new Set([
-  'Lower', 'Schedule', 'HighlightSchedule', 'OverAllData', 'OverallFrags', 'highlightPoints' , 'EventMvp',,
+  'Lower', 'Schedule', 'HighlightSchedule', 'OverAllData', 'OverallFrags', 'highlightPoints', 'EventMvp',
 ]);
 const VIEWS_NEEDING_ALL_MATCH_DATAS = new Set([
   'Schedule', 'highlightPoints', 'HighlightSchedule', 'OverAllData', 'OverallFrags',
   'EventMvp',
 ]);
-
-const NUMERIC_PLAYER_FIELDS = [
-  'health', 'healthMax', 'liveState', 'killNum', 'killNumBeforeDie', 'gotAirDropNum', 'maxKillDistance', 'damage',
-  'killNumInVehicle', 'killNumByGrenade', 'AIKillNum', 'BossKillNum', 'rank', 'inDamage', 'headShotNum', 'survivalTime',
-  'driveDistance', 'marchDistance', 'assists', 'outsideBlueCircleTime', 'knockouts', 'rescueTimes', 'useSmokeGrenadeNum',
-  'useFragGrenadeNum', 'useBurnGrenadeNum', 'useFlashGrenadeNum', 'PoisonTotalDamage', 'UseSelfRescueTime',
-  'UseEmergencyCallTime', 'contribution',
-];
 
 // Field set actually read by the round-summary views (Schedule,
 // HighlightSchedule, OverAllData, OverallFrags, highlightPoints) —
@@ -48,6 +39,102 @@ const NUMERIC_PLAYER_FIELDS = [
 // never read. Keep in sync with VIEWS_NEEDING_ALL_MATCH_DATAS above if a
 // future view added to that set needs more fields.
 const SUMMARY_PLAYER_FIELDS = ['killNum', 'damage', 'assists', 'survivalTime', 'knockouts'];
+
+/* --------------------------------------------------------------------
+   PER-VIEW PLAYER-FIELD SLIMMING (currentMatchData / overallData)
+   --------------------------------------------------------------------
+   Before this, every view in VIEWS_NEEDING_MATCH_DATA / VIEWS_NEEDING_OVERALL
+   got the complete, unslimmed player object — every numeric stat field the
+   live-ingest pipeline can produce, including several (location,
+   killNumBeforeDie, AIKillNum, BossKillNum, inDamage, outsideBlueCircleTime,
+   PoisonTotalDamage, UseSelfRescueTime, UseEmergencyCallTime, contribution,
+   showPicUrl) that NO view in any theme actually reads — confirmed by
+   auditing every theme component's actual field usage in front/src/Themes.
+   `slots`/`PlayerSwitch`/`mapPreview` (identity-only UI) were paying the
+   same ~65KB per-request cost as `Dom`/`WwcdStats`/etc. (full live-stat
+   views) for exactly this reason.
+
+   Tiers are additive (each includes the previous). Deliberately err toward
+   including a field where a view's exact need was ambiguous across themes,
+   and any view NOT listed in VIEW_PLAYER_TIER falls back to 'full' (no
+   slimming at all) so an unaudited/future view never silently loses a
+   field a live broadcast depends on. The HTTP /bulk request only ever
+   carries `view`, never `theme` (PublicThemeRenderer.tsx), so a tier must
+   be a safe union across every theme that implements a given view, not
+   theme-specific.
+-------------------------------------------------------------------- */
+const IDENTITY_PLAYER_FIELDS = ['_id', 'uId', 'playerName', 'picUrl'];
+const LIGHT_PLAYER_FIELDS = [
+  ...IDENTITY_PLAYER_FIELDS,
+  'killNum', 'liveState', 'bHasDied', 'rank', 'isFiring', 'isOutsideBlueCircle', 'survivalTime',
+];
+const MID_PLAYER_FIELDS = [
+  ...LIGHT_PLAYER_FIELDS,
+  'damage', 'assists', 'knockouts', 'health', 'healthMax',
+];
+const HEAVY_PLAYER_FIELDS = [
+  ...MID_PLAYER_FIELDS,
+  'headShotNum', 'killNumInVehicle', 'killNumByGrenade',
+  'useSmokeGrenadeNum', 'useFragGrenadeNum', 'useBurnGrenadeNum', 'useFlashGrenadeNum',
+  'gotAirDropNum', 'maxKillDistance', 'rescueTimes', 'driveDistance', 'marchDistance',
+];
+const PLAYER_FIELD_TIERS = {
+  identity: IDENTITY_PLAYER_FIELDS,
+  light: LIGHT_PLAYER_FIELDS,
+  mid: MID_PLAYER_FIELDS,
+  heavy: HEAVY_PLAYER_FIELDS,
+};
+
+// view -> tier name. LiveStats and EventMvp are deliberately NOT listed
+// (-> 'full'): LiveStats is the core live UI nearly every theme leans on
+// and combines matchData+overallData at once; EventMvp already pulls
+// matches list + overallData + full matchData + all-match-datas
+// simultaneously, so there's no meaningful slim available for it anyway.
+const VIEW_PLAYER_TIER = {
+  slots: 'identity',
+  PlayerSwitch: 'identity',
+  mapPreview: 'identity',
+
+  Alerts: 'light',
+  LiveFrags: 'light',
+  Recall: 'light',
+  LiveData: 'light',
+
+  MatchData: 'mid',
+  Upper: 'mid',
+  RosterShowCase: 'mid',
+  TeamH2H: 'mid',
+
+  MatchSummary: 'heavy',
+  Dom: 'heavy',
+  mvp: 'heavy',
+  WwcdStats: 'heavy',
+  WwcdSummary: 'heavy',
+  MatchFragrs: 'heavy',
+  Achive: 'heavy',
+  playerH2H: 'heavy',
+};
+
+function pickFields(obj, fields) {
+  if (!obj) return obj;
+  const out = {};
+  for (const f of fields) out[f] = obj[f];
+  return out;
+}
+
+// Only slims team.players[] — team-level fields (teamId/teamTag/teamName/
+// teamLogo/placePoints/wwcd/slot, a handful of small values) are left
+// untouched everywhere; the byte cost this whole file is fixing lives in
+// the players arrays (dozens of players x ~28 fields), not the team shell.
+function slimPlayersForView(teams, view) {
+  const tierName = VIEW_PLAYER_TIER[view];
+  if (!tierName) return teams; // unaudited/unlisted view — leave as-is, full fidelity
+  const fields = PLAYER_FIELD_TIERS[tierName];
+  return (teams || []).map(team => ({
+    ...team,
+    players: (team.players || []).map(p => pickFields(p, fields)),
+  }));
+}
 
 // Builds a fresh, independent object rather than mutating matchData in
 // place — matchDataMap's entries are shared/aliased with
@@ -72,115 +159,6 @@ function slimMatchDataForList(matchData) {
       }),
     })),
   };
-}
-
-// ─── Live-tick team diffing ────────────────────────────────────────────────
-// Keyed by matchId -> Map(teamId -> fingerprint string). Lets the socket-
-// triggered ("liveUpdate") path send only the team(s) that actually changed
-// since the last live push for that match, instead of re-embedding every
-// team's full roster on every tick. Cleared whenever a match stops being
-// live-pushed to for a while by simple LRU-less eviction isn't needed here —
-// entries are small (one string per team) and naturally bounded by however
-// many matches are actively live at once.
-const lastSentTeamsByMatch = new Map();
-
-function fingerprintTeam(team) {
-  const parts = [team.placePoints];
-  (team.players || []).forEach(p => {
-    for (const f of NUMERIC_PLAYER_FIELDS) parts.push(p[f]);
-  });
-  return parts.join('|');
-}
-
-// ─── Live-tick overall diffing ─────────────────────────────────────────────
-// Same idea as lastSentTeamsByMatch above, but for the round-wide cumulative
-// standings (getOverallForRound). Without this, every single live-stat tick
-// for whichever match is currently live would re-embed and re-broadcast the
-// full cumulative teams+players object for the ENTIRE round (every match
-// played so far), even though those totals only actually move when a team's
-// placement/wwcd settles at match end.
-const lastSentOverallByRound = new Map();
-
-function fingerprintOverallTeam(team) {
-  const parts = [team.placePoints, team.wwcd, team.matchesPlayed, team.slot];
-  (team.players || []).forEach(p => {
-    // SUMMARY_PLAYER_FIELDS, not NUMERIC_PLAYER_FIELDS — the aggregated
-    // player object built by buildInitialAggPlayer only ever has these
-    // fields now. NUMERIC_PLAYER_FIELDS stays reserved for fingerprintTeam
-    // (the separate, untouched real-time matchData diff below).
-    for (const f of SUMMARY_PLAYER_FIELDS) parts.push(p[f]);
-  });
-  return parts.join('|');
-}
-
-// Mutates overallData in place: keeps only the teams whose cumulative
-// fingerprint differs from what was last sent for this round, and marks the
-// payload as partial so the frontend knows to merge rather than replace.
-function applyLiveOverallDiff(roundId, overallData) {
-  if (!roundId || !overallData?.teams) return overallData;
-
-  const key = roundId.toString();
-  let lastSent = lastSentOverallByRound.get(key);
-  if (!lastSent) {
-    lastSent = new Map();
-    lastSentOverallByRound.set(key, lastSent);
-  }
-
-  const changedTeams = overallData.teams.filter(team => {
-    const teamKey = team.teamId?.toString();
-    if (!teamKey) return true;
-    const fp = fingerprintOverallTeam(team);
-    const changed = lastSent.get(teamKey) !== fp;
-    lastSent.set(teamKey, fp);
-    return changed;
-  });
-
-  overallData.teams = changedTeams;
-  overallData.isPartialTeams = true;
-  return overallData;
-}
-
-// ─── Live-tick matches-list diffing ────────────────────────────────────────
-// matchesData.list only changes via the separate Match change stream (new
-// match, matchNo edit, group reassignment) — it's essentially static across
-// the many MatchData live ticks that happen in between. Skip re-sending it
-// on ticks where nothing actually changed.
-const lastSentMatchesListByRound = new Map();
-
-function fingerprintMatchesList(matches) {
-  return matches
-    .map(m => [m._id, m.matchNo, m.groupName, (m.groupNames || []).join(',')].join(':'))
-    .join('|');
-}
-
-// Mutates matchData in place: when liveUpdate, keeps only the teams whose
-// fingerprint differs from what was last sent for this match, and marks the
-// payload as partial so the frontend knows to merge rather than replace. A
-// match with no prior entry (first live push, or the map was never
-// populated by a full/non-live fetch) sends everything once, then trims to
-// deltas from then on.
-function applyLiveTeamDiff(matchId, matchData) {
-  if (!matchId || !matchData?.teams) return matchData;
-
-  const key = matchId.toString();
-  let lastSent = lastSentTeamsByMatch.get(key);
-  if (!lastSent) {
-    lastSent = new Map();
-    lastSentTeamsByMatch.set(key, lastSent);
-  }
-
-  const changedTeams = matchData.teams.filter(team => {
-    const teamKey = (team.teamId ?? team._id)?.toString();
-    if (!teamKey) return true;
-    const fp = fingerprintTeam(team);
-    const changed = lastSent.get(teamKey) !== fp;
-    lastSent.set(teamKey, fp);
-    return changed;
-  });
-
-  matchData.teams = changedTeams;
-  matchData.isPartialTeams = true;
-  return matchData;
 }
 
 /* --------------------------------------------------------------------
@@ -377,8 +355,8 @@ async function getMatchDataForMatch(matchId) {
  * Fetch matchData for a list of matches, keyed by matchId string. One
  * batched $in query instead of a per-match findOne — the previous version
  * ran N (or up to 2N on the userId-fallback branch) separate round trips
- * per call, and this runs on every live tick via comsock.js, so it scaled
- * with round size on every single update.
+ * per call, and this runs on every live tick, so it scaled with round size
+ * on every single update.
  */
 async function getMatchDataBatch(matches) {
   const map = new Map();
@@ -458,18 +436,10 @@ async function getOverallForRound(tournamentId, roundId, { matches: matchesIn, m
   };
 }
 
-async function buildBulkPayload({ tournamentId, roundId, matchId, view = null, followSelected = false, includeAll = false, liveUpdate = false }) {
-  // liveUpdate: used only by the socket change-stream push (comsock.js) on
-  // every live-stat write. Deliberately excludes needsAllMatchDatas — that
-  // flag embeds EVERY match's full team/player rosters, which used to get
-  // rebuilt and re-broadcast to every subscribed overlay socket on every
-  // single tick regardless of which one match actually changed. Schedule/
-  // overall views still get their lightweight data; only the redundant
-  // whole-round roster re-embed is skipped here.
-  const needsOverall = includeAll || liveUpdate || VIEWS_NEEDING_OVERALL.has(view);
-  const needsMatchData = includeAll || liveUpdate || VIEWS_NEEDING_MATCH_DATA.has(view);
-  const needsBackpack = includeAll || VIEWS_NEEDING_BACKPACK.has(view);
-  const needsMatchesList = includeAll || liveUpdate || VIEWS_NEEDING_MATCHES_LIST.has(view);
+async function buildBulkPayload({ tournamentId, roundId, matchId, view = null, followSelected = false, includeAll = false }) {
+  const needsOverall = includeAll || VIEWS_NEEDING_OVERALL.has(view);
+  const needsMatchData = includeAll || VIEWS_NEEDING_MATCH_DATA.has(view);
+  const needsMatchesList = includeAll || VIEWS_NEEDING_MATCHES_LIST.has(view);
   const needsAllMatchDatas = includeAll || VIEWS_NEEDING_ALL_MATCH_DATAS.has(view);
 
   const [tournament, round] = await Promise.all([
@@ -547,65 +517,30 @@ async function buildBulkPayload({ tournamentId, roundId, matchId, view = null, f
       .filter(Boolean);
   }
 
-  // On live ticks, matchesData.list rarely differs from what was last sent
-  // (it only really changes via the separate Match change stream), so skip
-  // re-sending it when nothing changed. REST/includeAll/specific-view
-  // fetches always get the full list.
-  let matchesList = needsMatchesList ? enrichedMatches : [];
-  let matchesListUnchanged = false;
-  if (liveUpdate && needsMatchesList) {
-    const listKey = `${tournamentId}:${roundId}`;
-    const fp = fingerprintMatchesList(enrichedMatches);
-    if (lastSentMatchesListByRound.get(listKey) === fp) {
-      matchesList = [];
-      matchesListUnchanged = true;
-    } else {
-      lastSentMatchesListByRound.set(listKey, fp);
-    }
-  }
+  const matchesList = needsMatchesList ? enrichedMatches : [];
 
   const matchesData = {
     list: matchesList,
     current: match,
     effectiveMatchId,
-    ...(liveUpdate && needsMatchesList ? { listUnchanged: matchesListUnchanged } : {}),
   };
 
-  // Only the socket-triggered live path gets trimmed to changed teams —
-  // any real REST fetch (initial page load, manual refresh, includeAll,
-  // or a specific `view`) always gets a complete matchData.teams so the
-  // frontend never has to start from a partial picture.
-  const finalMatchData = (liveUpdate && matchData)
-    ? applyLiveTeamDiff(effectiveMatchId, matchData)
+  // Per-view player-field slimming (see VIEW_PLAYER_TIER above). Only ever
+  // applies on a real, single-view REST fetch — includeAll (and any view
+  // not in the tier map) always gets the untouched full object.
+  const shouldSlimForView = !includeAll && !!VIEW_PLAYER_TIER[view];
+  const slimmedMatchData = (shouldSlimForView && matchData)
+    ? { ...matchData, teams: slimPlayersForView(matchData.teams, view) }
     : matchData;
-
-  // On a live tick, needsAllMatchDatas is always false (see comment at the
-  // top of this function), so matchDatasData would otherwise be sent as
-  // `[]` on every single push — Schedule/HighlightSchedule/OverAllData/
-  // OverallFrags/highlightPoints consumers must NOT treat that as "clear
-  // everything" (see PublicThemeRenderer.tsx's merge-by-matchId handling).
-  // Attach a lightweight single-entry update for just the match that
-  // changed instead, reusing the already-fetched/diffed finalMatchData —
-  // no extra query needed.
-  if (matchDatasData.length === 0 && liveUpdate && finalMatchData && effectiveMatchId) {
-    matchDatasData = [{
-      matchId: effectiveMatchId,
-      matchNo: match ? match.matchNo : (matchNoById.get(effectiveMatchId) ?? null),
-      matchData: slimMatchDataForList(finalMatchData),
-    }];
-  }
-
-  // Same treatment for the round-wide overall standings: only trim to
-  // changed teams on the live-tick path, never on a real REST/full fetch.
-  const finalOverallData = (liveUpdate && overallData)
-    ? applyLiveOverallDiff(roundId, overallData)
+  const slimmedOverallData = (shouldSlimForView && overallData)
+    ? { ...overallData, teams: slimPlayersForView(overallData.teams, view) }
     : overallData;
 
-  const currentMatchData = finalMatchData
+  const currentMatchData = slimmedMatchData
     ? {
         matchId: effectiveMatchId,
         matchNo: match ? match.matchNo : (matchNoById.get(effectiveMatchId) ?? null),
-        matchData: finalMatchData,
+        matchData: slimmedMatchData,
       }
     : null;
 
@@ -615,7 +550,7 @@ async function buildBulkPayload({ tournamentId, roundId, matchId, view = null, f
     matchesData,
     matchDatasData,
     currentMatchData,
-    overallData: finalOverallData || null,
+    overallData: slimmedOverallData || null,
     updatedAt: new Date(),
   };
 }
@@ -658,5 +593,4 @@ module.exports = {
   getOverallForRound,
   hydrateMatchDataIdentity,
   updateDeadTeamList,
-  applyLiveTeamDiff,
 };

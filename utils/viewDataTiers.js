@@ -20,4 +20,15 @@ const VIEWS_NEEDING_MATCH_DATA = new Set([
   'PlayerSwitch', 'LiveData', 'Recall',
 ]);
 
-module.exports = { VIEWS_NEEDING_OVERALL, VIEWS_NEEDING_MATCH_DATA };
+// Subset of VIEWS_NEEDING_MATCH_DATA that actually renders live player
+// position (a minimap-style view). `location{x,y,z}` changes on nearly
+// every tick for any alive/moving player, which was making the shared
+// matchData room's delta re-include most alive teams almost every tick —
+// so views that don't need position now join a separate, lighter
+// "matchDataPositional"-free room instead (see joinRoundRoom / emitUpdates
+// in pubgApiMatchData.controller.js). Deliberately does NOT include
+// isFiring — LiveStats/LiveData render a live "firing" pulse off that
+// field and are core-tier views, unrelated to position.
+const VIEWS_NEEDING_POSITIONAL_DATA = new Set(['mapPreview']);
+
+module.exports = { VIEWS_NEEDING_OVERALL, VIEWS_NEEDING_MATCH_DATA, VIEWS_NEEDING_POSITIONAL_DATA };
