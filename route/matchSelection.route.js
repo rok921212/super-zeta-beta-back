@@ -24,6 +24,11 @@ router.patch(
   isPollingActiveController.updatePollingStatus
 );
 
+// PATCH stop polling for every one of the current user's active selections
+// in a single call — used by stopAllPolling() on logout instead of one
+// PATCH per selection.
+router.patch('/stopAllPolling', requireAuth, invalidateCacheMiddleware(), isPollingActiveController.stopAllPolling);
+
 // POST to select a match
 router.post('/select', requireAuth, matchSelectionController.selectMatch);
 

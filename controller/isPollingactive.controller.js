@@ -115,7 +115,49 @@ const updatePollingStatus = async (req, res) => {
   }
 };
 
+// PATCH stop polling for every one of the current user's active selections
+// in a single DB call — used by stopAllPolling() on logout instead of one
+// PATCH per selection. Deliberately does NOT check round.apiEnable: turning
+// everything off must always succeed regardless of any round's state,
+// otherwise a selection whose round later gets apiEnable disabled can never
+// be cleared (see updatePollingStatus's gate above).
+const stopAllPolling = async (req, res) => {
+  try {
+    const userId = req.session.userId;
+    if (!userId) return res.status(401).json({ message: 'Unauthorized' });
+
+    const active = await MatchSelection.find({ userId, isPollingActive: true });
+
+    if (active.length > 0) {
+      await MatchSelection.updateMany(
+        { userId, isPollingActive: true },
+        { $set: { isPollingActive: false } }
+      );
+
+      const io = getSocket();
+      const room = `user:${userId}`;
+      active.forEach((s) => {
+        io.to(room).emit('pollingStatusUpdated', {
+          _id: s._id,
+          matchId: s.matchId,
+          roundId: s.roundId,
+          tournamentId: s.tournamentId,
+          isPollingActive: false
+        });
+      });
+    }
+
+    markUserInactiveForPolling(userId);
+
+    res.status(200).json({ message: 'Polling stopped for all selections', stopped: active.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
 module.exports = {
   getPollingStatus,
-  updatePollingStatus
+  updatePollingStatus,
+  stopAllPolling
 };
