@@ -973,11 +973,35 @@ function startLiveMatchUpdater() {
     // joinBulkRoom/leaveBulkRoom from comsock.js). Scoped per round rather
     // than per match so a followSelected overlay keeps receiving whichever
     // match is currently selected, without needing to rejoin on a switch.
-    socket.on('joinRoundRoom', ({ tournamentId, roundId, view, wireFormat } = {}) => {
+    socket.on('joinRoundRoom', async ({ tournamentId, roundId, view, wireFormat } = {}) => {
       if (!tournamentId || !roundId) return;
+
+      // Leave whatever round/tier this socket was previously scoped to
+      // before joining the new one(s) — covers BOTH a view/wireFormat
+      // switch on the SAME round (which used to leave the socket in both
+      // matchData and matchDataPositional at once, double-delivering every
+      // tick) and a switch to a DIFFERENT round entirely (which used to
+      // leave the socket still subscribed to the old round's rooms
+      // forever, since only the client-initiated leaveRoundRoom event ever
+      // called socket.leave). socket.leave on a room the socket isn't in
+      // is a documented no-op, so this is safe to call unconditionally.
+      const prevScope = socket.data.roundRoomScope;
+      if (prevScope) {
+        socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:matchData`);
+        socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:matchDataPositional`);
+        socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:overall`);
+      }
+      socket.data.roundRoomScope = { tournamentId, roundId };
 
       if (wireFormat === 'protobuf') {
         setSocketWireFormat(socket.id, 'protobuf');
+      } else {
+        // Missing else branch previously: a socket that had negotiated
+        // protobuf on an earlier joinRoundRoom call (e.g. before a view
+        // switch back to the msgpack default) kept that stale registry
+        // entry forever — getSocketWireFormat has no other way to learn
+        // the socket moved away from protobuf short of it disconnecting.
+        clearSocketWireFormat(socket.id);
       }
 
       const matchDataRoom = `round:${tournamentId}:${roundId}:matchData`;
@@ -1004,6 +1028,57 @@ function startLiveMatchUpdater() {
       if (joinOverall) socket.join(overallRoom);
 
       console.log(`[bw][room] socket ${socket.id} joinRoundRoom view=${view ?? '(none)'} wireFormat=${wireFormat ?? 'msgpack'} -> matchData=${joinMatchData} matchDataPositional=${joinMatchDataPositional} overall=${joinOverall}`);
+
+      // Instant hydration: without this, a socket that just joined gets
+      // nothing until the NEXT live tick from the desktop relay — could be
+      // seconds away, or never if the relay isn't actively ticking (e.g.
+      // no roster change). liveMatchCache already holds the last full
+      // match-data object for exactly this purpose; it's just never been
+      // read from here before. Scoped to matchData/matchDataPositional
+      // only — the :overall room has no equivalent full-snapshot cache
+      // (only a last-delta cache), and computing one synchronously here
+      // would mean running computeOverallMatchDataForRound (already
+      // documented above as the most expensive step in the tick path) on
+      // every single join, which is out of scope for this fix.
+      if (!joinMatchData && !joinMatchDataPositional) return;
+      try {
+        // isSelected is unique per (tournamentId, roundId) globally (see
+        // MatchSelection.controller.js's selectMatch, which unconditionally
+        // clears isSelected for every other selection in that round before
+        // setting the new one) — this needs no session/auth, so it also
+        // works for the fully anonymous public-overlay case this handler's
+        // own comment says it must support.
+        const selection = await MatchSelection.findOne({ tournamentId, roundId, isSelected: true })
+          .select('userId matchId')
+          .lean();
+        if (!selection) return;
+        const cacheKey = `${String(selection.userId)}:${String(selection.matchId)}`;
+        const memoryMatch = liveMatchCache.get(cacheKey);
+        if (!memoryMatch) return;
+
+        // volatile:false deliberately, unlike the regular tick path above
+        // — this is a one-shot catch-up send for a socket that has nothing
+        // yet, so it must not be silently dropped under backpressure the
+        // way a routine tick's delta safely can be.
+        const basePayload = { ...memoryMatch, matchId: String(selection.matchId) };
+        if (joinMatchDataPositional) {
+          emitToRoomSplitByFormat(io, [socket.id], 'liveMatchUpdate', {
+            protoMessageName: 'MatchDataPayload',
+            mapToProto: toProtoMatchDataPayload,
+            data: { ...basePayload, teams: memoryMatch.teams },
+            volatile: false,
+          });
+        } else {
+          emitToRoomSplitByFormat(io, [socket.id], 'liveMatchUpdate', {
+            protoMessageName: 'MatchDataPayload',
+            mapToProto: toProtoMatchDataPayload,
+            data: { ...basePayload, teams: stripPositionalFields(memoryMatch.teams) },
+            volatile: false,
+          });
+        }
+      } catch (err) {
+        console.error(`[bw][room] joinRoundRoom hydration failed for ${socket.id}:`, err.message);
+      }
     });
 
     socket.on('leaveRoundRoom', ({ tournamentId, roundId } = {}) => {
@@ -1011,6 +1086,16 @@ function startLiveMatchUpdater() {
       socket.leave(`round:${tournamentId}:${roundId}:matchData`);
       socket.leave(`round:${tournamentId}:${roundId}:matchDataPositional`);
       socket.leave(`round:${tournamentId}:${roundId}:overall`);
+      // Keep joinRoundRoom's own leave-before-join bookkeeping in sync —
+      // an explicit leave here means there's no longer a "previous scope"
+      // for a later joinRoundRoom call to redundantly (harmlessly) leave.
+      if (
+        socket.data.roundRoomScope &&
+        socket.data.roundRoomScope.tournamentId === tournamentId &&
+        socket.data.roundRoomScope.roundId === roundId
+      ) {
+        delete socket.data.roundRoomScope;
+      }
       console.log(`[bw][room] socket ${socket.id} leaveRoundRoom tournamentId=${tournamentId} roundId=${roundId}`);
     });
 
