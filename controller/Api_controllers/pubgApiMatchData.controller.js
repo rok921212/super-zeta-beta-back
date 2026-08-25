@@ -1022,6 +1022,7 @@ function startLiveMatchUpdater() {
         socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:matchData`);
         socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:matchDataPositional`);
         socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:overall`);
+        socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:control`);
       }
       socket.data.roundRoomScope = { tournamentId, roundId };
 
@@ -1039,6 +1040,11 @@ function startLiveMatchUpdater() {
       const matchDataRoom = `round:${tournamentId}:${roundId}:matchData`;
       const matchDataPositionalRoom = `round:${tournamentId}:${roundId}:matchDataPositional`;
       const overallRoom = `round:${tournamentId}:${roundId}:overall`;
+      // Joined unconditionally (no view-tier gating, unlike the three rooms
+      // above) — a live view/theme switch (see OverlayControl.controller.js)
+      // must reach every socket in this round regardless of which data tier
+      // it's currently subscribed to.
+      const controlRoom = `round:${tournamentId}:${roundId}:control`;
 
       // A missing `view` means an old/pre-deploy overlay build (never sends
       // it) — treat that as "needs everything" so an already-open OBS
@@ -1058,6 +1064,7 @@ function startLiveMatchUpdater() {
       if (joinMatchDataPositional) socket.join(matchDataPositionalRoom);
       else if (joinMatchData) socket.join(matchDataRoom);
       if (joinOverall) socket.join(overallRoom);
+      socket.join(controlRoom);
 
       console.log(`[bw][room] socket ${socket.id} joinRoundRoom view=${view ?? '(none)'} wireFormat=${wireFormat ?? 'msgpack'} -> matchData=${joinMatchData} matchDataPositional=${joinMatchDataPositional} overall=${joinOverall}`);
 
@@ -1118,6 +1125,7 @@ function startLiveMatchUpdater() {
       socket.leave(`round:${tournamentId}:${roundId}:matchData`);
       socket.leave(`round:${tournamentId}:${roundId}:matchDataPositional`);
       socket.leave(`round:${tournamentId}:${roundId}:overall`);
+      socket.leave(`round:${tournamentId}:${roundId}:control`);
       // Keep joinRoundRoom's own leave-before-join bookkeeping in sync —
       // an explicit leave here means there's no longer a "previous scope"
       // for a later joinRoundRoom call to redundantly (harmlessly) leave.
