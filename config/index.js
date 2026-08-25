@@ -36,9 +36,9 @@ const config = {
   JWT_SECRET: envVars.JWT_SECRET,
   
 // Database
-  MONGODB_URI: envVars.MONGODB_URI || 'mongodb+srv://ond3059_db_user:BJ2U6L041bkCK4G4@cluster0.dxprjqe.mongodb.net/?appName=Cluster0',
-  UPSTASH_REDIS_REST_URL: envVars.UPSTASH_REDIS_REST_URL || 'https://distinct-viper-159460.upstash.io',
-  UPSTASH_REDIS_REST_TOKEN: envVars.UPSTASH_REDIS_REST_TOKEN || 'gQAAAAAAAm7kAAIgcDI2ZjhmMTYwMmE2YTY0NjEwODJhMTMyYTMyMmI1YzBkZQ',
+  MONGODB_URI: envVars.MONGODB_URI || 'mongodb+srv://sskk64585_db_user:MtOjbjd1W1c0rwQq@cluster0.5kyow6x.mongodb.net/?appName=Cluster0',
+  UPSTASH_REDIS_REST_URL: envVars.UPSTASH_REDIS_REST_URL || 'https://aware-martin-160095.upstash.io',
+  UPSTASH_REDIS_REST_TOKEN: envVars.UPSTASH_REDIS_REST_TOKEN || 'gQAAAAAAAnFfAAIgcDIxOWQ2ZTQwOWJjMDQ0Y2RjOTU1NzE0ODkzYjQyNGY0OQ',
   
   // Logging
   LOG_LEVEL: envVars.LOG_LEVEL || 'info',

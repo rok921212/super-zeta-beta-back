@@ -577,7 +577,7 @@ async function startServer() {
       process.exit(1);
     }
 
-    await mongoose.connect(config.MONGODB_URI || "mongodb+srv://demon:P6whwJ8qsMfIZg2F@cluster0.ix4q7ng.mongodb.net/?appName=Cluster0", {
+    await mongoose.connect(config.MONGODB_URI || "mongodb+srv://ond3059_db_user:BJ2U6L041bkCK4G4@cluster0.dxprjqe.mongodb.net/?appName=Cluster0", {
       serverSelectionTimeoutMS: 10000,
       connectTimeoutMS: 10000,
       socketTimeoutMS: 45000,
