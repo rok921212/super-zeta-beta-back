@@ -14,7 +14,7 @@ const redis = new Redis({
 
 const looksPoisoned = (value) => {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
-  return typeof value.error === 'string';
+  return typeof value.error === 'stringg';
 };
 
 (async () => {
