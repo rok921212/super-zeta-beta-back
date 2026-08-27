@@ -559,6 +559,13 @@ const userProcessing = new Map();
 const activeUserKeys = new Set();
 const userKeyToDbId = new Map();
 
+// DIAGNOSTIC (2026-08-23), throttled: discoverAndStartPollingUsers' pass
+// summary below only needs to print when something actually changed —
+// roundIds/selectedMatches/uniqueActiveUserIds are stable for long
+// stretches, so logging every 10s pass unconditionally just repeats the
+// same line forever once the system is steady.
+let lastDiscoveryLogSignature = null;
+
 // DIAGNOSTIC (2026-08-23): throttle for the "tick ignored, not in
 // activeUserKeys" warning in triggerImmediateUpdateForUser below — ticks
 // arrive every ~1-2s from a live relay, so an unthrottled log line there
@@ -838,6 +845,25 @@ function startLiveMatchUpdater() {
 
   console.log(c('cyan', `[socket] relay registered → user ${key} (${socket.id}, ${Date.now() - registerStartedAt}ms total)`));
   ack({ ok: true, userId: key });
+
+  // Reconcile the relay's own sending_enabled with the DB truth on every
+  // (re)registration. A polling toggle that happened while this relay was
+  // mid-reconnect broadcasts pollingStatusUpdated into user:<id> and never
+  // reaches a socket that wasn't in the room yet — this pushes the current
+  // state to the freshly-(re)joined relay socket so the desktop/website
+  // "Fetch Data" switch and the relay can't stay diverged. Fire-and-forget
+  // AFTER the ack (must not delay it); goes only to this one socket. The
+  // Rust `pollingStatusUpdated` handler reads `isPollingActive` and calls
+  // set_sending_enabled, which no-ops when already at that value.
+  MatchSelection.findOne({ userId: user._id, isSelected: true, isPollingActive: true })
+    .select('_id matchId roundId tournamentId')
+    .lean()
+    .then((sel) => {
+      socket.emit('pollingStatusUpdated', sel
+        ? { _id: sel._id, matchId: sel.matchId, roundId: sel.roundId, tournamentId: sel.tournamentId, isPollingActive: true }
+        : { isPollingActive: false });
+    })
+    .catch((e) => console.warn(c('yellow', `[socket] registerRelay polling reconcile failed for ${key}: ${e.message}`)));
   } catch (err) {
     console.error(c('red', `[socket][registerRelay] handler FAILED for ${socket.id} after ${Date.now() - registerStartedAt}ms: ${err.message}`));
     ack({ ok: false, reason: 'internal error' });
@@ -1022,7 +1048,6 @@ function startLiveMatchUpdater() {
         socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:matchData`);
         socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:matchDataPositional`);
         socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:overall`);
-        socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:control`);
       }
       socket.data.roundRoomScope = { tournamentId, roundId };
 
@@ -1040,11 +1065,6 @@ function startLiveMatchUpdater() {
       const matchDataRoom = `round:${tournamentId}:${roundId}:matchData`;
       const matchDataPositionalRoom = `round:${tournamentId}:${roundId}:matchDataPositional`;
       const overallRoom = `round:${tournamentId}:${roundId}:overall`;
-      // Joined unconditionally (no view-tier gating, unlike the three rooms
-      // above) — a live view/theme switch (see OverlayControl.controller.js)
-      // must reach every socket in this round regardless of which data tier
-      // it's currently subscribed to.
-      const controlRoom = `round:${tournamentId}:${roundId}:control`;
 
       // A missing `view` means an old/pre-deploy overlay build (never sends
       // it) — treat that as "needs everything" so an already-open OBS
@@ -1064,7 +1084,6 @@ function startLiveMatchUpdater() {
       if (joinMatchDataPositional) socket.join(matchDataPositionalRoom);
       else if (joinMatchData) socket.join(matchDataRoom);
       if (joinOverall) socket.join(overallRoom);
-      socket.join(controlRoom);
 
       console.log(`[bw][room] socket ${socket.id} joinRoundRoom view=${view ?? '(none)'} wireFormat=${wireFormat ?? 'msgpack'} -> matchData=${joinMatchData} matchDataPositional=${joinMatchDataPositional} overall=${joinOverall}`);
 
@@ -1823,7 +1842,11 @@ function startLiveMatchUpdater() {
       // out below is explainable — few/no roundIds means no round has
       // apiEnable, few/no selectedMatches means no MatchSelection matched
       // isSelected+isPollingActive for that round set.
-      console.debug(`[discovery] pass: roundIds=${roundIds.length} selectedMatches=${selectedMatches.length} uniqueActiveUserIds=${uniqueActiveUserIds.length}`);
+      const discoverySignature = `${roundIds.length}:${selectedMatches.length}:${uniqueActiveUserIds.length}`;
+      if (discoverySignature !== lastDiscoveryLogSignature) {
+        console.debug(`[discovery] pass: roundIds=${roundIds.length} selectedMatches=${selectedMatches.length} uniqueActiveUserIds=${uniqueActiveUserIds.length}`);
+        lastDiscoveryLogSignature = discoverySignature;
+      }
 
       for (const uid of uniqueActiveUserIds) {
         if (!activeUserKeys.has(uid)) {

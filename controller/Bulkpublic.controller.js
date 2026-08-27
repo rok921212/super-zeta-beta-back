@@ -27,7 +27,7 @@ const VIEWS_NEEDING_MATCHES_LIST = new Set([
 ]);
 const VIEWS_NEEDING_ALL_MATCH_DATAS = new Set([
   'Schedule', 'highlightPoints', 'HighlightSchedule', 'OverAllData', 'OverallFrags',
-  'EventMvp',
+  'EventMvp', 'Achive',
 ]);
 
 // Field set actually read by the round-summary views (Schedule,
@@ -39,6 +39,15 @@ const VIEWS_NEEDING_ALL_MATCH_DATAS = new Set([
 // never read. Keep in sync with VIEWS_NEEDING_ALL_MATCH_DATAS above if a
 // future view added to that set needs more fields.
 const SUMMARY_PLAYER_FIELDS = ['killNum', 'damage', 'assists', 'survivalTime', 'knockouts'];
+
+// Achive's round-wide "PLAYERS SUMMARY" leaderboard aggregates
+// grenade-kills/kill-distance/travel-distance across every match too, so
+// its matchDatasData entries need the extra live-stat fields that the
+// other summary views above don't read. Kept as its own list rather than
+// widening SUMMARY_PLAYER_FIELDS so those other views' payload stays slim.
+const ACHIVE_MATCH_LIST_FIELDS = [
+  ...SUMMARY_PLAYER_FIELDS, 'killNumByGrenade', 'maxKillDistance', 'driveDistance', 'marchDistance',
+];
 
 /* --------------------------------------------------------------------
    PER-VIEW PLAYER-FIELD SLIMMING (currentMatchData / overallData)
@@ -140,8 +149,9 @@ function slimPlayersForView(teams, view) {
 // place — matchDataMap's entries are shared/aliased with
 // currentMatchData.matchData (the live match), so mutating here would risk
 // stripping fields off the real-time payload too.
-function slimMatchDataForList(matchData) {
+function slimMatchDataForList(matchData, view) {
   if (!matchData) return matchData;
+  const fields = view === 'Achive' ? ACHIVE_MATCH_LIST_FIELDS : SUMMARY_PLAYER_FIELDS;
   return {
     _id: matchData._id,
     matchId: matchData.matchId,
@@ -154,7 +164,7 @@ function slimMatchDataForList(matchData) {
       placePoints: team.placePoints,
       players: (team.players || []).map(p => {
         const slim = { uId: p.uId, _id: p._id, playerName: p.playerName, picUrl: p.picUrl };
-        for (const f of SUMMARY_PLAYER_FIELDS) slim[f] = p[f];
+        for (const f of fields) slim[f] = p[f];
         return slim;
       }),
     })),
@@ -512,7 +522,7 @@ async function buildBulkPayload({ tournamentId, roundId, matchId, view = null, f
       .map(m => {
         const md = matchDataMap.get(m._id.toString());
         if (!md) return null;
-        return { matchId: m._id, matchNo: m.matchNo, matchData: slimMatchDataForList(md) };
+        return { matchId: m._id, matchNo: m.matchNo, matchData: slimMatchDataForList(md, view) };
       })
       .filter(Boolean);
   }

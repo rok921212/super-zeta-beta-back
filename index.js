@@ -27,7 +27,6 @@ const roundRoutes = require('./route/round.route.js');
 const matchRoutes = require('./route/match.route.js');
 const matchDataRoutes = require('./route/matchData.route.js');
 const matchSelectionRoutes = require('./route/matchSelection.route.js');
-const overlayControlRoutes = require('./route/overlayControl.route.js');
 const overallRoutes = require('./route/overall.route.js');
 
 const userRoutes = require('./route/User.route.js');
@@ -196,7 +195,6 @@ app.use('/api', roundRoutes);
 app.use('/api', teamRoutes);
 app.use('/api', matchDataRoutes);
 app.use('/api/matchSelection', matchSelectionRoutes);
-app.use('/api/overlayControl', overlayControlRoutes);
 app.use('/api', overallRoutes);
 app.use('/api/public', bulkRoutes);
 
@@ -312,28 +310,6 @@ app.get('/api/public/tournaments/:tournamentId/rounds/:roundId/selected-match', 
     return res.status(404).json({ error: 'No selected match or matches found' });
   } catch (err) {
     console.error('Public selected-match error:', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-// Public: get the currently-set overlay view/theme for a round (live
-// remote-switch feature — see OverlayControl.controller.js's setOverlayControl
-// for the authenticated write side and the matching socket broadcast).
-app.get('/api/public/tournaments/:tournamentId/rounds/:roundId/overlay-control', async (req, res) => {
-  try {
-    const { tournamentId, roundId } = req.params;
-    const mongoose = require('mongoose');
-    if (!mongoose.Types.ObjectId.isValid(tournamentId) || !mongoose.Types.ObjectId.isValid(roundId)) {
-      return res.status(400).json({ error: 'Invalid tournamentId or roundId' });
-    }
-    const Round = require('./models/round.model');
-    const round = await Round.findOne({ _id: roundId, tournamentId }).lean();
-    if (!round || (!round.overlayView && !round.overlayTheme)) {
-      return res.status(404).json({ error: 'No overlay control set for this round' });
-    }
-    return res.json({ view: round.overlayView, theme: round.overlayTheme, updatedAt: round.updatedAt });
-  } catch (err) {
-    console.error('Public overlay-control error:', err);
     return res.status(500).json({ error: err.message });
   }
 });
