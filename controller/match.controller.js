@@ -4,9 +4,13 @@ const Tournament = require('../models/tournament.model');
 const MatchData = require('../models/matchData.model');
 const MatchSelection = require('../models/MatchSelection.model.js');
 
+const mongoose = require('mongoose');
+
 const { createMatchDataForMatchDoc } = require('./matchData.controller.js');
 const { getSocket } = require('../socket.js');
 const { notifyRoundStructureChanged } = require('../utils/roundStructure.js');
+const { saveLiveMatchSnapshot } = require('./Api_controllers/pubgApiMatchData.controller.js');
+const { invalidateScope } = require('../middleware/cache.js');
 
 // Convert time to 12-hour
 function convertTo12Hour(time24) {
@@ -194,6 +198,75 @@ const updateAllMatchesWithRoundGroups = async (req, res) => {
   }
 };
 
+// ✅ Manual "SAVE DATA" — snapshot the current in-memory live match state to
+// MongoDB, on operator demand. NOT a finalization: the socket, relay, PCOB
+// ingestion, live emissions and polling all keep running unchanged. This is an
+// idempotent overwrite of the one MatchData doc (no history docs).
+//
+// Body: { tournamentId, roundId, matchId? }. When matchId is omitted the
+// current match is resolved from the round's isSelected MatchSelection (the
+// same identifier system joinRoundRoom / getSelectedMatch already use).
+const saveCurrentMatchData = async (req, res) => {
+  try {
+    const userId = req.session.userId;
+    let { tournamentId, roundId, matchId } = req.body || {};
+
+    if (matchId) {
+      if (!mongoose.Types.ObjectId.isValid(matchId)) {
+        return res.status(400).json({ success: false, message: 'Invalid matchId' });
+      }
+      // Explicit matchId must still belong to this operator.
+      const owned = await Match.findOne({ _id: matchId, userId })
+        .select('_id tournamentId roundId')
+        .lean();
+      if (!owned) {
+        return res.status(404).json({ success: false, message: 'Match not found or not yours' });
+      }
+      tournamentId = tournamentId || String(owned.tournamentId);
+      roundId = roundId || String(owned.roundId);
+    } else {
+      if (!tournamentId || !roundId) {
+        return res.status(400).json({ success: false, message: 'tournamentId and roundId (or matchId) required' });
+      }
+      const selection = await MatchSelection.findOne({ tournamentId, roundId, userId, isSelected: true }).lean();
+      if (!selection) {
+        // Not an error — the schedule / match-data pages can be open with no
+        // match selected for this round yet.
+        return res.status(200).json({ success: true, saved: false, reason: 'no-selected-match' });
+      }
+      matchId = String(selection.matchId);
+    }
+
+    const result = await saveLiveMatchSnapshot({ matchId, userId });
+
+    if (!result.saved) {
+      return res.status(200).json({ success: true, saved: false, reason: result.reason });
+    }
+
+    // Best-effort: bust the public round cache so /api/public/bulk + /overall
+    // reflect the save without waiting for a TTL. The automatic 3s writer never
+    // did this; with it off, this is the only thing keeping result screens
+    // fresh after a manual save.
+    if (tournamentId && roundId) {
+      try {
+        await invalidateScope(`round:${tournamentId}:${roundId}`);
+      } catch (e) {
+        console.warn('[saveCurrentMatchData] cache invalidate failed:', e.message);
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      saved: true,
+      matchId: result.matchId,
+      savedAt: result.savedAt,
+    });
+  } catch (err) {
+    console.error('[saveCurrentMatchData]', err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 module.exports = {
   createMatchInRoundInTournament,
   getMatchById,
@@ -203,4 +276,5 @@ module.exports = {
   updateMatch,
   deleteMatch,
   updateAllMatchesWithRoundGroups,
+  saveCurrentMatchData,
 };

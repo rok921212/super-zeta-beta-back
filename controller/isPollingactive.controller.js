@@ -58,8 +58,16 @@ const updatePollingStatus = async (req, res) => {
       return res.status(403).json({ message: 'API is not enabled for this round. Cannot modify polling status.' });
     }
 
-    // Disable polling for all other matches of this user in the same round & tournament
+    // Disable polling for all other matches of this user in the same round & tournament.
+    // Capture which ones were actually ON first, so we can emit a
+    // pollingStatusUpdated for each — otherwise every client keeps showing
+    // the just-force-disabled sibling as still LIVE until a refetch.
+    let disabledSiblings = [];
     if (isPollingActive) {
+      disabledSiblings = await MatchSelection.find(
+        { tournamentId, roundId, matchId: { $ne: matchId }, userId, isPollingActive: true }
+      ).select('_id matchId roundId tournamentId').lean();
+
       await MatchSelection.updateMany(
         { tournamentId, roundId, matchId: { $ne: matchId }, userId },
         { $set: { isPollingActive: false } }
@@ -83,6 +91,12 @@ const updatePollingStatus = async (req, res) => {
     // silently dropped by triggerImmediateUpdateForUser() until that next
     // pass catches up. The periodic sweep is now 60s (bandwidth: fewer Atlas
     // round-trips), so this fast path must be fully correct on its own.
+    // Whether ANY of this user's selections is still polling after this
+    // change — carried in the broadcast so a match-agnostic consumer (the
+    // desktop relay switch / its propless PollingManager mount) knows
+    // whether an `isPollingActive:false` for one match means "pause the
+    // relay" or "keep going, another match is still live".
+    let userStillActive = true;
     if (isPollingActive) {
       markUserActiveForPolling(userId);
     } else {
@@ -92,21 +106,43 @@ const updatePollingStatus = async (req, res) => {
       // is per-user, not per-match, so an unconditional call here would
       // freeze the other overlay until the 60s sweep re-added the user.)
       const stillActive = await MatchSelection.exists({ userId, isPollingActive: true });
+      userStillActive = !!stillActive;
       if (!stillActive) markUserInactiveForPolling(userId);
     }
 
     // --- Emit WebSocket event ---
     // Room must match `user:${key}` joined in registerRelay
     // (pubgApiMatchData.controller.js) — a bare userId room has no members.
+    // `ts` is a monotonic-enough server stamp shared by every event this
+    // request emits; clients apply last-write-wins on it so a slow/reordered
+    // broadcast can't clobber newer state. Sibling-off events go out FIRST
+    // and the real target LAST, so the last message the room sees is the
+    // authoritative target state.
     const io = getSocket();
     const room = `user:${userId}`;
-    console.log(`[socket] pollingStatusUpdated -> ${room} match=${matchId}`);
+    const ts = Date.now();
+
+    disabledSiblings.forEach((s) => {
+      io.to(room).emit('pollingStatusUpdated', {
+        _id: s._id,
+        matchId: s.matchId,
+        roundId: s.roundId,
+        tournamentId: s.tournamentId,
+        isPollingActive: false,
+        userStillActive: true, // the target of this request is turning ON
+        ts
+      });
+    });
+
+    console.log(`[socket] pollingStatusUpdated -> ${room} match=${matchId} (siblings off: ${disabledSiblings.length})`);
     io.to(room).emit('pollingStatusUpdated', {
       _id: updatedSelection._id,
       matchId,
       roundId,
       tournamentId,
-      isPollingActive: updatedSelection.isPollingActive
+      isPollingActive: updatedSelection.isPollingActive,
+      userStillActive,
+      ts
     });
 
     res.status(200).json({
@@ -114,7 +150,9 @@ const updatePollingStatus = async (req, res) => {
       tournamentId,
       roundId,
       matchId,
-      isPollingActive: updatedSelection.isPollingActive
+      isPollingActive: updatedSelection.isPollingActive,
+      userStillActive,
+      ts
     });
   } catch (err) {
     console.error(err);
@@ -143,13 +181,16 @@ const stopAllPolling = async (req, res) => {
 
       const io = getSocket();
       const room = `user:${userId}`;
+      const ts = Date.now();
       active.forEach((s) => {
         io.to(room).emit('pollingStatusUpdated', {
           _id: s._id,
           matchId: s.matchId,
           roundId: s.roundId,
           tournamentId: s.tournamentId,
-          isPollingActive: false
+          isPollingActive: false,
+          userStillActive: false, // everything is being turned off
+          ts
         });
       });
     }

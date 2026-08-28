@@ -5,6 +5,18 @@ const matchController = require('../controller/match.controller.js');
 const requireAuth = require('../authMiddleware.js'); // ✅ import middleware
 const { cacheMiddleware, invalidateCacheMiddleware } = require('../middleware/cache.js');
 
+// Snapshot the current in-memory live match state to MongoDB (operator
+// "SAVE DATA" button). Idempotent overwrite of the one MatchData doc — does
+// NOT finalize the match or touch the socket/relay/polling. Resolves the
+// current match from the round's isSelected MatchSelection when no matchId is
+// given. No cache middleware here: the public bulk/overall caches use the
+// `round:<tid>:<rid>` resource scope, which the controller busts directly.
+router.post(
+  '/match/save-current',
+  requireAuth,
+  matchController.saveCurrentMatchData
+);
+
 // Create a match inside specific tournament and round
 router.post(
   '/tournaments/:tournamentId/rounds/:roundId/matches',

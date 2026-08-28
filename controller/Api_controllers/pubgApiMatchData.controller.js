@@ -168,6 +168,12 @@ const SAVE_FLUSH_INTERVAL_MS = 3000;
 const saveQueue = new Map(); // "matchId:userId" -> { matchId, userId, teams }
 let isSaving = false;
 
+// Automatic 3s persistence is OFF by default now — live match `teams` are
+// persisted only on an explicit POST /api/match/save-current (the dashboard
+// "SAVE DATA" button, via saveLiveMatchSnapshot below). Set LIVE_AUTOSAVE=true
+// to restore the old continuous flush (e.g. as a durability safety net).
+const LIVE_AUTOSAVE_ENABLED = process.env.LIVE_AUTOSAVE === 'true';
+
 async function processSaveQueue() {
   if (isSaving || saveQueue.size === 0) return;
   isSaving = true;
@@ -192,7 +198,39 @@ async function processSaveQueue() {
   }
 }
 
-setInterval(processSaveQueue, SAVE_FLUSH_INTERVAL_MS);
+if (LIVE_AUTOSAVE_ENABLED) setInterval(processSaveQueue, SAVE_FLUSH_INTERVAL_MS);
+
+// ─── On-demand Live Snapshot Save ────────────────────────────────────────────
+// Persists the CURRENT in-memory live snapshot for one match to MongoDB on
+// operator demand (dashboard "SAVE DATA" button), using the SAME write shape as
+// processSaveQueue above ($set teams only, keyed by { matchId, userId }). It is
+// an idempotent overwrite of the single MatchData doc — never a history doc.
+// Reads liveMatchCache directly and does NOT touch the socket, the relay, PCOB
+// ingestion, polling flags, the saveQueue, or the flush timer — the live
+// pipeline keeps reading liveMatchCache untouched.
+//
+// userId here is req.session.userId (hex string from the JWT). The cache is
+// keyed `${String(userId)}:${String(matchId)}` at set-time (see
+// updateMatchDataWithLiveStats), and String(hex) === hex, so the Map lookup
+// matches. Mongoose casts the hex strings in the updateOne filter to ObjectId
+// against the schema, so the DB filter hits the same doc the automatic path
+// (ObjectIds) writes.
+async function saveLiveMatchSnapshot({ matchId, userId }) {
+  const cacheKey = `${String(userId)}:${String(matchId)}`;
+  const entry = liveMatchCache.get(cacheKey);
+  if (!entry || !Array.isArray(entry.teams)) {
+    return { saved: false, reason: 'no-live-snapshot' };
+  }
+  const result = await MatchData.updateOne(
+    { matchId, userId },
+    { $set: { teams: entry.teams } }
+  );
+  if (!result.matchedCount) {
+    return { saved: false, reason: 'no-matchdata-doc' };
+  }
+  console.log(c('green', `💾 SAVE DATA: match=${String(matchId)} user=${String(userId)} teams=${entry.teams.length}`));
+  return { saved: true, matchId: String(matchId), savedAt: new Date().toISOString() };
+}
 
 // ─── One-time Index Setup ─────────────────────────────────────────────────────
 const ensureIndexes = async () => {
@@ -637,6 +675,10 @@ function decodeTotalPlayerListPayload(raw) {
 function startLiveMatchUpdater() {
   const io = getSocket();
   console.log('Socket.IO instance connected:', !!io);
+  console.log(
+    'live autosave: ' +
+    (LIVE_AUTOSAVE_ENABLED ? 'ON (3s flush)' : 'OFF — manual SAVE DATA only')
+  );
 
   // ── Receive live player data pushed from each user's local relay ───────────
   io.on('connection', (socket) => {
@@ -890,13 +932,20 @@ function startLiveMatchUpdater() {
   // AFTER the ack (must not delay it); goes only to this one socket. The
   // Rust `pollingStatusUpdated` handler reads `isPollingActive` and calls
   // set_sending_enabled, which no-ops when already at that value.
-  MatchSelection.findOne({ userId: user._id, isSelected: true, isPollingActive: true })
+  //
+  // Query is `isPollingActive: true` ONLY — NOT `isSelected: true` too.
+  // updatePollingStatus never sets isSelected, so a selection that is
+  // polling-active but not flagged isSelected (a normal state) would
+  // otherwise make this push `{isPollingActive:false}` and wrongly disarm
+  // the relay on every reconnect. This matches activeUserKeys /
+  // stopAllPolling's own `exists({ userId, isPollingActive: true })`.
+  MatchSelection.findOne({ userId: user._id, isPollingActive: true })
     .select('_id matchId roundId tournamentId')
     .lean()
     .then((sel) => {
       socket.emit('pollingStatusUpdated', sel
-        ? { _id: sel._id, matchId: sel.matchId, roundId: sel.roundId, tournamentId: sel.tournamentId, isPollingActive: true }
-        : { isPollingActive: false });
+        ? { _id: sel._id, matchId: sel.matchId, roundId: sel.roundId, tournamentId: sel.tournamentId, isPollingActive: true, userStillActive: true, ts: Date.now() }
+        : { isPollingActive: false, userStillActive: false, ts: Date.now() });
     })
     .catch((e) => console.warn(c('yellow', `[socket] registerRelay polling reconcile failed for ${key}: ${e.message}`)));
   } catch (err) {
@@ -1597,17 +1646,23 @@ function startLiveMatchUpdater() {
     // Overwrites any still-pending snapshot for this match — see the
     // Background Save Queue definition above for why the flush is
     // deliberately deferred to a timer instead of happening right here.
-    saveQueue.set(cacheKey, {
-      matchId,
-      userId,
-      teams: updatedObject.teams,
-    });
+    // Gated on LIVE_AUTOSAVE_ENABLED: with automatic persistence off nothing
+    // drains saveQueue, so populating it would just leak memory. The manual
+    // SAVE DATA path (saveLiveMatchSnapshot) reads liveMatchCache above, not
+    // this queue.
+    if (LIVE_AUTOSAVE_ENABLED) {
+      saveQueue.set(cacheKey, {
+        matchId,
+        userId,
+        teams: updatedObject.teams,
+      });
 
-    if (VERBOSE_MATCH_LOGS) {
-      console.log(
-        `${c('dim', `[${new Date().toLocaleTimeString()}]`)} ` +
-        `${c('green', '✔ DB update queued')} for match=${matchId} user=${String(userId)}`
-      );
+      if (VERBOSE_MATCH_LOGS) {
+        console.log(
+          `${c('dim', `[${new Date().toLocaleTimeString()}]`)} ` +
+          `${c('green', '✔ DB update queued')} for match=${matchId} user=${String(userId)}`
+        );
+      }
     }
 
     return { data: updatedObject, changed: true, unmatchedChanged: unmatchedSetChanged };
@@ -1983,4 +2038,4 @@ function startLiveMatchUpdater() {
   setInterval(discoverAndStartPollingUsers, 60000);
 }
 
-module.exports = { startLiveMatchUpdater, getUnmatchedPlayers, markUserActiveForPolling, markUserInactiveForPolling };
+module.exports = { startLiveMatchUpdater, getUnmatchedPlayers, markUserActiveForPolling, markUserInactiveForPolling, saveLiveMatchSnapshot };
