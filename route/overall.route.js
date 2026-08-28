@@ -10,7 +10,7 @@ const { getOverallMatchDataForRound } = require('../controller/overall.controlle
 router.get(
   '/tournament/:tournamentId/round/:roundId/match/:matchId/overall',
   requireAuth,
-  cacheMiddleware(3, req => `round:${req.params.tournamentId}:${req.params.roundId}`),
+  cacheMiddleware(20, req => `round:${req.params.tournamentId}:${req.params.roundId}`),
   getOverallMatchDataForRound
 );
 

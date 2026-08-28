@@ -35,14 +35,24 @@ const DEAD_WEIGHT_PLAYER_FIELDS = new Set([
   'PoisonTotalDamage', 'UseSelfRescueTime', 'UseEmergencyCallTime',
 ]);
 
-// Fields that always ride along on an included player regardless of
-// whether they changed — identity (needed to key/route the player at all)
-// plus display strings that change so rarely the field-presence bookkeeping
-// isn't worth the extra merge complexity for them.
-const PLAYER_IDENTITY_FIELDS = [
-  'uId', 'docId', '_id', 'playerName', 'playerOpenId', 'picUrl',
-  'showPicUrl', 'character', 'teamIdfromApi', 'teamId', 'teamName',
+// Always included on any player that appears in a delta at all — needed to
+// key / route / merge the player client-side. Kept NON-optional in
+// overlay.proto (every one is cheap: short ids / small ints).
+const PLAYER_ROUTING_FIELDS = ['uId', 'docId', '_id', 'teamIdfromApi', 'teamId'];
+
+// Display strings — a Cloudinary URL each for picUrl/showPicUrl (~60-100 B),
+// plus name/character/teamName. They change rarely, so an included player
+// only carries one when it ACTUALLY changed since the previous tick (a
+// brand-new player still gets the full object — see computeChangedPlayerFields).
+// Declared `optional` in overlay.proto so an omitted one decodes as ABSENT,
+// not "", and PublicThemeRenderer's merge keeps the last-known value.
+const PLAYER_DISPLAY_FIELDS = [
+  'playerName', 'playerOpenId', 'picUrl', 'showPicUrl', 'character', 'teamName',
 ];
+
+// Back-compat union: "every field that isn't a live stat". The fingerprint
+// gate and the verify-*-delta.js scripts import this to isolate stat changes.
+const PLAYER_IDENTITY_FIELDS = [...PLAYER_ROUTING_FIELDS, ...PLAYER_DISPLAY_FIELDS];
 
 function fieldsEqual(a, b) {
   // location is a nested {x,y,z} object; every other field here is a scalar.
@@ -52,19 +62,30 @@ function fieldsEqual(a, b) {
   return a === b;
 }
 
-// Returns a player object containing only the identity fields plus whichever
-// OTHER fields actually differ from `previous` — or the full player object
-// unchanged on a first-tick-for-this-player (no `previous`), same "first
-// tick sends everything" rule computeChangedTeams already uses for teams.
+// Returns a player object containing the routing fields, plus any display
+// string or live stat that actually differs from `previous` — or the full
+// player object unchanged on a first-tick-for-this-player (no `previous`),
+// same "first tick sends everything" rule computeChangedTeams uses for teams.
 function computeChangedPlayerFields(current, previous) {
   if (!previous) return current;
 
   const out = {};
-  for (const key of PLAYER_IDENTITY_FIELDS) {
+  for (const key of PLAYER_ROUTING_FIELDS) {
     if (current[key] !== undefined) out[key] = current[key];
   }
+  // Display strings: only when they actually moved (name change, logo swap,
+  // photo backfill) — otherwise the client keeps its last-known value.
+  for (const key of PLAYER_DISPLAY_FIELDS) {
+    if (current[key] !== undefined && !fieldsEqual(current[key], previous[key])) {
+      out[key] = current[key];
+    }
+  }
   for (const key of Object.keys(current)) {
-    if (PLAYER_IDENTITY_FIELDS.includes(key) || DEAD_WEIGHT_PLAYER_FIELDS.has(key)) continue;
+    if (
+      PLAYER_ROUTING_FIELDS.includes(key) ||
+      PLAYER_DISPLAY_FIELDS.includes(key) ||
+      DEAD_WEIGHT_PLAYER_FIELDS.has(key)
+    ) continue;
     if (!fieldsEqual(current[key], previous[key])) out[key] = current[key];
   }
   return out;
@@ -85,7 +106,10 @@ function computeChangedPlayers(currentPlayers, previousPlayers) {
       changed.push(diffed);
       continue;
     }
-    const changedKeys = Object.keys(diffed).filter((k) => !PLAYER_IDENTITY_FIELDS.includes(k));
+    // "Did anything beyond routing change?" — a display-string-only change
+    // (name/logo/photo) still counts, so filter out only PLAYER_ROUTING_FIELDS,
+    // not the display fields.
+    const changedKeys = Object.keys(diffed).filter((k) => !PLAYER_ROUTING_FIELDS.includes(k));
     if (changedKeys.length > 0) changed.push(diffed);
   }
   return changed;
@@ -118,6 +142,11 @@ function stripPositionalFields(teams) {
   });
 }
 
+// Team display strings — teamLogo is a Cloudinary URL, teamName/teamTag short
+// strings. Same treatment as PLAYER_DISPLAY_FIELDS: an already-known team
+// only re-sends one when it changed. `optional` in overlay.proto.
+const TEAM_DISPLAY_FIELDS = ['teamName', 'teamTag', 'teamLogo'];
+
 function computeChangedTeams(currentTeams, previousTeams) {
   const prevByKey = new Map((previousTeams || []).map((t) => [teamKey(t), t]));
   const changed = [];
@@ -128,7 +157,12 @@ function computeChangedTeams(currentTeams, previousTeams) {
       continue;
     }
     if (JSON.stringify(team) !== JSON.stringify(prevTeam)) {
-      changed.push({ ...team, players: computeChangedPlayers(team.players, prevTeam.players) });
+      const trimmed = { ...team };
+      for (const key of TEAM_DISPLAY_FIELDS) {
+        if (key in trimmed && fieldsEqual(trimmed[key], prevTeam[key])) delete trimmed[key];
+      }
+      trimmed.players = computeChangedPlayers(team.players, prevTeam.players);
+      changed.push(trimmed);
     }
   }
   return changed;
@@ -144,5 +178,8 @@ module.exports = {
   TRACKED_FIELDS,
   DEAD_WEIGHT_PLAYER_FIELDS,
   PLAYER_IDENTITY_FIELDS,
+  PLAYER_ROUTING_FIELDS,
+  PLAYER_DISPLAY_FIELDS,
+  TEAM_DISPLAY_FIELDS,
   POSITIONAL_PLAYER_FIELDS,
 };

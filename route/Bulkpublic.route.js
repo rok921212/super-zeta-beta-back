@@ -17,9 +17,17 @@ const { msgpackCacheMiddleware } = require('../middleware/cache.js');
  *   /api/public/bulk/64f.../64f2.../64f3...?view=Upper
  *   /api/public/bulk/64f.../64f2...?followSelected=true   (no matchId needed)
  */
+// Bandwidth: TTL raised 3s -> 20s. Every OBS overlay source polls this on
+// mount, on a 10-min timer, and on every socket reconnect; a 3s TTL meant
+// each burst re-ran the full Mongo aggregation AND wrote a fresh Upstash
+// REST entry (SET + SADD + EXPIRE) — that write traffic is billed
+// service-initiated. The live match/overall slices in this payload are only
+// a mount/reconnect seed anyway (the socket delta stream + joinRoundRoom
+// hydration correct them within ~2s), and a manual dashboard edit still
+// clears this key immediately via invalidateScope('round:<tid>:<rid>').
 router.get(
   '/bulk/:tournamentId/:roundId/:matchId',
-  msgpackCacheMiddleware(3, req => `round:${req.params.tournamentId}:${req.params.roundId}`),
+  msgpackCacheMiddleware(20, req => `round:${req.params.tournamentId}:${req.params.roundId}`),
   getBulkData
 );
 

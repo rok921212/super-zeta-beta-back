@@ -6,6 +6,7 @@ const MatchSelection = require('../models/MatchSelection.model.js');
 
 const { createMatchDataForMatchDoc } = require('./matchData.controller.js');
 const { getSocket } = require('../socket.js');
+const { notifyRoundStructureChanged } = require('../utils/roundStructure.js');
 
 // Convert time to 12-hour
 function convertTo12Hour(time24) {
@@ -62,6 +63,7 @@ const createMatchInRoundInTournament = async (req, res) => {
 
     const payload = { match: savedMatch, matchData: createdMatchData };
     getSocket().to(`user:${req.session.userId}`).emit('matchCreated', payload);
+    notifyRoundStructureChanged(tournamentId, roundId);
 
     res.status(201).json(payload);
   } catch (err) {
@@ -136,6 +138,7 @@ const updateMatch = async (req, res) => {
     const updatedMatchWithData = await fetchMatchWithData(updatedMatch);
 
     getSocket().to(`user:${req.session.userId}`).emit('matchUpdated', updatedMatchWithData);
+    notifyRoundStructureChanged(tournamentId, roundId);
     res.json(updatedMatchWithData);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -153,6 +156,7 @@ const deleteMatch = async (req, res) => {
     const deletedSelections = await MatchSelection.deleteMany({ matchId: match._id });
 
     getSocket().to(`user:${req.session.userId}`).emit('matchDeleted', { matchId: match._id });
+    notifyRoundStructureChanged(tournamentId, roundId);
 
     res.json({
       message: 'Match, related MatchData, and MatchSelections deleted successfully',
@@ -179,6 +183,7 @@ const updateAllMatchesWithRoundGroups = async (req, res) => {
       roundId: round._id,
       modifiedCount: result.modifiedCount,
     });
+    notifyRoundStructureChanged(round.tournamentId, round._id);
 
     res.status(200).json({
       message: 'All matches updated with round groups',

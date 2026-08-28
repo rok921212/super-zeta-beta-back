@@ -18,7 +18,6 @@ const compression = require('compression');
 const http = require('http');
 const jwt = require('jsonwebtoken');
 const { initializeSocket } = require('./socket.js');
-const axios = require(require.resolve('axios'));
 // Import routes
 const groupRoutes = require('./route/group.route.js');
 const teamRoutes = require('./route/team.route.js');
@@ -41,8 +40,20 @@ const port = process.env.PORT || 3000;
 // Trust proxy (required for Render.com and other cloud platforms)
 app.set('trust proxy', 1);
 
-// Enable compression for all responses
-app.use(compression());
+// Enable compression for all responses.
+//
+// Bandwidth: the stock `compression()` filter defers to `compressible(contentType)`,
+// which has no entry for `application/msgpack` — so the biggest single response on
+// this server, `GET /api/public/bulk/...` (msgpack, up to ~360KB), was going out
+// completely uncompressed. msgpack of structured tournament data still gzips ~5-8x.
+// Force-compress msgpack; everything else keeps the default heuristic.
+app.use(compression({
+  filter: (req, res) => {
+    const type = res.getHeader('Content-Type');
+    if (typeof type === 'string' && type.includes('application/msgpack')) return true;
+    return compression.filter(req, res);
+  },
+}));
 
 // Auto-detect production environment
 const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER === 'true' || process.env.REACT_APP_API_URL?.includes('render.com');
@@ -346,7 +357,7 @@ app.get('/api/public/tournaments/:tournamentId/groups', cacheMiddleware(), async
 });
 
 // Public overall aggregated data for a round in a tournament
-app.get('/api/public/tournaments/:tournamentId/rounds/:roundId/overall', cacheMiddleware(3, req => `round:${req.params.tournamentId}:${req.params.roundId}`), async (req, res) => {
+app.get('/api/public/tournaments/:tournamentId/rounds/:roundId/overall', cacheMiddleware(20, req => `round:${req.params.tournamentId}:${req.params.roundId}`), async (req, res) => {
   try {
     const mongoose = require('mongoose');
     const Match = require('./models/match.model');
@@ -364,7 +375,7 @@ app.get('/api/public/tournaments/:tournamentId/rounds/:roundId/overall', cacheMi
 
     const matches = await Match.find({ tournamentId, roundId }).sort({ matchNo: 1 }).lean();
     if (!matches || matches.length === 0) {
-      return res.json({ tournamentId, roundId, teams: [], createdAt: new Date() });
+      return res.json({ tournamentId, roundId, teams: [] });
     }
 
     // Use all matches in the round for overall data
@@ -372,7 +383,7 @@ app.get('/api/public/tournaments/:tournamentId/rounds/:roundId/overall', cacheMi
 
     // helpers
     const NUMERIC_PLAYER_FIELDS = [
-      'health','healthMax','liveState','killNum','killNumBeforeDie','gotAirDropNum','maxKillDistance','damage',
+      'health','healthMax','liveState','killNum','killNumBeforeDie','gotAirDropNum','maxKillDistance','damage','heal',
       'killNumInVehicle','killNumByGrenade','AIKillNum','BossKillNum','rank','inDamage','headShotNum','survivalTime',
       'driveDistance','marchDistance','assists','outsideBlueCircleTime','knockouts','rescueTimes','useSmokeGrenadeNum',
       'useFragGrenadeNum','useBurnGrenadeNum','useFlashGrenadeNum','PoisonTotalDamage','UseSelfRescueTime',
@@ -519,7 +530,9 @@ app.get('/api/public/tournaments/:tournamentId/rounds/:roundId/overall', cacheMi
       players: Array.from(t.players.values())
     })).sort((a, b) => (a.slot || 0) - (b.slot || 0));
 
-    return res.json({ tournamentId, roundId, teams: aggregatedTeams, createdAt: new Date() });
+    // No `createdAt: new Date()` — keeps the body byte-stable for a given DB
+    // state so Express's ETag actually lets this cached endpoint 304.
+    return res.json({ tournamentId, roundId, teams: aggregatedTeams });
   } catch (err) {
     console.error('Public overall error:', err);
     return res.status(500).json({ error: err.message });

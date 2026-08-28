@@ -366,25 +366,18 @@ $root.overlay = (function() {
          * @property {number|null} [damage] Player damage
          * @property {number|null} [killNumInVehicle] Player killNumInVehicle
          * @property {number|null} [killNumByGrenade] Player killNumByGrenade
-         * @property {number|null} [AIKillNum] Player AIKillNum
-         * @property {number|null} [BossKillNum] Player BossKillNum
          * @property {number|null} [rank] Player rank
-         * @property {number|null} [inDamage] Player inDamage
          * @property {number|null} [headShotNum] Player headShotNum
          * @property {number|null} [survivalTime] Player survivalTime
          * @property {number|null} [driveDistance] Player driveDistance
          * @property {number|null} [marchDistance] Player marchDistance
          * @property {number|null} [assists] Player assists
-         * @property {number|null} [outsideBlueCircleTime] Player outsideBlueCircleTime
          * @property {number|null} [knockouts] Player knockouts
          * @property {number|null} [rescueTimes] Player rescueTimes
          * @property {number|null} [useSmokeGrenadeNum] Player useSmokeGrenadeNum
          * @property {number|null} [useFragGrenadeNum] Player useFragGrenadeNum
          * @property {number|null} [useBurnGrenadeNum] Player useBurnGrenadeNum
          * @property {number|null} [useFlashGrenadeNum] Player useFlashGrenadeNum
-         * @property {number|null} [PoisonTotalDamage] Player PoisonTotalDamage
-         * @property {number|null} [UseSelfRescueTime] Player UseSelfRescueTime
-         * @property {number|null} [UseEmergencyCallTime] Player UseEmergencyCallTime
          * @property {number|null} [contribution] Player contribution
          * @property {number|null} [heal] Player heal
          * @property {string|null} [docId] Player docId
@@ -429,43 +422,43 @@ $root.overlay = (function() {
 
         /**
          * Player playerName.
-         * @member {string} playerName
+         * @member {string|null|undefined} playerName
          * @memberof overlay.Player
          * @instance
          */
-        Player.prototype.playerName = "";
+        Player.prototype.playerName = null;
 
         /**
          * Player playerOpenId.
-         * @member {string} playerOpenId
+         * @member {string|null|undefined} playerOpenId
          * @memberof overlay.Player
          * @instance
          */
-        Player.prototype.playerOpenId = "";
+        Player.prototype.playerOpenId = null;
 
         /**
          * Player picUrl.
-         * @member {string} picUrl
+         * @member {string|null|undefined} picUrl
          * @memberof overlay.Player
          * @instance
          */
-        Player.prototype.picUrl = "";
+        Player.prototype.picUrl = null;
 
         /**
          * Player showPicUrl.
-         * @member {string} showPicUrl
+         * @member {string|null|undefined} showPicUrl
          * @memberof overlay.Player
          * @instance
          */
-        Player.prototype.showPicUrl = "";
+        Player.prototype.showPicUrl = null;
 
         /**
          * Player character.
-         * @member {string} character
+         * @member {string|null|undefined} character
          * @memberof overlay.Player
          * @instance
          */
-        Player.prototype.character = "";
+        Player.prototype.character = null;
 
         /**
          * Player teamIdfromApi.
@@ -485,11 +478,11 @@ $root.overlay = (function() {
 
         /**
          * Player teamName.
-         * @member {string} teamName
+         * @member {string|null|undefined} teamName
          * @memberof overlay.Player
          * @instance
          */
-        Player.prototype.teamName = "";
+        Player.prototype.teamName = null;
 
         /**
          * Player location.
@@ -604,36 +597,12 @@ $root.overlay = (function() {
         Player.prototype.killNumByGrenade = null;
 
         /**
-         * Player AIKillNum.
-         * @member {number} AIKillNum
-         * @memberof overlay.Player
-         * @instance
-         */
-        Player.prototype.AIKillNum = 0;
-
-        /**
-         * Player BossKillNum.
-         * @member {number} BossKillNum
-         * @memberof overlay.Player
-         * @instance
-         */
-        Player.prototype.BossKillNum = 0;
-
-        /**
          * Player rank.
          * @member {number|null|undefined} rank
          * @memberof overlay.Player
          * @instance
          */
         Player.prototype.rank = null;
-
-        /**
-         * Player inDamage.
-         * @member {number} inDamage
-         * @memberof overlay.Player
-         * @instance
-         */
-        Player.prototype.inDamage = 0;
 
         /**
          * Player headShotNum.
@@ -674,14 +643,6 @@ $root.overlay = (function() {
          * @instance
          */
         Player.prototype.assists = null;
-
-        /**
-         * Player outsideBlueCircleTime.
-         * @member {number} outsideBlueCircleTime
-         * @memberof overlay.Player
-         * @instance
-         */
-        Player.prototype.outsideBlueCircleTime = 0;
 
         /**
          * Player knockouts.
@@ -732,30 +693,6 @@ $root.overlay = (function() {
         Player.prototype.useFlashGrenadeNum = null;
 
         /**
-         * Player PoisonTotalDamage.
-         * @member {number} PoisonTotalDamage
-         * @memberof overlay.Player
-         * @instance
-         */
-        Player.prototype.PoisonTotalDamage = 0;
-
-        /**
-         * Player UseSelfRescueTime.
-         * @member {number} UseSelfRescueTime
-         * @memberof overlay.Player
-         * @instance
-         */
-        Player.prototype.UseSelfRescueTime = 0;
-
-        /**
-         * Player UseEmergencyCallTime.
-         * @member {number} UseEmergencyCallTime
-         * @memberof overlay.Player
-         * @instance
-         */
-        Player.prototype.UseEmergencyCallTime = 0;
-
-        /**
          * Player contribution.
          * @member {number|null|undefined} contribution
          * @memberof overlay.Player
@@ -781,6 +718,42 @@ $root.overlay = (function() {
 
         // OneOf field names bound to virtual getters and setters
         var $oneOfFields;
+
+        // Virtual OneOf for proto3 optional field
+        $Object.defineProperty(Player.prototype, "_playerName", {
+            get: $util.oneOfGetter($oneOfFields = ["playerName"]),
+            set: $util.oneOfSetter($oneOfFields)
+        });
+
+        // Virtual OneOf for proto3 optional field
+        $Object.defineProperty(Player.prototype, "_playerOpenId", {
+            get: $util.oneOfGetter($oneOfFields = ["playerOpenId"]),
+            set: $util.oneOfSetter($oneOfFields)
+        });
+
+        // Virtual OneOf for proto3 optional field
+        $Object.defineProperty(Player.prototype, "_picUrl", {
+            get: $util.oneOfGetter($oneOfFields = ["picUrl"]),
+            set: $util.oneOfSetter($oneOfFields)
+        });
+
+        // Virtual OneOf for proto3 optional field
+        $Object.defineProperty(Player.prototype, "_showPicUrl", {
+            get: $util.oneOfGetter($oneOfFields = ["showPicUrl"]),
+            set: $util.oneOfSetter($oneOfFields)
+        });
+
+        // Virtual OneOf for proto3 optional field
+        $Object.defineProperty(Player.prototype, "_character", {
+            get: $util.oneOfGetter($oneOfFields = ["character"]),
+            set: $util.oneOfSetter($oneOfFields)
+        });
+
+        // Virtual OneOf for proto3 optional field
+        $Object.defineProperty(Player.prototype, "_teamName", {
+            get: $util.oneOfGetter($oneOfFields = ["teamName"]),
+            set: $util.oneOfSetter($oneOfFields)
+        });
 
         // Virtual OneOf for proto3 optional field
         $Object.defineProperty(Player.prototype, "_location", {
@@ -984,21 +957,21 @@ $root.overlay = (function() {
                 throw $Error("max depth exceeded");
             if (message.uId != null && $Object.hasOwnProperty.call(message, "uId") && message.uId !== "")
                 writer.uint32(/* id 1, wireType 2 =*/10).string(message.uId);
-            if (message.playerName != null && $Object.hasOwnProperty.call(message, "playerName") && message.playerName !== "")
+            if (message.playerName != null && $Object.hasOwnProperty.call(message, "playerName"))
                 writer.uint32(/* id 2, wireType 2 =*/18).string(message.playerName);
-            if (message.playerOpenId != null && $Object.hasOwnProperty.call(message, "playerOpenId") && message.playerOpenId !== "")
+            if (message.playerOpenId != null && $Object.hasOwnProperty.call(message, "playerOpenId"))
                 writer.uint32(/* id 3, wireType 2 =*/26).string(message.playerOpenId);
-            if (message.picUrl != null && $Object.hasOwnProperty.call(message, "picUrl") && message.picUrl !== "")
+            if (message.picUrl != null && $Object.hasOwnProperty.call(message, "picUrl"))
                 writer.uint32(/* id 4, wireType 2 =*/34).string(message.picUrl);
-            if (message.showPicUrl != null && $Object.hasOwnProperty.call(message, "showPicUrl") && message.showPicUrl !== "")
+            if (message.showPicUrl != null && $Object.hasOwnProperty.call(message, "showPicUrl"))
                 writer.uint32(/* id 5, wireType 2 =*/42).string(message.showPicUrl);
-            if (message.character != null && $Object.hasOwnProperty.call(message, "character") && message.character !== "")
+            if (message.character != null && $Object.hasOwnProperty.call(message, "character"))
                 writer.uint32(/* id 6, wireType 2 =*/50).string(message.character);
             if (message.teamIdfromApi != null && $Object.hasOwnProperty.call(message, "teamIdfromApi") && message.teamIdfromApi !== 0)
                 writer.uint32(/* id 7, wireType 0 =*/56).int32(message.teamIdfromApi);
             if (message.teamId != null && $Object.hasOwnProperty.call(message, "teamId") && message.teamId !== 0)
                 writer.uint32(/* id 8, wireType 0 =*/64).int32(message.teamId);
-            if (message.teamName != null && $Object.hasOwnProperty.call(message, "teamName") && message.teamName !== "")
+            if (message.teamName != null && $Object.hasOwnProperty.call(message, "teamName"))
                 writer.uint32(/* id 9, wireType 2 =*/74).string(message.teamName);
             if (message.location != null && $Object.hasOwnProperty.call(message, "location"))
                 $root.overlay.Vec3.encode(message.location, writer.uint32(/* id 10, wireType 2 =*/82).fork(), _depth + 1).ldelim();
@@ -1028,14 +1001,8 @@ $root.overlay = (function() {
                 writer.uint32(/* id 25, wireType 0 =*/200).int32(message.killNumInVehicle);
             if (message.killNumByGrenade != null && $Object.hasOwnProperty.call(message, "killNumByGrenade"))
                 writer.uint32(/* id 26, wireType 0 =*/208).int32(message.killNumByGrenade);
-            if (message.AIKillNum != null && $Object.hasOwnProperty.call(message, "AIKillNum") && message.AIKillNum !== 0)
-                writer.uint32(/* id 27, wireType 0 =*/216).int32(message.AIKillNum);
-            if (message.BossKillNum != null && $Object.hasOwnProperty.call(message, "BossKillNum") && message.BossKillNum !== 0)
-                writer.uint32(/* id 28, wireType 0 =*/224).int32(message.BossKillNum);
             if (message.rank != null && $Object.hasOwnProperty.call(message, "rank"))
                 writer.uint32(/* id 29, wireType 0 =*/232).int32(message.rank);
-            if (message.inDamage != null && $Object.hasOwnProperty.call(message, "inDamage") && message.inDamage !== 0)
-                writer.uint32(/* id 30, wireType 0 =*/240).int32(message.inDamage);
             if (message.headShotNum != null && $Object.hasOwnProperty.call(message, "headShotNum"))
                 writer.uint32(/* id 31, wireType 0 =*/248).int32(message.headShotNum);
             if (message.survivalTime != null && $Object.hasOwnProperty.call(message, "survivalTime"))
@@ -1046,8 +1013,6 @@ $root.overlay = (function() {
                 writer.uint32(/* id 34, wireType 0 =*/272).int32(message.marchDistance);
             if (message.assists != null && $Object.hasOwnProperty.call(message, "assists"))
                 writer.uint32(/* id 35, wireType 0 =*/280).int32(message.assists);
-            if (message.outsideBlueCircleTime != null && $Object.hasOwnProperty.call(message, "outsideBlueCircleTime") && message.outsideBlueCircleTime !== 0)
-                writer.uint32(/* id 36, wireType 0 =*/288).int32(message.outsideBlueCircleTime);
             if (message.knockouts != null && $Object.hasOwnProperty.call(message, "knockouts"))
                 writer.uint32(/* id 37, wireType 0 =*/296).int32(message.knockouts);
             if (message.rescueTimes != null && $Object.hasOwnProperty.call(message, "rescueTimes"))
@@ -1060,12 +1025,6 @@ $root.overlay = (function() {
                 writer.uint32(/* id 41, wireType 0 =*/328).int32(message.useBurnGrenadeNum);
             if (message.useFlashGrenadeNum != null && $Object.hasOwnProperty.call(message, "useFlashGrenadeNum"))
                 writer.uint32(/* id 42, wireType 0 =*/336).int32(message.useFlashGrenadeNum);
-            if (message.PoisonTotalDamage != null && $Object.hasOwnProperty.call(message, "PoisonTotalDamage") && message.PoisonTotalDamage !== 0)
-                writer.uint32(/* id 43, wireType 0 =*/344).int32(message.PoisonTotalDamage);
-            if (message.UseSelfRescueTime != null && $Object.hasOwnProperty.call(message, "UseSelfRescueTime") && message.UseSelfRescueTime !== 0)
-                writer.uint32(/* id 44, wireType 0 =*/352).int32(message.UseSelfRescueTime);
-            if (message.UseEmergencyCallTime != null && $Object.hasOwnProperty.call(message, "UseEmergencyCallTime") && message.UseEmergencyCallTime !== 0)
-                writer.uint32(/* id 45, wireType 0 =*/360).int32(message.UseEmergencyCallTime);
             if (message.contribution != null && $Object.hasOwnProperty.call(message, "contribution"))
                 writer.uint32(/* id 46, wireType 0 =*/368).int32(message.contribution);
             if (message.heal != null && $Object.hasOwnProperty.call(message, "heal"))
@@ -1131,46 +1090,36 @@ $root.overlay = (function() {
                 case 2: {
                         if (wireType !== 2)
                             break;
-                        if ((value = reader.stringVerify()).length)
-                            message.playerName = value;
-                        else
-                            delete message.playerName;
+                        message.playerName = reader.stringVerify();
+                        message._playerName = "playerName";
                         continue;
                     }
                 case 3: {
                         if (wireType !== 2)
                             break;
-                        if ((value = reader.stringVerify()).length)
-                            message.playerOpenId = value;
-                        else
-                            delete message.playerOpenId;
+                        message.playerOpenId = reader.stringVerify();
+                        message._playerOpenId = "playerOpenId";
                         continue;
                     }
                 case 4: {
                         if (wireType !== 2)
                             break;
-                        if ((value = reader.stringVerify()).length)
-                            message.picUrl = value;
-                        else
-                            delete message.picUrl;
+                        message.picUrl = reader.stringVerify();
+                        message._picUrl = "picUrl";
                         continue;
                     }
                 case 5: {
                         if (wireType !== 2)
                             break;
-                        if ((value = reader.stringVerify()).length)
-                            message.showPicUrl = value;
-                        else
-                            delete message.showPicUrl;
+                        message.showPicUrl = reader.stringVerify();
+                        message._showPicUrl = "showPicUrl";
                         continue;
                     }
                 case 6: {
                         if (wireType !== 2)
                             break;
-                        if ((value = reader.stringVerify()).length)
-                            message.character = value;
-                        else
-                            delete message.character;
+                        message.character = reader.stringVerify();
+                        message._character = "character";
                         continue;
                     }
                 case 7: {
@@ -1194,10 +1143,8 @@ $root.overlay = (function() {
                 case 9: {
                         if (wireType !== 2)
                             break;
-                        if ((value = reader.stringVerify()).length)
-                            message.teamName = value;
-                        else
-                            delete message.teamName;
+                        message.teamName = reader.stringVerify();
+                        message._teamName = "teamName";
                         continue;
                     }
                 case 10: {
@@ -1298,38 +1245,11 @@ $root.overlay = (function() {
                         message._killNumByGrenade = "killNumByGrenade";
                         continue;
                     }
-                case 27: {
-                        if (wireType !== 0)
-                            break;
-                        if (value = reader.int32())
-                            message.AIKillNum = value;
-                        else
-                            delete message.AIKillNum;
-                        continue;
-                    }
-                case 28: {
-                        if (wireType !== 0)
-                            break;
-                        if (value = reader.int32())
-                            message.BossKillNum = value;
-                        else
-                            delete message.BossKillNum;
-                        continue;
-                    }
                 case 29: {
                         if (wireType !== 0)
                             break;
                         message.rank = reader.int32();
                         message._rank = "rank";
-                        continue;
-                    }
-                case 30: {
-                        if (wireType !== 0)
-                            break;
-                        if (value = reader.int32())
-                            message.inDamage = value;
-                        else
-                            delete message.inDamage;
                         continue;
                     }
                 case 31: {
@@ -1365,15 +1285,6 @@ $root.overlay = (function() {
                             break;
                         message.assists = reader.int32();
                         message._assists = "assists";
-                        continue;
-                    }
-                case 36: {
-                        if (wireType !== 0)
-                            break;
-                        if (value = reader.int32())
-                            message.outsideBlueCircleTime = value;
-                        else
-                            delete message.outsideBlueCircleTime;
                         continue;
                     }
                 case 37: {
@@ -1416,33 +1327,6 @@ $root.overlay = (function() {
                             break;
                         message.useFlashGrenadeNum = reader.int32();
                         message._useFlashGrenadeNum = "useFlashGrenadeNum";
-                        continue;
-                    }
-                case 43: {
-                        if (wireType !== 0)
-                            break;
-                        if (value = reader.int32())
-                            message.PoisonTotalDamage = value;
-                        else
-                            delete message.PoisonTotalDamage;
-                        continue;
-                    }
-                case 44: {
-                        if (wireType !== 0)
-                            break;
-                        if (value = reader.int32())
-                            message.UseSelfRescueTime = value;
-                        else
-                            delete message.UseSelfRescueTime;
-                        continue;
-                    }
-                case 45: {
-                        if (wireType !== 0)
-                            break;
-                        if (value = reader.int32())
-                            message.UseEmergencyCallTime = value;
-                        else
-                            delete message.UseEmergencyCallTime;
                         continue;
                     }
                 case 46: {
@@ -1515,30 +1399,42 @@ $root.overlay = (function() {
             if (message.uId != null && $Object.hasOwnProperty.call(message, "uId"))
                 if (!$util.isString(message.uId))
                     return "uId: string expected";
-            if (message.playerName != null && $Object.hasOwnProperty.call(message, "playerName"))
+            if (message.playerName != null && $Object.hasOwnProperty.call(message, "playerName")) {
+                properties._playerName = 1;
                 if (!$util.isString(message.playerName))
                     return "playerName: string expected";
-            if (message.playerOpenId != null && $Object.hasOwnProperty.call(message, "playerOpenId"))
+            }
+            if (message.playerOpenId != null && $Object.hasOwnProperty.call(message, "playerOpenId")) {
+                properties._playerOpenId = 1;
                 if (!$util.isString(message.playerOpenId))
                     return "playerOpenId: string expected";
-            if (message.picUrl != null && $Object.hasOwnProperty.call(message, "picUrl"))
+            }
+            if (message.picUrl != null && $Object.hasOwnProperty.call(message, "picUrl")) {
+                properties._picUrl = 1;
                 if (!$util.isString(message.picUrl))
                     return "picUrl: string expected";
-            if (message.showPicUrl != null && $Object.hasOwnProperty.call(message, "showPicUrl"))
+            }
+            if (message.showPicUrl != null && $Object.hasOwnProperty.call(message, "showPicUrl")) {
+                properties._showPicUrl = 1;
                 if (!$util.isString(message.showPicUrl))
                     return "showPicUrl: string expected";
-            if (message.character != null && $Object.hasOwnProperty.call(message, "character"))
+            }
+            if (message.character != null && $Object.hasOwnProperty.call(message, "character")) {
+                properties._character = 1;
                 if (!$util.isString(message.character))
                     return "character: string expected";
+            }
             if (message.teamIdfromApi != null && $Object.hasOwnProperty.call(message, "teamIdfromApi"))
                 if (!$util.isInteger(message.teamIdfromApi))
                     return "teamIdfromApi: integer expected";
             if (message.teamId != null && $Object.hasOwnProperty.call(message, "teamId"))
                 if (!$util.isInteger(message.teamId))
                     return "teamId: integer expected";
-            if (message.teamName != null && $Object.hasOwnProperty.call(message, "teamName"))
+            if (message.teamName != null && $Object.hasOwnProperty.call(message, "teamName")) {
+                properties._teamName = 1;
                 if (!$util.isString(message.teamName))
                     return "teamName: string expected";
+            }
             if (message.location != null && $Object.hasOwnProperty.call(message, "location")) {
                 properties._location = 1;
                 {
@@ -1612,20 +1508,11 @@ $root.overlay = (function() {
                 if (!$util.isInteger(message.killNumByGrenade))
                     return "killNumByGrenade: integer expected";
             }
-            if (message.AIKillNum != null && $Object.hasOwnProperty.call(message, "AIKillNum"))
-                if (!$util.isInteger(message.AIKillNum))
-                    return "AIKillNum: integer expected";
-            if (message.BossKillNum != null && $Object.hasOwnProperty.call(message, "BossKillNum"))
-                if (!$util.isInteger(message.BossKillNum))
-                    return "BossKillNum: integer expected";
             if (message.rank != null && $Object.hasOwnProperty.call(message, "rank")) {
                 properties._rank = 1;
                 if (!$util.isInteger(message.rank))
                     return "rank: integer expected";
             }
-            if (message.inDamage != null && $Object.hasOwnProperty.call(message, "inDamage"))
-                if (!$util.isInteger(message.inDamage))
-                    return "inDamage: integer expected";
             if (message.headShotNum != null && $Object.hasOwnProperty.call(message, "headShotNum")) {
                 properties._headShotNum = 1;
                 if (!$util.isInteger(message.headShotNum))
@@ -1651,9 +1538,6 @@ $root.overlay = (function() {
                 if (!$util.isInteger(message.assists))
                     return "assists: integer expected";
             }
-            if (message.outsideBlueCircleTime != null && $Object.hasOwnProperty.call(message, "outsideBlueCircleTime"))
-                if (!$util.isInteger(message.outsideBlueCircleTime))
-                    return "outsideBlueCircleTime: integer expected";
             if (message.knockouts != null && $Object.hasOwnProperty.call(message, "knockouts")) {
                 properties._knockouts = 1;
                 if (!$util.isInteger(message.knockouts))
@@ -1684,15 +1568,6 @@ $root.overlay = (function() {
                 if (!$util.isInteger(message.useFlashGrenadeNum))
                     return "useFlashGrenadeNum: integer expected";
             }
-            if (message.PoisonTotalDamage != null && $Object.hasOwnProperty.call(message, "PoisonTotalDamage"))
-                if (!$util.isInteger(message.PoisonTotalDamage))
-                    return "PoisonTotalDamage: integer expected";
-            if (message.UseSelfRescueTime != null && $Object.hasOwnProperty.call(message, "UseSelfRescueTime"))
-                if (!$util.isInteger(message.UseSelfRescueTime))
-                    return "UseSelfRescueTime: integer expected";
-            if (message.UseEmergencyCallTime != null && $Object.hasOwnProperty.call(message, "UseEmergencyCallTime"))
-                if (!$util.isInteger(message.UseEmergencyCallTime))
-                    return "UseEmergencyCallTime: integer expected";
             if (message.contribution != null && $Object.hasOwnProperty.call(message, "contribution")) {
                 properties._contribution = 1;
                 if (!$util.isInteger(message.contribution))
@@ -1731,20 +1606,15 @@ $root.overlay = (function() {
                 if (typeof object.uId !== "string" || object.uId.length)
                     message.uId = $String(object.uId);
             if (object.playerName != null)
-                if (typeof object.playerName !== "string" || object.playerName.length)
-                    message.playerName = $String(object.playerName);
+                message.playerName = $String(object.playerName);
             if (object.playerOpenId != null)
-                if (typeof object.playerOpenId !== "string" || object.playerOpenId.length)
-                    message.playerOpenId = $String(object.playerOpenId);
+                message.playerOpenId = $String(object.playerOpenId);
             if (object.picUrl != null)
-                if (typeof object.picUrl !== "string" || object.picUrl.length)
-                    message.picUrl = $String(object.picUrl);
+                message.picUrl = $String(object.picUrl);
             if (object.showPicUrl != null)
-                if (typeof object.showPicUrl !== "string" || object.showPicUrl.length)
-                    message.showPicUrl = $String(object.showPicUrl);
+                message.showPicUrl = $String(object.showPicUrl);
             if (object.character != null)
-                if (typeof object.character !== "string" || object.character.length)
-                    message.character = $String(object.character);
+                message.character = $String(object.character);
             if (object.teamIdfromApi != null)
                 if ($Number(object.teamIdfromApi) !== 0)
                     message.teamIdfromApi = object.teamIdfromApi | 0;
@@ -1752,8 +1622,7 @@ $root.overlay = (function() {
                 if ($Number(object.teamId) !== 0)
                     message.teamId = object.teamId | 0;
             if (object.teamName != null)
-                if (typeof object.teamName !== "string" || object.teamName.length)
-                    message.teamName = $String(object.teamName);
+                message.teamName = $String(object.teamName);
             if (object.location != null) {
                 if (!$util.isObject(object.location))
                     throw $TypeError(".overlay.Player.location: object expected");
@@ -1785,17 +1654,8 @@ $root.overlay = (function() {
                 message.killNumInVehicle = object.killNumInVehicle | 0;
             if (object.killNumByGrenade != null)
                 message.killNumByGrenade = object.killNumByGrenade | 0;
-            if (object.AIKillNum != null)
-                if ($Number(object.AIKillNum) !== 0)
-                    message.AIKillNum = object.AIKillNum | 0;
-            if (object.BossKillNum != null)
-                if ($Number(object.BossKillNum) !== 0)
-                    message.BossKillNum = object.BossKillNum | 0;
             if (object.rank != null)
                 message.rank = object.rank | 0;
-            if (object.inDamage != null)
-                if ($Number(object.inDamage) !== 0)
-                    message.inDamage = object.inDamage | 0;
             if (object.headShotNum != null)
                 message.headShotNum = object.headShotNum | 0;
             if (object.survivalTime != null)
@@ -1806,9 +1666,6 @@ $root.overlay = (function() {
                 message.marchDistance = object.marchDistance | 0;
             if (object.assists != null)
                 message.assists = object.assists | 0;
-            if (object.outsideBlueCircleTime != null)
-                if ($Number(object.outsideBlueCircleTime) !== 0)
-                    message.outsideBlueCircleTime = object.outsideBlueCircleTime | 0;
             if (object.knockouts != null)
                 message.knockouts = object.knockouts | 0;
             if (object.rescueTimes != null)
@@ -1821,15 +1678,6 @@ $root.overlay = (function() {
                 message.useBurnGrenadeNum = object.useBurnGrenadeNum | 0;
             if (object.useFlashGrenadeNum != null)
                 message.useFlashGrenadeNum = object.useFlashGrenadeNum | 0;
-            if (object.PoisonTotalDamage != null)
-                if ($Number(object.PoisonTotalDamage) !== 0)
-                    message.PoisonTotalDamage = object.PoisonTotalDamage | 0;
-            if (object.UseSelfRescueTime != null)
-                if ($Number(object.UseSelfRescueTime) !== 0)
-                    message.UseSelfRescueTime = object.UseSelfRescueTime | 0;
-            if (object.UseEmergencyCallTime != null)
-                if ($Number(object.UseEmergencyCallTime) !== 0)
-                    message.UseEmergencyCallTime = object.UseEmergencyCallTime | 0;
             if (object.contribution != null)
                 message.contribution = object.contribution | 0;
             if (object.heal != null)
@@ -1859,21 +1707,8 @@ $root.overlay = (function() {
             var object = {};
             if (options.defaults) {
                 object.uId = "";
-                object.playerName = "";
-                object.playerOpenId = "";
-                object.picUrl = "";
-                object.showPicUrl = "";
-                object.character = "";
                 object.teamIdfromApi = 0;
                 object.teamId = 0;
-                object.teamName = "";
-                object.AIKillNum = 0;
-                object.BossKillNum = 0;
-                object.inDamage = 0;
-                object.outsideBlueCircleTime = 0;
-                object.PoisonTotalDamage = 0;
-                object.UseSelfRescueTime = 0;
-                object.UseEmergencyCallTime = 0;
                 object.docId = "";
             }
             if (message.uId != null && $Object.hasOwnProperty.call(message, "uId"))
@@ -1922,14 +1757,8 @@ $root.overlay = (function() {
                 object.killNumInVehicle = message.killNumInVehicle;
             if (message.killNumByGrenade != null && $Object.hasOwnProperty.call(message, "killNumByGrenade"))
                 object.killNumByGrenade = message.killNumByGrenade;
-            if (message.AIKillNum != null && $Object.hasOwnProperty.call(message, "AIKillNum"))
-                object.AIKillNum = message.AIKillNum;
-            if (message.BossKillNum != null && $Object.hasOwnProperty.call(message, "BossKillNum"))
-                object.BossKillNum = message.BossKillNum;
             if (message.rank != null && $Object.hasOwnProperty.call(message, "rank"))
                 object.rank = message.rank;
-            if (message.inDamage != null && $Object.hasOwnProperty.call(message, "inDamage"))
-                object.inDamage = message.inDamage;
             if (message.headShotNum != null && $Object.hasOwnProperty.call(message, "headShotNum"))
                 object.headShotNum = message.headShotNum;
             if (message.survivalTime != null && $Object.hasOwnProperty.call(message, "survivalTime"))
@@ -1940,8 +1769,6 @@ $root.overlay = (function() {
                 object.marchDistance = message.marchDistance;
             if (message.assists != null && $Object.hasOwnProperty.call(message, "assists"))
                 object.assists = message.assists;
-            if (message.outsideBlueCircleTime != null && $Object.hasOwnProperty.call(message, "outsideBlueCircleTime"))
-                object.outsideBlueCircleTime = message.outsideBlueCircleTime;
             if (message.knockouts != null && $Object.hasOwnProperty.call(message, "knockouts"))
                 object.knockouts = message.knockouts;
             if (message.rescueTimes != null && $Object.hasOwnProperty.call(message, "rescueTimes"))
@@ -1954,12 +1781,6 @@ $root.overlay = (function() {
                 object.useBurnGrenadeNum = message.useBurnGrenadeNum;
             if (message.useFlashGrenadeNum != null && $Object.hasOwnProperty.call(message, "useFlashGrenadeNum"))
                 object.useFlashGrenadeNum = message.useFlashGrenadeNum;
-            if (message.PoisonTotalDamage != null && $Object.hasOwnProperty.call(message, "PoisonTotalDamage"))
-                object.PoisonTotalDamage = message.PoisonTotalDamage;
-            if (message.UseSelfRescueTime != null && $Object.hasOwnProperty.call(message, "UseSelfRescueTime"))
-                object.UseSelfRescueTime = message.UseSelfRescueTime;
-            if (message.UseEmergencyCallTime != null && $Object.hasOwnProperty.call(message, "UseEmergencyCallTime"))
-                object.UseEmergencyCallTime = message.UseEmergencyCallTime;
             if (message.contribution != null && $Object.hasOwnProperty.call(message, "contribution"))
                 object.contribution = message.contribution;
             if (message.heal != null && $Object.hasOwnProperty.call(message, "heal"))
@@ -2063,27 +1884,27 @@ $root.overlay = (function() {
 
         /**
          * Team teamName.
-         * @member {string} teamName
+         * @member {string|null|undefined} teamName
          * @memberof overlay.Team
          * @instance
          */
-        Team.prototype.teamName = "";
+        Team.prototype.teamName = null;
 
         /**
          * Team teamTag.
-         * @member {string} teamTag
+         * @member {string|null|undefined} teamTag
          * @memberof overlay.Team
          * @instance
          */
-        Team.prototype.teamTag = "";
+        Team.prototype.teamTag = null;
 
         /**
          * Team teamLogo.
-         * @member {string} teamLogo
+         * @member {string|null|undefined} teamLogo
          * @memberof overlay.Team
          * @instance
          */
-        Team.prototype.teamLogo = "";
+        Team.prototype.teamLogo = null;
 
         /**
          * Team slot.
@@ -2133,6 +1954,27 @@ $root.overlay = (function() {
          */
         Team.prototype.players = $util.emptyArray;
 
+        // OneOf field names bound to virtual getters and setters
+        var $oneOfFields;
+
+        // Virtual OneOf for proto3 optional field
+        $Object.defineProperty(Team.prototype, "_teamName", {
+            get: $util.oneOfGetter($oneOfFields = ["teamName"]),
+            set: $util.oneOfSetter($oneOfFields)
+        });
+
+        // Virtual OneOf for proto3 optional field
+        $Object.defineProperty(Team.prototype, "_teamTag", {
+            get: $util.oneOfGetter($oneOfFields = ["teamTag"]),
+            set: $util.oneOfSetter($oneOfFields)
+        });
+
+        // Virtual OneOf for proto3 optional field
+        $Object.defineProperty(Team.prototype, "_teamLogo", {
+            get: $util.oneOfGetter($oneOfFields = ["teamLogo"]),
+            set: $util.oneOfSetter($oneOfFields)
+        });
+
         /**
          * Creates a new Team instance using the specified properties.
          * @function create
@@ -2169,11 +2011,11 @@ $root.overlay = (function() {
                 writer.uint32(/* id 1, wireType 2 =*/10).string(message.teamId);
             if (message.docId != null && $Object.hasOwnProperty.call(message, "docId") && message.docId !== "")
                 writer.uint32(/* id 2, wireType 2 =*/18).string(message.docId);
-            if (message.teamName != null && $Object.hasOwnProperty.call(message, "teamName") && message.teamName !== "")
+            if (message.teamName != null && $Object.hasOwnProperty.call(message, "teamName"))
                 writer.uint32(/* id 3, wireType 2 =*/26).string(message.teamName);
-            if (message.teamTag != null && $Object.hasOwnProperty.call(message, "teamTag") && message.teamTag !== "")
+            if (message.teamTag != null && $Object.hasOwnProperty.call(message, "teamTag"))
                 writer.uint32(/* id 4, wireType 2 =*/34).string(message.teamTag);
-            if (message.teamLogo != null && $Object.hasOwnProperty.call(message, "teamLogo") && message.teamLogo !== "")
+            if (message.teamLogo != null && $Object.hasOwnProperty.call(message, "teamLogo"))
                 writer.uint32(/* id 5, wireType 2 =*/42).string(message.teamLogo);
             if (message.slot != null && $Object.hasOwnProperty.call(message, "slot") && message.slot !== 0)
                 writer.uint32(/* id 6, wireType 0 =*/48).int32(message.slot);
@@ -2256,28 +2098,22 @@ $root.overlay = (function() {
                 case 3: {
                         if (wireType !== 2)
                             break;
-                        if ((value = reader.stringVerify()).length)
-                            message.teamName = value;
-                        else
-                            delete message.teamName;
+                        message.teamName = reader.stringVerify();
+                        message._teamName = "teamName";
                         continue;
                     }
                 case 4: {
                         if (wireType !== 2)
                             break;
-                        if ((value = reader.stringVerify()).length)
-                            message.teamTag = value;
-                        else
-                            delete message.teamTag;
+                        message.teamTag = reader.stringVerify();
+                        message._teamTag = "teamTag";
                         continue;
                     }
                 case 5: {
                         if (wireType !== 2)
                             break;
-                        if ((value = reader.stringVerify()).length)
-                            message.teamLogo = value;
-                        else
-                            delete message.teamLogo;
+                        message.teamLogo = reader.stringVerify();
+                        message._teamLogo = "teamLogo";
                         continue;
                     }
                 case 6: {
@@ -2376,21 +2212,28 @@ $root.overlay = (function() {
                 _depth = 0;
             if (_depth > $util.recursionLimit)
                 return "max depth exceeded";
+            var properties = {};
             if (message.teamId != null && $Object.hasOwnProperty.call(message, "teamId"))
                 if (!$util.isString(message.teamId))
                     return "teamId: string expected";
             if (message.docId != null && $Object.hasOwnProperty.call(message, "docId"))
                 if (!$util.isString(message.docId))
                     return "docId: string expected";
-            if (message.teamName != null && $Object.hasOwnProperty.call(message, "teamName"))
+            if (message.teamName != null && $Object.hasOwnProperty.call(message, "teamName")) {
+                properties._teamName = 1;
                 if (!$util.isString(message.teamName))
                     return "teamName: string expected";
-            if (message.teamTag != null && $Object.hasOwnProperty.call(message, "teamTag"))
+            }
+            if (message.teamTag != null && $Object.hasOwnProperty.call(message, "teamTag")) {
+                properties._teamTag = 1;
                 if (!$util.isString(message.teamTag))
                     return "teamTag: string expected";
-            if (message.teamLogo != null && $Object.hasOwnProperty.call(message, "teamLogo"))
+            }
+            if (message.teamLogo != null && $Object.hasOwnProperty.call(message, "teamLogo")) {
+                properties._teamLogo = 1;
                 if (!$util.isString(message.teamLogo))
                     return "teamLogo: string expected";
+            }
             if (message.slot != null && $Object.hasOwnProperty.call(message, "slot"))
                 if (!$util.isInteger(message.slot))
                     return "slot: integer expected";
@@ -2443,14 +2286,11 @@ $root.overlay = (function() {
                 if (typeof object.docId !== "string" || object.docId.length)
                     message.docId = $String(object.docId);
             if (object.teamName != null)
-                if (typeof object.teamName !== "string" || object.teamName.length)
-                    message.teamName = $String(object.teamName);
+                message.teamName = $String(object.teamName);
             if (object.teamTag != null)
-                if (typeof object.teamTag !== "string" || object.teamTag.length)
-                    message.teamTag = $String(object.teamTag);
+                message.teamTag = $String(object.teamTag);
             if (object.teamLogo != null)
-                if (typeof object.teamLogo !== "string" || object.teamLogo.length)
-                    message.teamLogo = $String(object.teamLogo);
+                message.teamLogo = $String(object.teamLogo);
             if (object.slot != null)
                 if ($Number(object.slot) !== 0)
                     message.slot = object.slot | 0;
@@ -2501,9 +2341,6 @@ $root.overlay = (function() {
             if (options.defaults) {
                 object.teamId = "";
                 object.docId = "";
-                object.teamName = "";
-                object.teamTag = "";
-                object.teamLogo = "";
                 object.slot = 0;
                 object.placePoints = 0;
                 object.rank = 0;

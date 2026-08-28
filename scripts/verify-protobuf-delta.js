@@ -74,15 +74,40 @@ const decodedPlayer = decodedObj.teams[0].players[0];
   ? pass('Other unchanged optional fields (liveState, assists, location) all correctly absent')
   : fail(`Other unchanged fields leaked: liveState=${decodedPlayer.liveState}, assists=${decodedPlayer.assists}, location=${JSON.stringify(decodedPlayer.location)}`);
 
-// Identity fields must always survive regardless of delta status.
-(decodedPlayer.uId === 'u1' && decodedPlayer.docId === 'p1' && decodedPlayer.teamName === 'Team 1')
-  ? pass('Identity fields (uId, docId, teamName) always present on a partial player')
-  : fail(`Identity fields missing/wrong: uId=${decodedPlayer.uId}, docId=${decodedPlayer.docId}, teamName=${decodedPlayer.teamName}`);
+// Routing fields (uId, docId) always survive regardless of delta status.
+(decodedPlayer.uId === 'u1' && decodedPlayer.docId === 'p1')
+  ? pass('Routing fields (uId, docId) always present on a partial player')
+  : fail(`Routing fields missing/wrong: uId=${decodedPlayer.uId}, docId=${decodedPlayer.docId}`);
 
-// --- 2. Dead-weight fields (e.g. AIKillNum) stay non-optional and always 0 ---
-(decodedPlayer.AIKillNum === 0)
-  ? pass('Dead-weight field (AIKillNum) present and 0 as expected (non-optional, always hardcoded)')
-  : fail(`Dead-weight field AIKillNum unexpected value: ${decodedPlayer.AIKillNum}`);
+// Display strings are now `optional` too — an UNCHANGED one is absent, same
+// as an unchanged stat. The client merge keeps its last-known value.
+(!('teamName' in decodedPlayer) && !('playerName' in decodedPlayer) && !('picUrl' in decodedPlayer))
+  ? pass('Unchanged display strings (teamName, playerName, picUrl) correctly ABSENT on a partial player')
+  : fail(`Unchanged display strings leaked: teamName=${JSON.stringify(decodedPlayer.teamName)}, playerName=${JSON.stringify(decodedPlayer.playerName)}, picUrl=${JSON.stringify(decodedPlayer.picUrl)}`);
+
+// --- 1b. A CHANGED display string (picUrl) does survive the round-trip ---
+const prevWithPic = synthPlayer(3, { picUrl: 'https://cdn/old.jpg' });
+const nowWithPic = { ...prevWithPic, picUrl: 'https://cdn/new.jpg' };
+const picDiff = computeChangedPlayerFields(nowWithPic, prevWithPic);
+const picTeam = { teamId: '3', _id: 't3', teamName: 'Team 3', players: [picDiff] };
+const picDecoded = proto.MatchDataPayload.toObject(
+  proto.MatchDataPayload.decode(encodeProtobuf('MatchDataPayload', { matchId: 'm1', teams: [toProtoTeam(picTeam)] }).subarray(1)),
+  { defaults: true, longs: String }
+);
+const picPlayer = picDecoded.teams[0].players[0];
+(picPlayer.picUrl === 'https://cdn/new.jpg' && !('playerName' in picPlayer))
+  ? pass('Changed display string (picUrl) survives; sibling unchanged display string (playerName) still absent')
+  : fail(`Changed display string: picUrl=${JSON.stringify(picPlayer.picUrl)}, playerName=${JSON.stringify(picPlayer.playerName)}`);
+// client merge keeps the old pic when a later tick omits it
+const mergedPic = { ...nowWithPic, ...computeChangedPlayerFields({ ...nowWithPic, health: 1 }, nowWithPic) };
+(mergedPic.picUrl === 'https://cdn/new.jpg')
+  ? pass('Client merge: a stats-only later tick keeps the last-known picUrl')
+  : fail(`Client merge dropped picUrl: ${JSON.stringify(mergedPic.picUrl)}`);
+
+// --- 2. Reserved dead-weight fields (e.g. AIKillNum) are absent from the wire ---
+(!('AIKillNum' in decodedPlayer) && !('PoisonTotalDamage' in decodedPlayer))
+  ? pass('Reserved dead-weight fields (AIKillNum, PoisonTotalDamage) absent from the decoded object')
+  : fail(`Reserved dead-weight field present: AIKillNum=${JSON.stringify(decodedPlayer.AIKillNum)}, PoisonTotalDamage=${JSON.stringify(decodedPlayer.PoisonTotalDamage)}`);
 
 // --- 3. First-tick (full) player: every optional field present with its real value ---
 const firstTickTeam = { teamId: '2', _id: 't2', teamName: 'Team 2', players: [synthPlayer(2)] };

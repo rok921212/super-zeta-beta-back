@@ -35,42 +35,33 @@ const OPTIONAL_INT_FIELDS = [
   'useFlashGrenadeNum', 'contribution', 'heal',
 ];
 const OPTIONAL_BOOL_FIELDS = ['isFiring', 'bHasDied', 'isOutsideBlueCircle'];
+// Display strings — `optional` in overlay.proto. matchTeamDiff.js only puts
+// one on a delta player when it actually changed (or the player is brand
+// new), so set it here only when the source object carries it; an absent one
+// is 0 wire bytes and the client keeps its last-known value.
+const OPTIONAL_STRING_FIELDS = [
+  'playerName', 'playerOpenId', 'picUrl', 'showPicUrl', 'character', 'teamName',
+];
 
 function toProtoPlayer(p) {
   if (!p) return null;
   const out = {
     uId: String(p.uId ?? ''),
-    playerName: p.playerName || '',
-    playerOpenId: p.playerOpenId || '',
-    picUrl: p.picUrl || '',
-    showPicUrl: p.showPicUrl || '',
-    character: p.character || '',
     teamIdfromApi: toInt32(p.teamIdfromApi),
     teamId: toInt32(p.teamId),
-    teamName: p.teamName || '',
-    // These 7 fields are confirmed dead weight: no front/src/Themes view
-    // component reads any of them, on any view — grepped all of front/src,
-    // only the mirrored proto schema files reference the names. Kept
-    // non-optional in the schema on purpose (see overlay.proto) — proto3
-    // already omits a non-optional zero-valued scalar from the wire for
-    // free, so hardcoding 0 here is a guaranteed, unconditional size cut on
-    // every protobuf tick with no extra presence-tracking needed. Scoped to
-    // this mapper only — DB persistence and the dashboard's own raw-object
-    // msgpack feed (pubgApiMatchData.controller.js's emitUpdates) are
-    // untouched.
-    AIKillNum: 0,
-    BossKillNum: 0,
-    inDamage: 0,
-    outsideBlueCircleTime: 0,
-    PoisonTotalDamage: 0,
-    UseSelfRescueTime: 0,
-    UseEmergencyCallTime: 0,
     // p._id is a Mongoose ObjectId instance here (pre-normalization) or
     // already a hex string if this player object was itself already
     // normalized upstream — String() handles both.
     docId: String(p._id ?? ''),
+    // AIKillNum / BossKillNum / inDamage / outsideBlueCircleTime /
+    // PoisonTotalDamage / UseSelfRescueTime / UseEmergencyCallTime are
+    // `reserved` in overlay.proto — confirmed dead weight (no view reads
+    // any of them), so they're simply not on the wire any more.
   };
 
+  for (const key of OPTIONAL_STRING_FIELDS) {
+    if (p[key] !== undefined) out[key] = String(p[key] ?? '');
+  }
   if (p.location !== undefined) {
     const loc = p.location || {};
     out.location = { x: Number(loc.x) || 0, y: Number(loc.y) || 0, z: Number(loc.z) || 0 };
@@ -85,15 +76,14 @@ function toProtoPlayer(p) {
   return out;
 }
 
+const OPTIONAL_TEAM_STRING_FIELDS = ['teamName', 'teamTag', 'teamLogo'];
+
 function toProtoTeam(t) {
   if (!t) return null;
   const normalized = normalizeWireValue(t);
-  return {
+  const out = {
     teamId: String(normalized.teamId ?? ''),
     docId: String(normalized._id ?? ''),
-    teamName: normalized.teamName || '',
-    teamTag: normalized.teamTag || '',
-    teamLogo: normalized.teamLogo || '',
     slot: toInt32(normalized.slot),
     placePoints: toInt32(normalized.placePoints),
     rank: toInt32(normalized.rank),
@@ -101,6 +91,10 @@ function toProtoTeam(t) {
     matchesPlayed: toInt32(normalized.matchesPlayed),
     players: (normalized.players || []).map(toProtoPlayer).filter(Boolean),
   };
+  for (const key of OPTIONAL_TEAM_STRING_FIELDS) {
+    if (normalized[key] !== undefined) out[key] = String(normalized[key] ?? '');
+  }
+  return out;
 }
 
 function toProtoMatchDataPayload(memoryMatch) {

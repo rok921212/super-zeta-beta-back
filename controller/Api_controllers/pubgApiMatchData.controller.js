@@ -17,6 +17,7 @@ const { setSocketWireFormat, clearSocketWireFormat } = require('../../utils/sock
 const { emitToRoomSplitByFormat } = require('../../utils/roomEmit');
 const { toProtoMatchDataPayload, toProtoOverallDataPayload } = require('../../utils/protobufCodec');
 const { computeChangedTeams, TRACKED_FIELDS, stripPositionalFields } = require('../../utils/matchTeamDiff');
+const { getRoundStructureVersion } = require('../../utils/roundStructure');
 
 // ─── In-Memory Live Match Cache ───────────────────────────────────────────────
 const liveMatchCache = new Map();
@@ -639,7 +640,17 @@ function startLiveMatchUpdater() {
 
   // ── Receive live player data pushed from each user's local relay ───────────
   io.on('connection', (socket) => {
-    console.log(c('dim', `[socket] client connected: ${socket.id} transport=${socket.conn.transport.name}`));
+    console.log(c('dim', `[socket] client connected: ${socket.id} transport=${socket.conn.transport.name}${socket.recovered ? ' (recovered)' : ''}`));
+
+    // connectionStateRecovery (socket.js): on a resumed session, rooms and
+    // socket.data are restored and missed non-volatile packets are replayed —
+    // but the per-socket wire-format registry is keyed by socket.id (NEW
+    // after recovery), so re-seed it from the socket.data.wireFormat stashed
+    // in joinRoundRoom, otherwise the first post-recovery emit for a protobuf
+    // overlay would be split as msgpack until its next joinRoundRoom.
+    if (socket.recovered && socket.data.wireFormat === 'protobuf') {
+      setSocketWireFormat(socket.id, 'protobuf');
+    }
 
     // DIAGNOSTIC (2026-08-23): fills the gap identified while chasing the
     // relay's ~2-4s connect/die flap — until now this app never logged
@@ -674,12 +685,36 @@ function startLiveMatchUpdater() {
 
       // Bandwidth: this dashboard socket can declare msgpack support for the
       // user: room's liveMatchUpdate via ?msgpackLiveUpdate=1 on the connect
-      // query string. Absence = plain JSON (today's format) — PERMANENT
-      // negotiated default, not a flag meant to be deleted later (see
-      // splitUserRoomForLiveUpdate below for why).
+      // query string. The liveMatchUpdate on this room is now always msgpack
+      // (and a team-level DELTA — see emitUpdates below), so this flag is
+      // effectively always true for real clients; kept for the log line and
+      // in case a pre-msgpack client ever needs detecting.
       const supportsMsgpack = socket.handshake.query?.msgpackLiveUpdate === '1';
       socket.data.supportsMsgpackLiveUpdate = supportsMsgpack;
       console.log(c('cyan', `[socket] dashboard joined user:${sessionUserId} (${socket.id}) wire=${supportsMsgpack ? 'msgpack' : 'json'}`));
+
+      // Full baseline for the delta stream. liveMatchUpdate on user:<id> is
+      // a team-level delta now, so a dashboard that connects mid-match — or
+      // RECONNECTS after an outage (socket.io makes a fresh socket + re-runs
+      // this handler) — would otherwise only ever see partial teams. The
+      // HTTP matchdata fetch on the dashboard's mount covers first load but
+      // not a reconnect. Replay whatever full snapshots liveMatchCache holds
+      // for this user's active match(es) — usually one; the client filters
+      // by its own matchId/_id so any extra is harmless. msgpack, non-
+      // volatile (a catch-up send must not be dropped under backpressure).
+      //
+      // Skipped on a recovered session (connectionStateRecovery): the missed
+      // liveMatchUpdate deltas were already replayed, so a full re-send here
+      // would just be redundant bytes.
+      if (!socket.recovered) {
+        const uidStr = String(sessionUserId);
+        for (const [cacheKey, fullMatch] of liveMatchCache) {
+          if (!cacheKey.startsWith(`${uidStr}:`)) continue;
+          const hydratedMatchId = cacheKey.slice(uidStr.length + 1);
+          socket.emit('liveMatchUpdate', encodeMsgpack({ ...fullMatch, matchId: hydratedMatchId }));
+          console.log(c('dim', `[socket] user-room hydration -> ${socket.id} cacheKey=${cacheKey}`));
+        }
+      }
     }
 
     // Each relay identifies which user it belongs to before pushing data.
@@ -1031,7 +1066,7 @@ function startLiveMatchUpdater() {
     // joinBulkRoom/leaveBulkRoom from comsock.js). Scoped per round rather
     // than per match so a followSelected overlay keeps receiving whichever
     // match is currently selected, without needing to rejoin on a switch.
-    socket.on('joinRoundRoom', async ({ tournamentId, roundId, view, wireFormat } = {}) => {
+    socket.on('joinRoundRoom', async ({ tournamentId, roundId, view, wireFormat, tiers } = {}) => {
       if (!tournamentId || !roundId) return;
 
       // Leave whatever round/tier this socket was previously scoped to
@@ -1048,8 +1083,23 @@ function startLiveMatchUpdater() {
         socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:matchData`);
         socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:matchDataPositional`);
         socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:overall`);
+        socket.leave(`round:${prevScope.tournamentId}:${prevScope.roundId}:control`);
       }
       socket.data.roundRoomScope = { tournamentId, roundId };
+
+      // Every overlay for this round joins :control regardless of `view`, so
+      // a structural change (matches list / selection / schedule) reaches
+      // even views that need no live tier. Hand this socket the current
+      // structure version straight back as its baseline for future
+      // roundStructureChanged events and for its own reconnect check —
+      // replaces the overlay's old blind 10-min poll + unconditional
+      // refetch-on-every-reconnect. See utils/roundStructure.js.
+      socket.join(`round:${tournamentId}:${roundId}:control`);
+      socket.emit('roundStructureChanged', {
+        tournamentId,
+        roundId,
+        version: getRoundStructureVersion(tournamentId, roundId),
+      });
 
       if (wireFormat === 'protobuf') {
         setSocketWireFormat(socket.id, 'protobuf');
@@ -1061,6 +1111,10 @@ function startLiveMatchUpdater() {
         // the socket moved away from protobuf short of it disconnecting.
         clearSocketWireFormat(socket.id);
       }
+      // Stashed on socket.data so connectionStateRecovery restores it — the
+      // wire-format registry itself is keyed by socket.id, which changes on
+      // recovery (see the `socket.recovered` re-seed in io.on('connection')).
+      socket.data.wireFormat = wireFormat === 'protobuf' ? 'protobuf' : 'msgpack';
 
       const matchDataRoom = `round:${tournamentId}:${roundId}:matchData`;
       const matchDataPositionalRoom = `round:${tournamentId}:${roundId}:matchDataPositional`;
@@ -1075,9 +1129,26 @@ function startLiveMatchUpdater() {
       // (core fields + location), so a socket joins ONE of the two rooms,
       // never both — joining both would double-deliver every core field on
       // every tick a position-needing view is present in the same match.
-      const joinOverall = !view || VIEWS_NEEDING_OVERALL.has(view);
-      const needsPositional = !view || VIEWS_NEEDING_POSITIONAL_DATA.has(view);
-      const needsMatchData = !view || VIEWS_NEEDING_MATCH_DATA.has(view);
+      //
+      // `tiers` (optional): an explicit list of live-data tiers the caller
+      // wants — any of 'matchData' | 'matchDataPositional' | 'overall'
+      // | 'control'. Used by the desktop overlay relay (desktop-app/relay/
+      // server.cjs), which fans ONE upstream connection out to many local OBS
+      // Browser Sources and so must ask for exactly the union of tiers its
+      // local consumers need, independent of any single `view`. When absent
+      // (every non-relay caller, and any old build) the `view` -> tier
+      // mapping is used unchanged. `control` is always joined regardless, so
+      // `tiers` only actually gates matchData / matchDataPositional / overall.
+      const explicitTiers = Array.isArray(tiers) && tiers.length > 0 ? new Set(tiers) : null;
+      const joinOverall = explicitTiers
+        ? explicitTiers.has('overall')
+        : (!view || VIEWS_NEEDING_OVERALL.has(view));
+      const needsPositional = explicitTiers
+        ? explicitTiers.has('matchDataPositional')
+        : (!view || VIEWS_NEEDING_POSITIONAL_DATA.has(view));
+      const needsMatchData = explicitTiers
+        ? explicitTiers.has('matchData')
+        : (!view || VIEWS_NEEDING_MATCH_DATA.has(view));
       const joinMatchDataPositional = needsPositional;
       const joinMatchData = needsMatchData && !needsPositional;
 
@@ -1085,7 +1156,7 @@ function startLiveMatchUpdater() {
       else if (joinMatchData) socket.join(matchDataRoom);
       if (joinOverall) socket.join(overallRoom);
 
-      console.log(`[bw][room] socket ${socket.id} joinRoundRoom view=${view ?? '(none)'} wireFormat=${wireFormat ?? 'msgpack'} -> matchData=${joinMatchData} matchDataPositional=${joinMatchDataPositional} overall=${joinOverall}`);
+      console.log(`[bw][room] socket ${socket.id} joinRoundRoom view=${view ?? '(none)'} tiers=${explicitTiers ? [...explicitTiers].join('+') : '(none)'} wireFormat=${wireFormat ?? 'msgpack'} -> matchData=${joinMatchData} matchDataPositional=${joinMatchDataPositional} overall=${joinOverall}`);
 
       // Instant hydration: without this, a socket that just joined gets
       // nothing until the NEXT live tick from the desktop relay — could be
@@ -1695,40 +1766,67 @@ function startLiveMatchUpdater() {
         const emitUpdates = () => {
           memoryMatch.deadTeamList = updateDeadTeamList(selected.matchId, memoryMatch);
 
+          // Team-level (+ player-level) delta since the last tick. Computed
+          // ONCE here and reused for both the operator dashboard (user:
+          // room) and the public overlay rooms — all three now send this
+          // diff, not the whole memoryMatch. First tick for this
+          // (user, match): lastData is undefined, so computeChangedTeams
+          // returns the full roster — a natural full baseline.
+          const changedTeams = computeChangedTeams(memoryMatch.teams, lastData?.teams);
+          const matchDataRoom = `round:${selected.tournamentId}:${selected.roundId}:matchData`;
+          const matchDataPositionalRoom = `round:${selected.tournamentId}:${selected.roundId}:matchDataPositional`;
+
           // volatile: if a client's socket buffer is backed up, drop this
           // frame rather than queueing — always prefer the freshest data.
           //
-          // Dashboard (user: room): split by negotiated format — a socket
-          // only gets msgpack once it opts in via ?msgpackLiveUpdate=1 (see
-          // socketFormatRegistry / the connection handler above). Absence =
-          // plain JSON, permanently, not just during a rollout window.
+          // Operator dashboard (user: room): a tiny liveness heartbeat for
+          // isPolling.tsx's "LIVE • data Xs ago" dot (that component used to
+          // join the PUBLIC round room and subscribe to the whole delta
+          // stream just for this), plus the liveMatchUpdate itself.
+          //
+          // liveMatchUpdate was the ENTIRE memoryMatch (every team, every
+          // player, ~40 fields incl. location + deadTeamList) every ~2s
+          // tick, as msgpack OR plain JSON. Now it's the same `changedTeams`
+          // delta the public rooms use, msgpack only. `location` is kept
+          // here (the dashboard's own map / observing-player views read it
+          // off matchData; desktop firing-detection uses a separate local
+          // PCOB feed, not this). Every consumer negotiates
+          // ?msgpackLiveUpdate=1 (the SharedWorker and the Rust hub both
+          // do), and a dashboard that connects or reconnects mid-match gets
+          // a full baseline from the user-room hydration in
+          // io.on('connection') above — so the plain-JSON fallback is gone.
+          // Relay sockets (s.data.userId set) never listen for this.
           {
             const userRoom = `user:${userKey}`;
             const userRoomIds = io.sockets.adapter.rooms.get(userRoom);
             if (userRoomIds && userRoomIds.size > 0) {
-              const msgpackTargets = [];
-              const plainTargets = [];
-              for (const id of userRoomIds) {
-                const s = io.sockets.sockets.get(id);
-                if (!s || s.data?.userId) continue; // relay sockets never listen for liveMatchUpdate
-                (s.data?.supportsMsgpackLiveUpdate ? msgpackTargets : plainTargets).push(id);
+              io.to(userRoom).volatile.emit('dataHeartbeat', {
+                tournamentId: String(selected.tournamentId),
+                roundId: String(selected.roundId),
+                matchId: String(selected.matchId),
+                at: Date.now(),
+              });
+
+              if (changedTeams.length > 0) {
+                const targets = [];
+                for (const id of userRoomIds) {
+                  const s = io.sockets.sockets.get(id);
+                  if (!s || s.data?.userId) continue;
+                  targets.push(id);
+                }
+                if (targets.length) {
+                  const encoded = encodeMsgpack({ ...memoryMatch, teams: changedTeams, matchId: String(selected.matchId) });
+                  console.log(`[bw][emit] liveMatchUpdate (delta) -> ${userRoom}: sockets=${targets.length} teams=${changedTeams.length}/${memoryMatch.teams.length} bytes=${encoded.length}`);
+                  io.to(targets).volatile.emit('liveMatchUpdate', encoded);
+                }
               }
-              console.log(`[bw][emit] liveMatchUpdate -> ${userRoom}: msgpack=${msgpackTargets.length} plain=${plainTargets.length}`);
-              if (msgpackTargets.length) io.to(msgpackTargets).volatile.emit('liveMatchUpdate', encodeMsgpack(memoryMatch));
-              if (plainTargets.length) io.to(plainTargets).volatile.emit('liveMatchUpdate', memoryMatch);
             }
           }
 
           // Public overlay: only send the teams that actually changed since
           // the last tick (team-level delta), to whichever sockets joined
           // the matchData tier (view-scoped — see joinRoundRoom above),
-          // split by negotiated wire format (protobuf vs. msgpack). First
-          // tick for this (user, match) needs no special case: lastData is
-          // undefined, so every team fails the previous-team lookup and
-          // computeChangedTeams naturally returns the full roster.
-          const changedTeams = computeChangedTeams(memoryMatch.teams, lastData?.teams);
-          const matchDataRoom = `round:${selected.tournamentId}:${selected.roundId}:matchData`;
-          const matchDataPositionalRoom = `round:${selected.tournamentId}:${selected.roundId}:matchDataPositional`;
+          // split by negotiated wire format (protobuf vs. msgpack).
           if (changedTeams.length === 0) {
             // Structurally near-impossible: the top-level `changed` gate
             // (TRACKED_FIELDS-based) is a strict subset of what this
@@ -1873,8 +1971,16 @@ function startLiveMatchUpdater() {
   // Re-run discovery periodically ONLY to pick up new/removed selections —
   // this does not fetch or poll live player data, it just maintains the
   // active-user set used by triggerImmediateUpdateForUser().
+  //
+  // Bandwidth: the real-time path is already event-driven — the polling
+  // toggle endpoint calls markUserActiveForPolling()/markUserInactiveForPolling()
+  // synchronously, so a newly armed match is picked up immediately without
+  // waiting for this timer. This interval is now only a slow reconcile /
+  // safety net (e.g. a Round.apiEnable flag flipped directly in the DB), so
+  // 60s instead of 10s — 6x fewer MongoDB round-trips per idle server, which
+  // is outbound (Atlas) traffic Render bills as service-initiated.
   discoverAndStartPollingUsers();
-  setInterval(discoverAndStartPollingUsers, 10000);
+  setInterval(discoverAndStartPollingUsers, 60000);
 }
 
 module.exports = { startLiveMatchUpdater, getUnmatchedPlayers, markUserActiveForPolling, markUserInactiveForPolling };

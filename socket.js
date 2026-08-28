@@ -40,6 +40,21 @@ function initializeSocket(server) {
       threshold: 1024,
       zlibDeflateOptions: { level: 6 },
     },
+    // Bandwidth: on a brief drop (OBS scene switch, venue Wi-Fi blip, the
+    // relay's own upstream reconnect) the client resumes the SAME session
+    // instead of a fresh one — rooms + socket.data are restored and missed
+    // NON-volatile packets are replayed, so the client skips its
+    // re-joinRoundRoom + full re-hydration + (for overall views) the
+    // /api/public/bulk refetch it would otherwise do on every reconnect.
+    // `socket.recovered === true` on the connection when this happened.
+    // skipMiddlewares: the handshake `use()` below only reads an optional
+    // JWT into socket.request.session; on a recovery there's no new
+    // socket.data.userId to set anyway (it's restored), and the public
+    // overlay path is anonymous — nothing to re-run.
+    connectionStateRecovery: {
+      maxDisconnectionDuration: 120000,
+      skipMiddlewares: true,
+    },
   });
 
   // JWT handshake auth: populates socket.request.session = { userId } from

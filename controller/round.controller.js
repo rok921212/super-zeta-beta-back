@@ -6,6 +6,7 @@ const MatchSelection = require('../models/MatchSelection.model');
 const Tournament = require('../models/tournament.model');
 const { invalidateScope } = require('../middleware/cache.js');
 const { getSocket } = require('../socket');
+const { notifyRoundStructureChanged } = require('../utils/roundStructure.js');
 
 const ALLOWED_UPDATE_FIELDS = ['roundName', 'torLogo', 'day', 'groups', 'apiEnable', 'selectedMatch'];
 
@@ -85,6 +86,7 @@ const createRoundInTournament = async (req, res) => {
     // its cache TTL happens to expire.
     invalidatePublicScope(tournamentId);
     getSocket().to(`user:${createdBy}`).emit('roundUpdated', { round: savedRound });
+    notifyRoundStructureChanged(tournamentId, savedRound._id);
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
@@ -202,6 +204,7 @@ const updateRound = async (req, res) => {
     // in a different tournament via the updateMany above.
     invalidatePublicScope(tournamentId);
     getSocket().to(`user:${userId}`).emit('roundUpdated', { round: updatedRound });
+    notifyRoundStructureChanged(tournamentId, updatedRound._id);
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
@@ -229,6 +232,7 @@ const deleteRound = async (req, res) => {
 
     invalidatePublicScope(tournamentId);
     getSocket().to(`user:${userId}`).emit('roundUpdated', { roundId: id, deleted: true });
+    notifyRoundStructureChanged(tournamentId, id);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

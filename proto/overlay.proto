@@ -22,10 +22,22 @@
 // needs NO change to keep using `{ defaults: true }`; an absent optional
 // field already decodes as absent, not 0. Verified in
 // scripts/verify-protobuf-delta.js. The client then merges a present field
-// onto the previously-known player rather than replacing it. Identity
-// fields (uId/docId/teamId/etc.) and rarely-changing display strings
-// (playerName/picUrl/etc.) are NOT optional — they're cheap, change rarely,
-// and always riding along keeps the merge logic simpler.
+// onto the previously-known player rather than replacing it.
+//
+// Display strings (playerName/playerOpenId/picUrl/showPicUrl/character and
+// Team.teamName/teamTag/teamLogo) are ALSO `optional`: picUrl/showPicUrl/
+// teamLogo are Cloudinary URLs (~60-100 B each) that rode along on every
+// changed player/team every tick even though they change rarely.
+// matchTeamDiff.js now only puts one on a delta when it actually moved (or
+// the player/team is brand new — the full object is sent then), and the
+// spread-merge in matchTeamMerge.ts keeps the last-known value when it's
+// absent. NON-optional (always on the wire): uId/docId/teamId/teamIdfromApi
+// (routing) — cheap and needed to key the merge.
+//
+// AIKillNum/BossKillNum/inDamage/outsideBlueCircleTime/PoisonTotalDamage/
+// UseSelfRescueTime/UseEmergencyCallTime are `reserved` — confirmed dead
+// weight (no view reads them); previously hardcoded to 0 in
+// protobufCodec.js, now simply not on the wire.
 syntax = "proto3";
 package overlay;
 
@@ -41,11 +53,11 @@ message Vec3 {
 // live path, so a separate summary message isn't justified by field count.
 message Player {
   string uId = 1;
-  string playerName = 2;
-  string playerOpenId = 3;
-  string picUrl = 4;
-  string showPicUrl = 5;
-  string character = 6;
+  optional string playerName = 2;
+  optional string playerOpenId = 3;
+  optional string picUrl = 4;
+  optional string showPicUrl = 5;
+  optional string character = 6;
   // Confirmed via matchData.model.js (schema says String) vs. the actual hot
   // live-tick assignment in pubgApiMatchData.controller.js (`teamIdfromApi:
   // team.slot`, a Number, at both finalPlayer construction sites) — this
@@ -53,7 +65,7 @@ message Player {
   // not the (inconsistent) Mongoose schema declaration.
   int32 teamIdfromApi = 7;
   int32 teamId = 8;
-  string teamName = 9;
+  optional string teamName = 9;
 
   optional Vec3 location = 10;
   optional int32 health = 11;
@@ -70,31 +82,24 @@ message Player {
   optional int32 damage = 24;
   optional int32 killNumInVehicle = 25;
   optional int32 killNumByGrenade = 26;
-  // AIKillNum/BossKillNum/inDamage/outsideBlueCircleTime/PoisonTotalDamage/
-  // UseSelfRescueTime/UseEmergencyCallTime deliberately stay NON-optional —
-  // protobufCodec.js's toProtoPlayer already hardcodes them to 0
-  // unconditionally (confirmed dead weight, no view reads them), and proto3
-  // already omits a non-optional zero-valued scalar from the wire for free,
-  // so there's nothing for `optional` to buy here.
-  int32 AIKillNum = 27;
-  int32 BossKillNum = 28;
+  // 27, 28, 30, 36, 43, 44, 45 were AIKillNum / BossKillNum / inDamage /
+  // outsideBlueCircleTime / PoisonTotalDamage / UseSelfRescueTime /
+  // UseEmergencyCallTime — confirmed dead weight (no view reads any),
+  // removed from the wire. Numbers reserved so they can never be reused
+  // with a different meaning.
+  reserved 27, 28, 30, 36, 43, 44, 45;
   optional int32 rank = 29;
-  int32 inDamage = 30;
   optional int32 headShotNum = 31;
   optional int32 survivalTime = 32;
   optional int32 driveDistance = 33;
   optional int32 marchDistance = 34;
   optional int32 assists = 35;
-  int32 outsideBlueCircleTime = 36;
   optional int32 knockouts = 37;
   optional int32 rescueTimes = 38;
   optional int32 useSmokeGrenadeNum = 39;
   optional int32 useFragGrenadeNum = 40;
   optional int32 useBurnGrenadeNum = 41;
   optional int32 useFlashGrenadeNum = 42;
-  int32 PoisonTotalDamage = 43;
-  int32 UseSelfRescueTime = 44;
-  int32 UseEmergencyCallTime = 45;
   optional int32 contribution = 46;
   optional int32 heal = 47;
   // matchData.model.js's playerStatsSchema declares `{ _id: true }` — every
@@ -120,9 +125,9 @@ message Team {
   // client-side, same reasoning as Player.docId above.
   string teamId = 1;
   string docId = 2;
-  string teamName = 3;
-  string teamTag = 4;
-  string teamLogo = 5;
+  optional string teamName = 3;
+  optional string teamTag = 4;
+  optional string teamLogo = 5;
   int32 slot = 6;
   int32 placePoints = 7;
   int32 rank = 8;            // live-tier only

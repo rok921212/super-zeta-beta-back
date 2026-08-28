@@ -1,6 +1,7 @@
 const MatchSelection = require('../models/MatchSelection.model.js');
 const Round = require('../models/round.model.js');
 const { getSocket } = require('../socket'); // Socket.IO singleton
+const { notifyRoundStructureChanged } = require('../utils/roundStructure.js');
 
 // Get all matches where isSelected = true for this user
 const getAllSelectedMatches = async (req, res) => {
@@ -51,6 +52,7 @@ const selectMatch = async (req, res) => {
       const room = `user:${userId}`;
       console.log(`[socket] matchDeselected -> ${room} match=${matchId}`);
       io.to(room).emit('matchDeselected', { matchId, tournamentId, roundId, userId });
+      notifyRoundStructureChanged(tournamentId, roundId);
 
       return res.status(200).json({ message: 'Match deselected', deselected: matchId });
     }
@@ -110,6 +112,7 @@ const selectMatch = async (req, res) => {
 
     console.log(`[socket] matchSelected -> ${room} match=${matchId}`);
     io.to(room).emit('matchSelected', { selected: selectedMatch });
+    notifyRoundStructureChanged(tournamentId, roundId);
 
     res.status(200).json({ message: 'Match selected', selected: selectedMatch });
   } catch (err) {
@@ -184,6 +187,7 @@ const deleteMatchSelection = async (req, res) => {
     const room = `user:${userId}`;
     console.log(`[socket] matchDeleted -> ${room} match=${matchId}`);
     io.to(room).emit('matchDeleted', { matchId, userId });
+    notifyRoundStructureChanged(result.tournamentId, result.roundId);
 
     res.status(200).json({ message: 'Match selection deleted successfully', result });
   } catch (err) {

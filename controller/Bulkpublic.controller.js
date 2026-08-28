@@ -79,7 +79,7 @@ const LIGHT_PLAYER_FIELDS = [
 ];
 const MID_PLAYER_FIELDS = [
   ...LIGHT_PLAYER_FIELDS,
-  'damage', 'assists', 'knockouts', 'health', 'healthMax',
+  'damage', 'assists', 'knockouts', 'health', 'healthMax', 'heal',
 ];
 const HEAVY_PLAYER_FIELDS = [
   ...MID_PLAYER_FIELDS,
@@ -423,7 +423,8 @@ async function getMatchDataBatch(matches) {
 async function getOverallForRound(tournamentId, roundId, { matches: matchesIn, matchDataMap: matchDataMapIn } = {}) {
   const matches = matchesIn || await Match.find({ tournamentId, roundId }).sort({ matchNo: 1 }).lean();
   if (!matches.length) {
-    return { tournamentId, roundId, totalMatches: 0, teams: [], createdAt: new Date() };
+    // No synthetic `createdAt` here — see the note on the normal return below.
+    return { tournamentId, roundId, totalMatches: 0, teams: [] };
   }
 
   const matchDataMap = matchDataMapIn || await getMatchDataBatch(matches);
@@ -437,12 +438,17 @@ async function getOverallForRound(tournamentId, roundId, { matches: matchesIn, m
     .filter(Boolean);
   const teams = aggregateOverallTeams(orderedMatchDatas);
 
+  // Deliberately NO `createdAt: new Date()` — a wall-clock timestamp in the
+  // body changes the bytes on every regeneration, so Express's ETag never
+  // matched and `GET /api/public/bulk|overall` could never return a 304.
+  // Every OBS overlay re-downloads this on mount, on the 10-min poll, and on
+  // every socket reconnect; without a stable body those are all full sends.
+  // The rest of this payload is already deterministic for a given DB state.
   return {
     tournamentId,
     roundId,
     totalMatches: matches.length,
     teams,
-    createdAt: new Date(),
   };
 }
 
@@ -561,7 +567,8 @@ async function buildBulkPayload({ tournamentId, roundId, matchId, view = null, f
     matchDatasData,
     currentMatchData,
     overallData: slimmedOverallData || null,
-    updatedAt: new Date(),
+    // No `updatedAt: new Date()` — see getOverallForRound above for why a
+    // wall-clock stamp here defeats HTTP 304 revalidation on this endpoint.
   };
 }
 

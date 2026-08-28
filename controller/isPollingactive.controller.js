@@ -78,14 +78,21 @@ const updatePollingStatus = async (req, res) => {
     }
 
     // Register this user as active for the live-ingestion path right away,
-    // instead of waiting for the next discoverAndStartPollingUsers() pass
-    // (up to 10s) — otherwise relay ticks that are already arriving for this
-    // user get silently dropped by triggerImmediateUpdateForUser() until
-    // that next pass catches up.
+    // instead of waiting for the next discoverAndStartPollingUsers() pass —
+    // otherwise relay ticks that are already arriving for this user get
+    // silently dropped by triggerImmediateUpdateForUser() until that next
+    // pass catches up. The periodic sweep is now 60s (bandwidth: fewer Atlas
+    // round-trips), so this fast path must be fully correct on its own.
     if (isPollingActive) {
       markUserActiveForPolling(userId);
     } else {
-      markUserInactiveForPolling(userId);
+      // Only deactivate the user if this was their LAST active selection —
+      // an operator running two live matches in different rounds who stops
+      // one must keep ingesting for the other. (markUserInactiveForPolling
+      // is per-user, not per-match, so an unconditional call here would
+      // freeze the other overlay until the 60s sweep re-added the user.)
+      const stillActive = await MatchSelection.exists({ userId, isPollingActive: true });
+      if (!stillActive) markUserInactiveForPolling(userId);
     }
 
     // --- Emit WebSocket event ---

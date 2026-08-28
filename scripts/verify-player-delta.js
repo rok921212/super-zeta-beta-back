@@ -7,6 +7,7 @@ const {
   computeChangedPlayers,
   computeChangedPlayerFields,
   PLAYER_IDENTITY_FIELDS,
+  PLAYER_ROUTING_FIELDS,
   DEAD_WEIGHT_PLAYER_FIELDS,
 } = require('../utils/matchTeamDiff');
 
@@ -102,6 +103,33 @@ const mergedPlayer = mergePlayer(prevFullPlayer, incomingPartial);
 (mergedPlayer.health === 60 && mergedPlayer.killNum === 2 && mergedPlayer.assists === 3)
   ? pass('Client merge: updated field (health) applied, untouched fields (killNum, assists) retained from prior state')
   : fail(`Client merge: health=${mergedPlayer.health}, killNum=${mergedPlayer.killNum}, assists=${mergedPlayer.assists}`);
+
+// --- 8. Display-string-only change (picUrl): player IS included, diff carries
+//        only routing + the changed display string, no stats ---
+const p9prev = synthPlayer(9, { picUrl: 'https://cdn/a.jpg', playerName: 'Old Name' });
+const p9now = { ...p9prev, picUrl: 'https://cdn/b.jpg' }; // photo backfill, nothing else
+const dispDiff = computeChangedPlayerFields(p9now, p9prev);
+const dispExtraKeys = Object.keys(dispDiff).filter((k) => !PLAYER_ROUTING_FIELDS.includes(k));
+(dispDiff.picUrl === 'https://cdn/b.jpg' && !('playerName' in dispDiff) && dispExtraKeys.length === 1)
+  ? pass('Display-only change (picUrl): diff carries only routing + picUrl, unchanged playerName omitted')
+  : fail(`Display-only change: keys=${JSON.stringify(Object.keys(dispDiff))}`);
+const dispList = computeChangedPlayers([p9now], [p9prev]);
+(dispList.length === 1 && dispList[0].picUrl === 'https://cdn/b.jpg')
+  ? pass('computeChangedPlayers: a player whose ONLY change is a display string is still emitted')
+  : fail(`computeChangedPlayers dropped a display-only change: ${dispList.length} entries`);
+
+// --- 9. Unchanged display string stays out of a stats-change diff; client
+//        merge keeps the last-known value ---
+const p10prev = synthPlayer(10, { picUrl: 'https://cdn/keep.jpg', teamName: 'Alpha' });
+const p10now = { ...p10prev, killNum: 4 };
+const statDiff = computeChangedPlayerFields(p10now, p10prev);
+(!('picUrl' in statDiff) && !('teamName' in statDiff) && statDiff.killNum === 4)
+  ? pass('Stats-only change: unchanged picUrl / teamName omitted from the diff')
+  : fail(`Stats-only change leaked display strings: ${JSON.stringify(Object.keys(statDiff))}`);
+const mergedDisp = { ...p10prev, ...statDiff };
+(mergedDisp.picUrl === 'https://cdn/keep.jpg' && mergedDisp.teamName === 'Alpha' && mergedDisp.killNum === 4)
+  ? pass('Client merge: stats-only diff keeps last-known picUrl / teamName')
+  : fail(`Client merge: picUrl=${mergedDisp.picUrl}, teamName=${mergedDisp.teamName}, killNum=${mergedDisp.killNum}`);
 
 console.log('\n=== PLAYER DELTA VERIFICATION RESULTS ===');
 results.forEach((r) => console.log(r));

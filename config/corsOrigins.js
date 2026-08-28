@@ -12,6 +12,7 @@ const allowedOrigins = [
   "https://scoresync-v1.vercel.app",
   "capacitor://localhost",
   "http://localhost",
+  "http://127.0.0.1:8787",
   "http://localhost:8080",
   "http://192.168.18.6:3001",
 ];

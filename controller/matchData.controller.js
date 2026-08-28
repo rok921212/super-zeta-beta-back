@@ -492,7 +492,7 @@ const updatePlayerStats = async (req, res) => {
     const allowedFields = [
       'playerName', 'playerOpenId', 'picUrl', 'showPicUrl', 'character', 'isFiring',
       'bHasDied', 'health', 'healthMax', 'liveState', 'killNumBeforeDie',
-      'playerKey', 'gotAirDropNum', 'maxKillDistance', 'damage', 'killNumInVehicle',
+      'playerKey', 'gotAirDropNum', 'maxKillDistance', 'damage', 'heal', 'killNumInVehicle',
       'killNumByGrenade', 'AIKillNum', 'BossKillNum', 'rank', 'isOutsideBlueCircle',
       'inDamage', 'headShotNum', 'survivalTime', 'driveDistance', 'marchDistance',
       'assists', 'outsideBlueCircleTime', 'knockouts', 'rescueTimes',
@@ -507,7 +507,7 @@ const updatePlayerStats = async (req, res) => {
     // validation (the schema itself has no `min` guard on these).
     const NONNEG_NUMERIC_FIELDS = new Set([
       'health', 'healthMax', 'liveState', 'killNumBeforeDie', 'gotAirDropNum',
-      'maxKillDistance', 'damage', 'killNumInVehicle', 'killNumByGrenade',
+      'maxKillDistance', 'damage', 'heal', 'killNumInVehicle', 'killNumByGrenade',
       'AIKillNum', 'BossKillNum', 'rank', 'inDamage', 'headShotNum',
       'survivalTime', 'driveDistance', 'marchDistance', 'assists',
       'outsideBlueCircleTime', 'knockouts', 'rescueTimes', 'useSmokeGrenadeNum',

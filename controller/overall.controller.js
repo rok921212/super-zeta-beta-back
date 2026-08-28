@@ -3,10 +3,8 @@ const Match = require('../models/match.model');
 const MatchData = require('../models/matchData.model');
 const Round = require('../models/round.model');
 const Tournament = require('../models/tournament.model');
-const { getSocket } = require('../socket');
-const { encodeMsgpack } = require('../utils/msgpackCodec');
-const { emitToRoomSplitByFormat } = require('../utils/roomEmit');
-const { toProtoOverallDataPayload } = require('../utils/protobufCodec');
+// (socket/msgpack/protobuf imports removed — this controller no longer emits;
+// the live overall delta is owned by pubgApiMatchData.controller.js.)
 
 // Numeric player fields to aggregate (sum)
 const NUMERIC_PLAYER_FIELDS = [
@@ -48,6 +46,21 @@ const NUMERIC_PLAYER_FIELDS = [
 // documented in pubgApiMatchData.controller.js's `nonNeg`. Guard explicitly
 // so a leaked negative never sums straight into the round-wide aggregate.
 const nonNeg = (v) => (typeof v === 'number' && v > 0) ? Math.trunc(v) : 0;
+
+// Projection for the round-wide overall recompute. aggregateOverallTeams /
+// buildInitialAggPlayer below only ever read these fields, so pulling FULL
+// MatchData docs (every player's `location`, every unused stat) for every
+// match in the round on every elimination was mostly wasted DB egress —
+// billed as Render "Service-Initiated". KEEP IN SYNC with the field reads in
+// aggregateOverallTeams + buildInitialAggPlayer.
+const OVERALL_MATCHDATA_PROJECTION = [
+  'matchId', 'createdAt', 'updatedAt',
+  ...['teamId', 'teamName', 'teamTag', 'teamLogo', 'slot', 'placePoints', 'rank']
+    .map((f) => `teams.${f}`),
+  ...['uId', '_id', 'playerName', 'playerOpenId', 'picUrl', 'showPicUrl', 'character', 'playerKey', 'teamIdfromApi']
+    .map((f) => `teams.players.${f}`),
+  ...NUMERIC_PLAYER_FIELDS.map((f) => `teams.players.${f}`),
+].join(' ');
 
 function sumNumericFields(target, source, fields) {
   for (const f of fields) {
@@ -289,7 +302,21 @@ async function getRoundMeta(tournamentId, roundId, userId) {
   return entry;
 }
 
+// Result memo for the round-wide aggregate. computeOverallMatchDataForRound
+// runs on the live-emit hot path once per active match per changed tick, and
+// the aggregate is round-wide (independent of which matchId triggered it), so
+// two matches in the same round eliminating within a second both used to scan
+// every MatchData in the round. A short TTL collapses that to one scan; a
+// changed tick after the TTL recomputes. Same "brief staleness for a lot less
+// DB work" tradeoff already made by getRoundMeta above.
+const OVERALL_RESULT_TTL_MS = 2000;
+const overallResultCache = new Map(); // `${roundId}:${userId||''}` -> { teams, expiresAt }
+
 const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, userId) => {
+  const resultKey = `${roundId}:${userId || ''}`;
+  const cached = overallResultCache.get(resultKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.teams;
+
   const meta = await getRoundMeta(tournamentId, roundId, userId);
 
   // matchId existence/ownership is now a membership check against the
@@ -335,7 +362,9 @@ const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, u
   }
 
   // Load all matchData after attempting creation
-  const matchDatas = await MatchData.find({ matchId: { $in: matchIds }, ...(userId && { userId }) }).lean();
+  const matchDatas = await MatchData.find({ matchId: { $in: matchIds }, ...(userId && { userId }) })
+    .select(OVERALL_MATCHDATA_PROJECTION)
+    .lean();
 
   // MatchData.find({$in: matchIds}) does not guarantee results come back in
   // matchIds order — but aggregateOverallTeams treats "last processed" as
@@ -345,7 +374,9 @@ const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, u
   const matchDataByMatchId = new Map(matchDatas.map(md => [md.matchId.toString(), md]));
   const orderedMatchDatas = matchIds.map(id => matchDataByMatchId.get(id.toString())).filter(Boolean);
 
-  return aggregateOverallTeams(orderedMatchDatas);
+  const teams = aggregateOverallTeams(orderedMatchDatas);
+  overallResultCache.set(resultKey, { teams, expiresAt: Date.now() + OVERALL_RESULT_TTL_MS });
+  return teams;
 };
 
 // GET overall aggregated matchData for a round in a tournament
@@ -361,28 +392,18 @@ const getOverallMatchDataForRound = async (req, res) => {
 
     const aggregatedTeams = await computeOverallMatchDataForRound(tournamentId, roundId, matchId, userId);
 
-    // Emit overall data via socket for real-time updates — scoped to this
-    // tournament/round's room (was a global io.emit(), leaking every
-    // tournament's standings to every connected socket).
-    try {
-      const io = getSocket();
-      const room = `round:${tournamentId}:${roundId}:overall`;
-      console.log(`[bw][overall] overallDataUpdate (HTTP-triggered) -> ${room} teams=${aggregatedTeams.length}`);
-      // This room is the public overlay's (PublicThemeRenderer.tsx) —
-      // always encoded (protobuf or msgpack per each socket's negotiated
-      // format), unlike the plain-JSON user:${userId} emits used elsewhere
-      // for the authenticated dashboard.
-      emitToRoomSplitByFormat(io, room, 'overallDataUpdate', {
-        protoMessageName: 'OverallDataPayload',
-        mapToProto: toProtoOverallDataPayload,
-        data: { tournamentId, roundId, matchId, teams: aggregatedTeams, createdAt: new Date() },
-        volatile: false,
-      });
-    } catch (socketError) {
-      console.warn('Failed to emit overall data via socket:', socketError.message);
-    }
+    // NOTE (bandwidth): this GET used to also broadcast a FULL, non-delta
+    // `overallDataUpdate` into `round:${tournamentId}:${roundId}:overall` as
+    // a side effect — so an HTTP poll of this endpoint amplified into a
+    // socket send to every overlay in the round. The live tick path
+    // (pubgApiMatchData.controller.js emitOverallUpdate) already pushes
+    // team-level overall deltas to that room on elimination changes; a read
+    // must not fan out. Removed.
 
-    return res.json({ tournamentId, roundId, matchId, ...(userId && { userId }), teams: aggregatedTeams, createdAt: new Date() });
+    // No `createdAt: new Date()` — a wall-clock stamp in the body changes
+    // the bytes every regeneration and defeats HTTP 304 revalidation on this
+    // cached endpoint.
+    return res.json({ tournamentId, roundId, matchId, ...(userId && { userId }), teams: aggregatedTeams });
   } catch (error) {
     console.error('Error generating overall matchData:', error);
     return res.status(500).json({ error: error.message });

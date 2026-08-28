@@ -156,19 +156,19 @@ export namespace overlay {
         uId: string;
 
         /** Player playerName. */
-        playerName: string;
+        playerName?: (string|null);
 
         /** Player playerOpenId. */
-        playerOpenId: string;
+        playerOpenId?: (string|null);
 
         /** Player picUrl. */
-        picUrl: string;
+        picUrl?: (string|null);
 
         /** Player showPicUrl. */
-        showPicUrl: string;
+        showPicUrl?: (string|null);
 
         /** Player character. */
-        character: string;
+        character?: (string|null);
 
         /** Player teamIdfromApi. */
         teamIdfromApi: number;
@@ -177,7 +177,7 @@ export namespace overlay {
         teamId: number;
 
         /** Player teamName. */
-        teamName: string;
+        teamName?: (string|null);
 
         /** Player location. */
         location?: (overlay.Vec3.$Properties|null);
@@ -221,17 +221,8 @@ export namespace overlay {
         /** Player killNumByGrenade. */
         killNumByGrenade?: (number|null);
 
-        /** Player AIKillNum. */
-        AIKillNum: number;
-
-        /** Player BossKillNum. */
-        BossKillNum: number;
-
         /** Player rank. */
         rank?: (number|null);
-
-        /** Player inDamage. */
-        inDamage: number;
 
         /** Player headShotNum. */
         headShotNum?: (number|null);
@@ -247,9 +238,6 @@ export namespace overlay {
 
         /** Player assists. */
         assists?: (number|null);
-
-        /** Player outsideBlueCircleTime. */
-        outsideBlueCircleTime: number;
 
         /** Player knockouts. */
         knockouts?: (number|null);
@@ -268,15 +256,6 @@ export namespace overlay {
 
         /** Player useFlashGrenadeNum. */
         useFlashGrenadeNum?: (number|null);
-
-        /** Player PoisonTotalDamage. */
-        PoisonTotalDamage: number;
-
-        /** Player UseSelfRescueTime. */
-        UseSelfRescueTime: number;
-
-        /** Player UseEmergencyCallTime. */
-        UseEmergencyCallTime: number;
 
         /** Player contribution. */
         contribution?: (number|null);
@@ -440,17 +419,8 @@ export namespace overlay {
             /** Player killNumByGrenade */
             killNumByGrenade?: (number|null);
 
-            /** Player AIKillNum */
-            AIKillNum?: (number|null);
-
-            /** Player BossKillNum */
-            BossKillNum?: (number|null);
-
             /** Player rank */
             rank?: (number|null);
-
-            /** Player inDamage */
-            inDamage?: (number|null);
 
             /** Player headShotNum */
             headShotNum?: (number|null);
@@ -466,9 +436,6 @@ export namespace overlay {
 
             /** Player assists */
             assists?: (number|null);
-
-            /** Player outsideBlueCircleTime */
-            outsideBlueCircleTime?: (number|null);
 
             /** Player knockouts */
             knockouts?: (number|null);
@@ -487,15 +454,6 @@ export namespace overlay {
 
             /** Player useFlashGrenadeNum */
             useFlashGrenadeNum?: (number|null);
-
-            /** Player PoisonTotalDamage */
-            PoisonTotalDamage?: (number|null);
-
-            /** Player UseSelfRescueTime */
-            UseSelfRescueTime?: (number|null);
-
-            /** Player UseEmergencyCallTime */
-            UseEmergencyCallTime?: (number|null);
 
             /** Player contribution */
             contribution?: (number|null);
@@ -540,13 +498,13 @@ export namespace overlay {
         docId: string;
 
         /** Team teamName. */
-        teamName: string;
+        teamName?: (string|null);
 
         /** Team teamTag. */
-        teamTag: string;
+        teamTag?: (string|null);
 
         /** Team teamLogo. */
-        teamLogo: string;
+        teamLogo?: (string|null);
 
         /** Team slot. */
         slot: number;
