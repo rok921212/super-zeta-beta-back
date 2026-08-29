@@ -250,7 +250,12 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
     // memoryScopeIndex under `scope` so invalidateScope() sweeps it, and
     // prefixed `cache:<scope>:` so invalidateKeysByPrefix() matches it too.
     const bufKey = `${key}::mp`;
+    // Memoised authoritative revision for this cached body (roundData.publicRev).
+    // Threaded onto every exit as the X-Public-Rev response header so the local
+    // overlay relay can order responses without decoding the msgpack body.
+    const revKey = `${key}::rev`;
     const cacheControl = cacheControlFor(req, scopeFn);
+    const setRevHeader = (rev) => res.set('X-Public-Rev', String(rev ?? 0));
 
     // Cheap conditional 304. The ETag is stable within one cache-TTL window
     // and rolls immediately on any invalidateScope/invalidateKeysByPrefix for
@@ -263,6 +268,7 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
     if (req.headers['if-none-match'] === etag) {
       res.locals.__bwBytes = 0;
       res.set('Cache-Control', cacheControl);
+      setRevHeader(memoryCache.get(revKey) ?? 0);
       return res.status(304).end();
     }
 
@@ -281,13 +287,20 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
     // returned the full ~360 KB body over HTTPS on every cache hit, billed
     // service-initiated).
     const buffered = memoryCache.get(bufKey);
-    if (buffered) return sendBuffered(buffered);
+    if (buffered) {
+      setRevHeader(memoryCache.get(revKey) ?? 0);
+      return sendBuffered(buffered);
+    }
 
     const cached = await getCache(key);
     if (cached) {
       const body = encodeMsgpack(cached);
+      const rev = cached?.roundData?.publicRev ?? 0;
       memoryCache.set(bufKey, body);
+      memoryCache.set(revKey, rev);
       trackMemoryKey(scope, bufKey, ttlSeconds);
+      trackMemoryKey(scope, revKey, ttlSeconds);
+      setRevHeader(rev);
       return sendBuffered(body);
     }
 
@@ -296,10 +309,14 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
       // See cacheMiddleware above for why this only caches on success.
       if (ok) setCache(key, data, ttlSeconds, scope).catch(console.warn);
       const body = encodeMsgpack(data);
+      const rev = data?.roundData?.publicRev ?? 0;
       if (ok) {
         memoryCache.set(bufKey, body);
+        memoryCache.set(revKey, rev);
         trackMemoryKey(scope, bufKey, ttlSeconds);
+        trackMemoryKey(scope, revKey, ttlSeconds);
       }
+      setRevHeader(rev);
       sendBuffered(body);
     };
 

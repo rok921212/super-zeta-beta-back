@@ -10,6 +10,8 @@ const { encodeMsgpack } = require('../utils/msgpackCodec');
 const { emitToRoomSplitByFormat } = require('../utils/roomEmit');
 const { toProtoMatchDataPayload, toProtoOverallDataPayload } = require('../utils/protobufCodec');
 const { stripPositionalFields } = require('../utils/matchTeamDiff');
+const { bumpRound } = require('../utils/publicRevision');
+const { notifyRoundStructureChanged } = require('../utils/roundStructure');
 
 // ─── Shared player-template builder ───────────────────────────────────────────
 // Was previously copy-pasted 3x (create / replace / add) with small drifts
@@ -232,6 +234,15 @@ const syncMatchDataTeamsForGroup = async (groupId) => {
 
     const io = getSocket();
 
+    // matchId -> { tournamentId, roundId } so a reconciled MatchData can bump
+    // its round's publicRev without a per-doc query. Bump once per round.
+    const matchById = new Map(
+      (await Match.find({ _id: { $in: matchDatas.map(md => md.matchId) } })
+        .select('tournamentId roundId').lean())
+        .map(m => [String(m._id), m]),
+    );
+    const bumpedRounds = new Set();
+
     for (const matchData of matchDatas) {
       let changed = false;
       // Per-team diffs collected as we go, so we can push exactly what
@@ -309,6 +320,20 @@ const syncMatchDataTeamsForGroup = async (groupId) => {
           });
         }
         emitOverallUpdateAsync(io, matchData.matchId, matchData.userId, matchData.toObject());
+
+        // Team identity/roster in this MatchData changed -> the public bulk
+        // payload for the whole round changed (overallData folds every match).
+        const mref = matchById.get(String(matchData.matchId));
+        if (mref && mref.roundId && !bumpedRounds.has(String(mref.roundId))) {
+          bumpedRounds.add(String(mref.roundId));
+          bumpRound(io, {
+            tournamentId: mref.tournamentId,
+            roundId: mref.roundId,
+            matchId: matchData.matchId,
+            reason: 'syncGroup',
+            scope: 'round',
+          });
+        }
       }
     }
   } catch (error) {
@@ -437,6 +462,13 @@ const updateTeamPoints = async (req, res) => {
     res.json({ message: 'Team placePoints updated', matchDataId, teamId, changes: { placePoints } });
 
     emitOverallUpdateAsync(io, matchId, userId, result);
+    bumpRound(io, {
+      tournamentId: req.params.tournamentId,
+      roundId: req.params.roundId,
+      matchId,
+      reason: 'updateTeamPoints',
+      scope: 'round',
+    });
   } catch (error) {
     console.error('Error updating team points:', error);
     res.status(500).json({ error: error.message });
@@ -622,6 +654,13 @@ const updatePlayerStats = async (req, res) => {
     res.json({ message: 'Player stats updated', player });
 
     emitOverallUpdateAsync(io, matchId, userId, updated);
+    bumpRound(io, {
+      tournamentId: req.params.tournamentId,
+      roundId: req.params.roundId,
+      matchId,
+      reason: 'updatePlayerStats',
+      scope: 'round',
+    });
   } catch (error) {
     console.error('Error in updatePlayerStats:', error);
     res.status(500).json({ error: error.message });
@@ -630,10 +669,14 @@ const updatePlayerStats = async (req, res) => {
 
 const deleteMatchDataById = async (req, res) => {
   try {
-    const { tournamentId, roundId, id } = req.params;
-    const match = await Match.findOneAndDelete({ _id: id, tournamentId, roundId, userId: req.session.userId });
+    const { tournamentId, roundId, matchId } = req.params;
+    const match = await Match.findOneAndDelete({ _id: matchId, tournamentId, roundId, userId: req.session.userId });
     if (!match) return res.status(404).json({ error: 'Match not found in this round/tournament' });
     await MatchData.deleteMany({ matchId: match._id, userId: req.session.userId });
+    // Deletes a Match (+ its MatchData): matches list, current match and
+    // standings all change. Structural signal; also folds the round publicRev
+    // bump so the local relay + overlays refetch immediately.
+    notifyRoundStructureChanged(match.tournamentId, match.roundId);
     return res.json({ message: 'Match and related MatchData deleted successfully' });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -691,6 +734,13 @@ const updateTeamPlayersBulkStats = async (req, res) => {
     res.json({ message: 'Team players updated', teamId, bHasDied });
 
     emitOverallUpdateAsync(io, matchId, userId, result);
+    bumpRound(io, {
+      tournamentId: req.params.tournamentId,
+      roundId: req.params.roundId,
+      matchId,
+      reason: 'bulkTeamStats',
+      scope: 'round',
+    });
   } catch (error) {
     console.error('Error in bulk team update:', error);
     res.status(500).json({ error: error.message });
@@ -750,6 +800,16 @@ const updatePlayerByIdInMatchData = async (req, res) => {
     const io = getSocket();
     console.log(`[socket] matchDataUpdated -> user:${req.session.userId} team=${teamId} replaced`);
     io.to(`user:${req.session.userId}`).emit('matchDataUpdated', { matchDataId, teamId, changes: { players: team.players } });
+
+    // Roster change is invisible to the round rooms otherwise (matchDataUpdated
+    // only goes to user:<id>). Bump the round's publicRev so overlays refetch.
+    bumpRound(io, {
+      tournamentId: match.tournamentId,
+      roundId: match.roundId,
+      matchId: matchData.matchId,
+      reason: 'replaceRoster',
+      scope: 'round',
+    });
 
     return res.json({ message: 'Players updated successfully', team });
   } catch (err) {
@@ -821,6 +881,14 @@ const addPlayersToTeamInMatchData = async (req, res) => {
     console.log(`[socket] matchDataUpdated -> user:${req.session.userId} team=${teamId} added`);
     io.to(`user:${req.session.userId}`).emit('matchDataUpdated', { matchDataId, teamId, changes: { players: team.players } });
 
+    bumpRound(io, {
+      tournamentId: match.tournamentId,
+      roundId: match.roundId,
+      matchId: matchData.matchId,
+      reason: 'addRosterPlayers',
+      scope: 'round',
+    });
+
     return res.json({ message: 'Players added successfully', team });
   } catch (error) {
     console.error('Error adding players to MatchData:', error);
@@ -858,9 +926,21 @@ const removePlayersFromTeamInMatchData = async (req, res) => {
     matchData.markModified('teams');
     await matchData.save();
 
+    const match = await Match.findById(matchData.matchId).select('tournamentId roundId').lean();
+
     const io = getSocket();
     console.log(`[socket] matchDataUpdated -> user:${req.session.userId} team=${teamId} removed`);
     io.to(`user:${req.session.userId}`).emit('matchDataUpdated', { matchDataId, teamId, changes: { players: team.players } });
+
+    if (match) {
+      bumpRound(io, {
+        tournamentId: match.tournamentId,
+        roundId: match.roundId,
+        matchId: matchData.matchId,
+        reason: 'removeRosterPlayers',
+        scope: 'round',
+      });
+    }
 
     return res.json({ message: 'Players removed successfully', team });
   } catch (error) {
@@ -943,6 +1023,13 @@ const copyRosterFromPreviousMatch = async (req, res) => {
           changes: { players: ut.players },
         });
       }
+      bumpRound(io, {
+        tournamentId: currentMatch.tournamentId,
+        roundId: currentMatch.roundId,
+        matchId: currentMatch._id,
+        reason: 'copyPreviousRoster',
+        scope: 'round',
+      });
     }
 
     return res.json({

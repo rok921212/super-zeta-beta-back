@@ -5,6 +5,8 @@ const Match = require('../models/match.model');
 const MatchData = require('../models/matchData.model');
 const Group = require('../models/group.model');
 const MatchSelection = require('../models/MatchSelection.model');
+const { getSocket } = require('../socket.js');
+const { bumpTournament } = require('../utils/publicRevision.js');
 
 // --- CREATE TOURNAMENT ---
 const createTournament = async (req, res) => {
@@ -92,6 +94,12 @@ const updateTournament = async (req, res) => {
     );
     if (!updatedTournament) return res.status(404).json({ error: 'Tournament not found or unauthorized' });
     res.json(updatedTournament);
+    // tournamentName / logo / primaryColor / secondaryColor / overlayBg / day
+    // are the theme skin of EVERY overlay for this tournament, and this path
+    // emits nothing else — bump every round's publicRev.
+    let io = null;
+    try { io = getSocket(); } catch { /* socket not ready */ }
+    bumpTournament(io, { tournamentId: req.params.id, reason: 'updateTournament' });
   } catch (err) {
     console.error('updateTournament error:', err);
     res.status(400).json({ error: err.message });
@@ -105,6 +113,10 @@ const deleteTournament = async (req, res) => {
     if (!tournament) return res.status(404).json({ error: 'Tournament not found or unauthorized' });
 
     const tournamentId = tournament._id;
+
+    // Announce before the cascade wipes the rooms/clients — bump every round's
+    // publicRev so any co-located overlay drops its cache immediately.
+    try { bumpTournament(getSocket(), { tournamentId, reason: 'deleteTournament' }); } catch { /* socket not ready */ }
 
     // Delete related data
     const rounds = await Round.find({ tournamentId }).select('_id');

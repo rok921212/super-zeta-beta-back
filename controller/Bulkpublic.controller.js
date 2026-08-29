@@ -594,6 +594,12 @@ async function getBulkData(req, res) {
       return res.status(404).json({ error: 'Tournament not found' });
     }
 
+    // Authoritative per-round revision. Rides in the body as
+    // roundData.publicRev (what the overlay reads) and this header (what the
+    // local relay reads without decoding the msgpack body). The msgpack cache
+    // middleware re-stamps the header on its hit / 304 paths.
+    res.set('X-Public-Rev', String(payload.roundData?.publicRev ?? 0));
+
     res.json(payload);
   } catch (err) {
     console.error('Bulk data error:', err);

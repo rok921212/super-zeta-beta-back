@@ -18,6 +18,8 @@ const { emitToRoomSplitByFormat } = require('../../utils/roomEmit');
 const { toProtoMatchDataPayload, toProtoOverallDataPayload } = require('../../utils/protobufCodec');
 const { computeChangedTeams, TRACKED_FIELDS, stripPositionalFields } = require('../../utils/matchTeamDiff');
 const { getRoundStructureVersion } = require('../../utils/roundStructure');
+const { getPublicRev, bumpRound } = require('../../utils/publicRevision');
+const MatchModel = require('../../models/match.model');
 
 // ─── In-Memory Live Match Cache ───────────────────────────────────────────────
 const liveMatchCache = new Map();
@@ -191,6 +193,24 @@ async function processSaveQueue() {
       { ordered: false }
     );
     console.log(c('green', `💾 Bulk-saved ${batch.length} job(s)`));
+
+    // Persisted teams changed -> the public bulk body for each affected round
+    // changed. Bump once per distinct round (LIVE_AUTOSAVE path only; the ~2s
+    // in-memory tick never writes Mongo and must NOT bump).
+    try {
+      const matchIds = [...new Set(batch.map(j => String(j.matchId)))];
+      const matchDocs = await MatchModel.find({ _id: { $in: matchIds } }).select('tournamentId roundId').lean();
+      const bumped = new Set();
+      let io = null;
+      try { io = getSocket(); } catch { /* socket not ready */ }
+      for (const m of matchDocs) {
+        if (bumped.has(String(m.roundId))) continue;
+        bumped.add(String(m.roundId));
+        bumpRound(io, { tournamentId: m.tournamentId, roundId: m.roundId, reason: 'autosaveBatch', scope: 'round' });
+      }
+    } catch (e) {
+      console.warn('[bw][rev] autosave bump skipped:', e.message);
+    }
   } catch (err) {
     console.error('Background save error:', err.message);
   } finally {
@@ -437,6 +457,15 @@ const liveApiPlayersByUser = new Map(); // userId -> { players, at }
 // it). Reset wholesale on every registerRelay (fresh connection or
 // reconnect), so a connection swap never inherits stale seq/player state.
 const relayStateByUser = new Map(); // userId -> { socketId, lastReceivedSeq, players: Map<uid, playerObj> }
+
+// One-shot autosave: userIds whose relay just did a fresh/replacement
+// registerRelay and whose next processed tick should fire exactly one
+// saveLiveMatchSnapshot, after which persistence is manual-only again
+// (the dashboard SAVE DATA button). Armed in registerRelay's else-branch,
+// consumed on the first pollForUser match iteration with a populated
+// liveMatchCache entry, cleared on authoritative-socket disconnect.
+// Independent of LIVE_AUTOSAVE_ENABLED.
+const relayReconnectArmed = new Set(); // Set<String(user._id)>
 
 // Mirrors fetcher.rs's player_key(): prefer uId, fall back to playerName.
 function playerKeyOf(p) {
@@ -917,6 +946,10 @@ function startLiveMatchUpdater() {
       lastReceivedSeq: null,
       players: existing?.players ?? new Map(),
     });
+    // A genuine (re)connect — not the keepalive re-emit above. Arm a
+    // one-shot autosave so the first tick this relay actually processes
+    // gets persisted without waiting on a manual SAVE DATA.
+    relayReconnectArmed.add(key);
     socket.emit('requestFullSnapshot');
   }
 
@@ -1148,6 +1181,11 @@ function startLiveMatchUpdater() {
         tournamentId,
         roundId,
         version: getRoundStructureVersion(tournamentId, roundId),
+        // Authoritative per-round revision baseline (durable across restarts).
+        // The local relay seeds its knownRev from this so a slow/stale HTTP
+        // body can never overwrite newer state, and only acts on strictly
+        // higher revs afterwards.
+        publicRev: await getPublicRev(roundId),
       });
 
       if (wireFormat === 'protobuf') {
@@ -1292,6 +1330,7 @@ function startLiveMatchUpdater() {
       const relayState = relayStateByUser.get(userId);
       if (relayState && relayState.socketId === socket.id) {
         relayStateByUser.delete(userId);
+        relayReconnectArmed.delete(userId);
       }
 
       // Only clear this user's live-data state if no other socket (e.g. a
@@ -1729,6 +1768,35 @@ function startLiveMatchUpdater() {
 
         const cacheKey    = `${String(userKey)}:${String(selected.matchId)}`;
         const memoryMatch = liveMatchCache.get(cacheKey) || updatedMatchData;
+
+        // First processed tick after the relay (re)connected: persist this
+        // match's current snapshot exactly once, then disarm — every later
+        // tick stays manual-only. Gated on a populated liveMatchCache entry
+        // so a pre-cache first pass simply stays armed and retries next
+        // tick. Fire-and-forget: a transient Mongo failure is logged, not
+        // retried until the next reconnect. The synchronous .delete before
+        // any further await also blocks the userProcessing coalesce re-run
+        // from double-saving.
+        if (relayReconnectArmed.has(String(userKey)) && liveMatchCache.has(cacheKey)) {
+          relayReconnectArmed.delete(String(userKey));
+          saveLiveMatchSnapshot({ matchId: selected.matchId, userId: selUserId })
+            .then(r => {
+              console.log(c('cyan', `[relay-reconnect] one-shot save ${cacheKey} -> ${JSON.stringify(r)}`));
+              if (r && r.saved) {
+                let io = null;
+                try { io = getSocket(); } catch { /* socket not ready */ }
+                bumpRound(io, {
+                  tournamentId: selected.tournamentId,
+                  roundId: selected.roundId,
+                  matchId: selected.matchId,
+                  reason: 'relayReconnectSave',
+                  scope: 'round',
+                });
+              }
+            })
+            .catch(err => console.error(`[relay-reconnect] one-shot save ${cacheKey} failed:`, err.message));
+        }
+
         const lastData    = lastMatchDataByUserMatch[cacheKey];
 
         // ─────────────────────────────────────────────────────────────────

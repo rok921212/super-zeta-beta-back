@@ -2,6 +2,8 @@ const Group = require('../models/group.model.js');
 const Team = require('../models/teams.model.js');
 const Tournament = require('../models/tournament.model.js');
 const { syncMatchDataTeamsForGroup } = require('./matchData.controller.js');
+const { getSocket } = require('../socket.js');
+const { bumpTournament } = require('../utils/publicRevision.js');
 
 // CREATE Group (user-scoped)
 const createGroup = async (req, res) => {
@@ -156,6 +158,11 @@ const deleteGroup = async (req, res) => {
       return res.status(404).json({ message: 'Group not found in this tournament' });
     }
     res.json({ message: 'Group deleted successfully' });
+    // Group names / team membership across the tournament's rounds change and
+    // this path emits nothing else — bump every round's publicRev.
+    let io = null;
+    try { io = getSocket(); } catch { /* socket not ready */ }
+    bumpTournament(io, { tournamentId, reason: 'deleteGroup' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });

@@ -10,7 +10,7 @@ const { createMatchDataForMatchDoc } = require('./matchData.controller.js');
 const { getSocket } = require('../socket.js');
 const { notifyRoundStructureChanged } = require('../utils/roundStructure.js');
 const { saveLiveMatchSnapshot } = require('./Api_controllers/pubgApiMatchData.controller.js');
-const { invalidateScope } = require('../middleware/cache.js');
+const { bumpRound } = require('../utils/publicRevision.js');
 
 // Convert time to 12-hour
 function convertTo12Hour(time24) {
@@ -243,15 +243,16 @@ const saveCurrentMatchData = async (req, res) => {
       return res.status(200).json({ success: true, saved: false, reason: result.reason });
     }
 
-    // Best-effort: bust the public round cache so /api/public/bulk + /overall
-    // reflect the save without waiting for a TTL. The automatic 3s writer never
-    // did this; with it off, this is the only thing keeping result screens
-    // fresh after a manual save.
+    // Bump the round's authoritative publicRev — this busts the backend public
+    // round cache (/api/public/bulk + /overall) AND emits `publicDataInvalidated`
+    // so co-located OBS overlays refetch immediately instead of waiting for a
+    // TTL. The automatic 3s writer never did this; with it off, this is the only
+    // thing keeping result screens fresh after a manual save.
     if (tournamentId && roundId) {
       try {
-        await invalidateScope(`round:${tournamentId}:${roundId}`);
+        await bumpRound(getSocket(), { tournamentId, roundId, matchId, reason: 'saveCurrent', scope: 'round' });
       } catch (e) {
-        console.warn('[saveCurrentMatchData] cache invalidate failed:', e.message);
+        console.warn('[saveCurrentMatchData] publicRev bump failed:', e.message);
       }
     }
 

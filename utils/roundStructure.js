@@ -29,6 +29,7 @@
 // is holding, so change notifications resume working immediately.
 
 const { getSocket } = require('../socket');
+const { bumpRound } = require('./publicRevision');
 
 const versionByRound = new Map(); // "tid:rid" -> epoch ms of last structural change
 
@@ -38,20 +39,37 @@ function getRoundStructureVersion(tournamentId, roundId) {
   return versionByRound.get(keyOf(String(tournamentId), String(roundId))) || 0;
 }
 
-// Call after any mutation that changes a round's structural shape. Accepts
-// raw id strings or ObjectIds. No-op (bump only, no emit) if Socket.IO is
-// somehow not initialized yet — the bump still counts for the next join.
-function notifyRoundStructureChanged(tournamentId, roundId) {
+// Call after any mutation that changes a round's structural shape (match
+// created/updated/deleted, match selected/deselected, round updated, ...).
+// Accepts raw id strings or ObjectIds. Fire-and-forget — callers do not await.
+// Also bumps the round's authoritative publicRev (utils/publicRevision.js),
+// which busts the backend cache and emits `publicDataInvalidated`; the
+// resulting rev is carried on the `roundStructureChanged` payload too so a
+// client / relay that only listens for structure changes still learns it.
+// Swallows its own errors, always returns a promise.
+async function notifyRoundStructureChanged(tournamentId, roundId) {
   if (!tournamentId || !roundId) return;
   const tid = String(tournamentId);
   const rid = String(roundId);
   const version = Date.now();
   versionByRound.set(keyOf(tid, rid), version);
+
+  let io = null;
+  try { io = getSocket(); } catch { /* socket not ready — bump still counts for the next join */ }
+
+  let publicRev = 0;
   try {
-    getSocket()
-      .to(`round:${tid}:${rid}:control`)
-      .emit('roundStructureChanged', { tournamentId: tid, roundId: rid, version });
-    console.log(`[bw][structure] roundStructureChanged -> round:${tid}:${rid}:control version=${version}`);
+    publicRev = (await bumpRound(io, { tournamentId: tid, roundId: rid, reason: 'structure', scope: 'round' })) ?? 0;
+  } catch (err) {
+    console.warn('[bw][structure] publicRev bump skipped:', err.message);
+  }
+
+  try {
+    if (io) {
+      io.to(`round:${tid}:${rid}:control`)
+        .emit('roundStructureChanged', { tournamentId: tid, roundId: rid, version, publicRev });
+      console.log(`[bw][structure] roundStructureChanged -> round:${tid}:${rid}:control version=${version} publicRev=${publicRev}`);
+    }
   } catch (err) {
     console.warn('[bw][structure] notify skipped (socket not ready):', err.message);
   }
