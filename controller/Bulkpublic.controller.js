@@ -131,6 +131,75 @@ function pickFields(obj, fields) {
   return out;
 }
 
+/* --------------------------------------------------------------------
+   CACHE-KEY VIEW FOLDING
+   --------------------------------------------------------------------
+   buildBulkPayload's output depends on `view` ONLY through: the four
+   needs* section flags, the currentMatchData/overallData player tier
+   (VIEW_PLAYER_TIER[view] || 'full'), and the Achive-only list field set.
+   Any two views with the same combination of those produce a byte-identical
+   body for the same (tournament, round, match, followSelected) — e.g.
+   OverAllData == OverallFrags (~203 KB), Dom == WwcdStats == MatchFragrs
+   (~41 KB). The msgpack cache keys on req.originalUrl though, so today each
+   is its own Redis entry AND its own full Mongo aggregation on a miss.
+   canonicalBulkView() collapses each equivalence class onto one
+   representative `view` for cache-key purposes; getBulkData still builds
+   for whatever `view` the request actually carried (identical bytes).
+-------------------------------------------------------------------- */
+function bulkViewSignature(view) {
+  if (!view) return 'ALL';
+  return [
+    VIEWS_NEEDING_OVERALL.has(view) ? 'o' : '-',
+    VIEWS_NEEDING_MATCH_DATA.has(view) ? 'm' : '-',
+    VIEWS_NEEDING_MATCHES_LIST.has(view) ? 'l' : '-',
+    VIEWS_NEEDING_ALL_MATCH_DATAS.has(view) ? 'a' : '-',
+    VIEW_PLAYER_TIER[view] || 'full',
+    view === 'Achive' ? 'achive' : 'std',
+  ].join('');
+}
+
+const CANONICAL_VIEW_BY_SIGNATURE = (() => {
+  const allViews = new Set([
+    ...VIEWS_NEEDING_OVERALL, ...VIEWS_NEEDING_MATCH_DATA,
+    ...VIEWS_NEEDING_MATCHES_LIST, ...VIEWS_NEEDING_ALL_MATCH_DATAS,
+    ...Object.keys(VIEW_PLAYER_TIER),
+  ]);
+  const bySig = new Map();
+  for (const v of [...allViews].sort()) {
+    const sig = bulkViewSignature(v);
+    if (!bySig.has(sig)) bySig.set(sig, v);
+  }
+  return bySig;
+})();
+
+function canonicalBulkView(view) {
+  if (!view) return view;
+  return CANONICAL_VIEW_BY_SIGNATURE.get(bulkViewSignature(view)) || view;
+}
+
+// Log the fold groups once at boot so they're reviewable — if a future
+// `view === '...'` branch is added to buildBulkPayload without a matching
+// term in bulkViewSignature(), a group here would become wrong and this is
+// where it shows.
+{
+  const groups = new Map(); // canonical -> [aliases]
+  const allViews = new Set([
+    ...VIEWS_NEEDING_OVERALL, ...VIEWS_NEEDING_MATCH_DATA,
+    ...VIEWS_NEEDING_MATCHES_LIST, ...VIEWS_NEEDING_ALL_MATCH_DATAS,
+    ...Object.keys(VIEW_PLAYER_TIER),
+  ]);
+  for (const v of [...allViews].sort()) {
+    const canon = canonicalBulkView(v);
+    if (!groups.has(canon)) groups.set(canon, []);
+    if (v !== canon) groups.get(canon).push(v);
+  }
+  const folded = [...groups.entries()].filter(([, a]) => a.length);
+  if (folded.length) {
+    console.log('[bw][bulk] cache-key view folds: ' +
+      folded.map(([c, a]) => `${c}<=[${a.join(',')}]`).join('  '));
+  }
+}
+
 // Only slims team.players[] — team-level fields (teamId/teamTag/teamName/
 // teamLogo/placePoints/wwcd/slot, a handful of small values) are left
 // untouched everywhere; the byte cost this whole file is fixing lives in
@@ -610,6 +679,7 @@ async function getBulkData(req, res) {
 module.exports = {
   buildBulkPayload,
   getBulkData,
+  canonicalBulkView,
   getMatchDataForMatch,
   getMatchDataForMatchDoc,
   getMatchDataBatch,

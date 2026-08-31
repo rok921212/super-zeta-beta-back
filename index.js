@@ -40,6 +40,35 @@ const port = process.env.PORT || 3000;
 // Trust proxy (required for Render.com and other cloud platforms)
 app.set('trust proxy', 1);
 
+// Real post-compression wire-byte counter. Registered BEFORE compression()
+// so this res.write/res.end patch sits closest to the socket and measures the
+// bytes that actually leave the process (gzip/brotli output), not the
+// pre-compression body. compression() re-wraps res.write/res.end when it runs
+// later in the chain, capturing THESE wrappers as its originals — so the
+// chunks it hands back to us here are already encoded. Stashed on
+// res.locals.__bwWire for the [bw][http] line below, and summed into
+// utils/bwCounters for the periodic [bw][rollup].
+const { addHttpWire } = require('./utils/bwCounters');
+app.use((req, res, next) => {
+  let wire = 0;
+  const measure = (chunk, enc) => {
+    if (!chunk || typeof chunk === 'function') return;
+    wire += Buffer.isBuffer(chunk)
+      ? chunk.length
+      : Buffer.byteLength(chunk, typeof enc === 'string' ? enc : undefined);
+  };
+  const origWrite = res.write.bind(res);
+  const origEnd = res.end.bind(res);
+  res.write = (chunk, enc, cb) => { measure(chunk, enc); return origWrite(chunk, enc, cb); };
+  res.end = (chunk, enc, cb) => {
+    measure(chunk, enc);
+    res.locals.__bwWire = wire;
+    addHttpWire(wire);
+    return origEnd(chunk, enc, cb);
+  };
+  next();
+});
+
 // Enable compression for all responses.
 //
 // Bandwidth: the stock `compression()` filter defers to `compressible(contentType)`,
@@ -152,12 +181,17 @@ app.use((req, res, next) => {
   next();
 });
 
-// Per-route HTTP bandwidth accounting — no equivalent existed before this
-// (the [bw][emit] logs in utils/roomEmit.js only cover WebSocket traffic).
-// `bytes` is the pre-compression JSON body size, not the actual post-gzip
-// wire bytes Render bills for — a first-pass approximation good enough to
-// rank routes by relative volume, without the extra complexity of hooking
-// below the compression() middleware.
+// Per-route HTTP bandwidth accounting.
+//   bytes = pre-compression body size (JSON.stringify length, or the msgpack
+//           buffer length set by msgpackCacheMiddleware). Useful for ranking
+//           routes by payload weight.
+//   wire  = real post-compression bytes on the socket, from the counter
+//           registered before compression() above.
+// On a 304 the body is never sent, so `bytes` is forced to 0 to match `wire`
+// — a plain-cacheMiddleware 304 used to log the full representation size it
+// did NOT send (e.g. groups ~104 KB, matchdata ~74 KB, hundreds of times a
+// session), which is where most of the phantom "HTTP MB" in the totals came
+// from.
 app.use((req, res, next) => {
   const originalJson = res.json.bind(res);
   res.json = (data) => {
@@ -165,7 +199,10 @@ app.use((req, res, next) => {
     return originalJson(data);
   };
   res.on('finish', () => {
-    console.log(`[bw][http] ${req.method} ${req.originalUrl} status=${res.statusCode} bytes=${res.locals.__bwBytes ?? res.get('content-length') ?? 'n/a'}`);
+    const bytes = res.statusCode === 304
+      ? 0
+      : (res.locals.__bwBytes ?? res.get('content-length') ?? 'n/a');
+    console.log(`[bw][http] ${req.method} ${req.originalUrl} status=${res.statusCode} bytes=${bytes} wire=${res.locals.__bwWire ?? 'n/a'}`);
   });
   next();
 });
@@ -558,6 +595,10 @@ app.get('/', (req, res) => {
   res.send('Hello World from Express!');
 });
 
+// Hoisted so the SIGTERM handler below can drain them. Assigned in startServer().
+let server = null;
+let io = null;
+
 async function startServer() {
   try {
 
@@ -576,8 +617,8 @@ async function startServer() {
 
     console.log("✅ MongoDB connected");
 
-    const server = http.createServer(app);
-    const io = initializeSocket(server);
+    server = http.createServer(app);
+    io = initializeSocket(server);
 
     console.log('🚀 Starting live match updater now that DB is ready');
 
@@ -587,6 +628,19 @@ async function startServer() {
     server.listen(port, '0.0.0.0', () => {
       console.log(`🚀 Server running on ${port}`);
     });
+
+    // Periodic real-bandwidth rollup. http_wire is exact post-compression
+    // egress; ws_fanout is pre-perMessageDeflate (encoded length x recipients)
+    // with a ~/3 deflated estimate alongside. unref() so it never holds the
+    // process open during the SIGTERM drain below.
+    const { readAndReset } = require('./utils/bwCounters');
+    setInterval(() => {
+      const { httpWire, wsFanout } = readAndReset();
+      if (!httpWire && !wsFanout) return;
+      console.log(
+        `[bw][rollup] window=60s http_wire=${httpWire} ws_fanout=${wsFanout} ws_wire_est=${Math.round(wsFanout / 3)}`
+      );
+    }, 60000).unref();
 
   } catch (err) {
     console.log("❌ MongoDB connection error", err);
@@ -612,8 +666,39 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error(`[fatal] unhandledRejection at ${new Date().toISOString()}:`, reason);
 });
 
-process.on('SIGTERM', async () => {
-  process.exit(0);
+// Graceful drain on deploy / instance recycle. The old handler was a bare
+// process.exit(0): every WebSocket was severed at the TCP level with no
+// Socket.IO `disconnect` frame, so every client (dozens of OBS Browser
+// Sources + the dashboard) treated it as a hard drop and reconnected within
+// ~5s — each re-running joinRoundRoom and pulling a full ~18.8 KB hydrate,
+// and each dashboard socket replaying its full match snapshot(s). io.close()
+// sends real disconnect frames so clients within connectionStateRecovery's
+// 120s window resume the SAME session on reconnect (socket.recovered ===
+// true) and SKIP re-hydration entirely. Hard-capped so a stuck close never
+// outlives Render's own SIGKILL grace.
+let shuttingDown = false;
+process.on('SIGTERM', () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log('[shutdown] SIGTERM — draining sockets');
+  const hardExit = setTimeout(() => {
+    console.warn('[shutdown] drain timed out — forcing exit');
+    process.exit(0);
+  }, 8000);
+  hardExit.unref();
+  const done = () => { clearTimeout(hardExit); process.exit(0); };
+  try {
+    // io.close() in socket.io v4 disconnects every client with a real close
+    // frame AND closes the underlying HTTP server that was passed to it, so
+    // this one call covers both. server.close() is the fallback for the
+    // (unreachable in practice) case where io was never created.
+    if (io) io.close(done);
+    else if (server) server.close(done);
+    else done();
+  } catch (err) {
+    console.warn('[shutdown] drain error:', err?.message);
+    done();
+  }
 });
 
 startServer();

@@ -1,7 +1,24 @@
 const express = require('express');
 const router = express.Router();
-const { getBulkData } = require('../controller/Bulkpublic.controller');
+const { getBulkData, canonicalBulkView } = require('../controller/Bulkpublic.controller');
 const { msgpackCacheMiddleware } = require('../middleware/cache.js');
+
+// Cache-key normaliser (see canonicalBulkView + msgpackCacheMiddleware's
+// keyFn param): fold byte-identical `view`s onto one entry and give params a
+// stable order, so N distinct view names for the same underlying data share
+// one Redis entry + one Mongo aggregation on a miss instead of 2-3x.
+function bulkCacheKey(req) {
+  try {
+    const u = new URL(req.originalUrl, 'http://x');
+    const v = u.searchParams.get('view');
+    if (v) u.searchParams.set('view', canonicalBulkView(v));
+    u.searchParams.sort();
+    const qs = u.searchParams.toString();
+    return qs ? `${u.pathname}?${qs}` : u.pathname;
+  } catch {
+    return req.originalUrl;
+  }
+}
 
 /**
  * GET /api/public/bulk/:tournamentId/:roundId/:matchId?
@@ -27,7 +44,7 @@ const { msgpackCacheMiddleware } = require('../middleware/cache.js');
 // clears this key immediately via invalidateScope('round:<tid>:<rid>').
 router.get(
   '/bulk/:tournamentId/:roundId/:matchId',
-  msgpackCacheMiddleware(20, req => `round:${req.params.tournamentId}:${req.params.roundId}`),
+  msgpackCacheMiddleware(20, req => `round:${req.params.tournamentId}:${req.params.roundId}`, bulkCacheKey),
   getBulkData
 );
 

@@ -240,12 +240,20 @@ cacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
 // stores the plain JS object under the same key scheme, so bustCache/
 // invalidateScope in comsock.js need no changes), but the response body is
 // MessagePack-encoded instead of JSON on both the hit and miss paths.
-msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
+//
+// keyFn(req), when given, replaces req.originalUrl as the per-request part of
+// the cache key — used by /api/public/bulk to fold byte-identical `view`s
+// (OverAllData/OverallFrags, Dom/WwcdStats/MatchFragrs, ...) onto one entry
+// and to normalise query-param order. It only affects the cache key; the
+// controller still sees the real req.query and builds the real (identical)
+// body on a miss.
+msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null, keyFn = null) => {
   return async (req, res, next) => {
     if (req.method !== 'GET') return next();
 
     const scope = scopeFn ? scopeFn(req) : (req.session?.userId?.toString() || req.sessionID || 'anon');
-    const key = `cache:${scope}:${req.originalUrl}`;
+    const keyPath = keyFn ? keyFn(req) : req.originalUrl;
+    const key = `cache:${scope}:${keyPath}`;
     // In-process copy of the ENCODED msgpack body. Tracked in
     // memoryScopeIndex under `scope` so invalidateScope() sweeps it, and
     // prefixed `cache:<scope>:` so invalidateKeysByPrefix() matches it too.
@@ -257,13 +265,21 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
     const cacheControl = cacheControlFor(req, scopeFn);
     const setRevHeader = (rev) => res.set('X-Public-Rev', String(rev ?? 0));
 
-    // Cheap conditional 304. The ETag is stable within one cache-TTL window
-    // and rolls immediately on any invalidateScope/invalidateKeysByPrefix for
-    // this scope (a manual dashboard edit). A matching If-None-Match skips
-    // Redis, Mongo and msgpack encoding entirely — the main HTTP-egress lever
-    // for /api/public/bulk (~360 KB), which every OBS source re-fetches on
-    // mount, on reconnect, and on a periodic backstop.
-    const etag = `W/"${getEtagEpoch(scope)}.${Math.floor(Date.now() / (ttlSeconds * 1000))}"`;
+    // Cheap conditional 304. The ETag is now purely the scope's revision
+    // epoch — it changes if and only if invalidateScope / invalidateKeysByPrefix
+    // ran for this scope, which every mutation path that can alter a /bulk or
+    // /overall body already does (utils/publicRevision.js bumpRound/
+    // bumpTournament -> invalidateScope on points/roster/selection/structure/
+    // skin edits and the manual SAVE DATA). Between those events the body is
+    // byte-identical, so a revalidating client stays 304 and pulls ~0 bytes.
+    //
+    // The previous form appended `.${floor(now / TTL)}`, a time bucket that
+    // rolled every `ttlSeconds` (20s for /bulk) and forced a full-body 200 to
+    // every OBS source every 20s even when nothing had changed — the single
+    // biggest real HTTP-egress item. Dropped. On a cold start the in-process
+    // epoch is 0 until the first bump; a client holding a stale pre-restart
+    // ETag then gets one fresh 200 and self-heals on the next mutation.
+    const etag = `W/"${getEtagEpoch(scope)}"`;
     res.set('ETag', etag);
     if (req.headers['if-none-match'] === etag) {
       res.locals.__bwBytes = 0;

@@ -14,7 +14,8 @@ const { encodeMsgpack } = require('../../utils/msgpackCodec');
 const { updateDeadTeamList, hydrateMatchDataIdentity } = require('../Bulkpublic.controller');
 const { VIEWS_NEEDING_OVERALL, VIEWS_NEEDING_MATCH_DATA, VIEWS_NEEDING_POSITIONAL_DATA } = require('../../utils/viewDataTiers');
 const { setSocketWireFormat, clearSocketWireFormat } = require('../../utils/socketFormatRegistry');
-const { emitToRoomSplitByFormat } = require('../../utils/roomEmit');
+const { emitToRoomSplitByFormat, roomSize, countNonRelaySockets } = require('../../utils/roomEmit');
+const { addWsFanout } = require('../../utils/bwCounters');
 const { toProtoMatchDataPayload, toProtoOverallDataPayload } = require('../../utils/protobufCodec');
 const { computeChangedTeams, TRACKED_FIELDS, stripPositionalFields } = require('../../utils/matchTeamDiff');
 const { getRoundStructureVersion } = require('../../utils/roundStructure');
@@ -175,6 +176,42 @@ let isSaving = false;
 // "SAVE DATA" button, via saveLiveMatchSnapshot below). Set LIVE_AUTOSAVE=true
 // to restore the old continuous flush (e.g. as a durability safety net).
 const LIVE_AUTOSAVE_ENABLED = process.env.LIVE_AUTOSAVE === 'true';
+
+// Kill switch for the outbound live-telemetry burst (liveMatchUpdate /
+// overallDataUpdate / dataHeartbeat). Default ON. When set to 'false' the
+// tick pipeline still runs — totalPlayerList ingest, the relay handshake,
+// liveMatchCache refresh, manual SAVE DATA — but emitUpdates does no
+// socket emit at all. Instant rollback lever for the consumer-gating
+// below; flip back to 'true' and clients resume within one tick (a
+// dashboard/overlay that (re)connects meanwhile is hydrated from
+// liveMatchCache as usual).
+const CLOUD_LIVE_DATA_ENABLED = process.env.CLOUD_LIVE_DATA_ENABLED !== 'false';
+
+// ─── Live-emit observability (Stage 0) ───────────────────────────────────────
+// emitUpdates runs whenever a user is in activeUserKeys (a pure DB
+// condition). These counters make visible how much of that work is spent
+// with nobody actually subscribed, and are logged + reset every 60s
+// alongside index.js's [bw][rollup]. The user:<id> msgpack emit is a
+// direct io.to().emit (not via emitToRoomSplitByFormat), so it was never
+// counted in [bw][rollup]'s ws_fanout — addWsFanout is now called for it
+// too (see emitUpdates), closing a ~10x under-report.
+let cloudLiveTicksTotal = 0;
+let cloudLiveTicksSkippedNoConsumers = 0;
+let overallScansTotal = 0;
+let overallScansSkippedNoSubscribers = 0;
+setInterval(() => {
+  if (!cloudLiveTicksTotal && !overallScansTotal) return;
+  console.log(
+    `[bw][cloud-live] window=60s ticks=${cloudLiveTicksTotal} ` +
+    `skipped_no_consumers=${cloudLiveTicksSkippedNoConsumers} ` +
+    `overall_scans=${overallScansTotal} overall_skipped_no_subs=${overallScansSkippedNoSubscribers} ` +
+    `emit_enabled=${CLOUD_LIVE_DATA_ENABLED}`
+  );
+  cloudLiveTicksTotal = 0;
+  cloudLiveTicksSkippedNoConsumers = 0;
+  overallScansTotal = 0;
+  overallScansSkippedNoSubscribers = 0;
+}, 60000).unref();
 
 async function processSaveQueue() {
   if (isSaving || saveQueue.size === 0) return;
@@ -668,6 +705,39 @@ function markUserInactiveForPolling(userId) {
 const lastMatchDataByUserMatch = {};
 const lastFingerprintByUserMatch = {}; // stores fingerprint PARTS arrays, not hashes
 
+// ─── liveMatchCache idle eviction ────────────────────────────────────────────
+// liveMatchCache and the five last*ByUserMatch maps above were never pruned:
+// every (user, match) pair seen since the process booted stayed resident for
+// the whole lifetime. Two concrete costs:
+//   1. Memory grew unbounded across a multi-hour broadcast -> Render OOM-kill
+//      -> restart -> every socket drops at once -> mass reconnect + full
+//      re-hydration (the reconnect storm).
+//   2. The dashboard user-room hydration loop replayed EVERY entry for the
+//      user (the "4 stale matchIds" in the [bw] logs), not just the live one.
+// A live match writes liveMatchCache every ~2s, so a generous idle TTL never
+// touches an in-progress match; anything not written for LIVE_MATCH_CACHE_TTL_MS
+// and not currently selected is a finished/abandoned match and is dropped.
+const liveMatchCacheTouchedAt = new Map(); // cacheKey -> Date.now() of last set
+const LIVE_MATCH_CACHE_TTL_MS = 15 * 60 * 1000;
+// Dashboard reconnect hydration only replays snapshots newer than this — a
+// tighter bound than the sweep TTL so a just-finished match isn't re-sent to
+// every reconnecting tab in the gap before the next sweep.
+const LIVE_MATCH_HYDRATION_MAX_AGE_MS = 10 * 60 * 1000;
+
+function touchLiveMatchCache(cacheKey) {
+  liveMatchCacheTouchedAt.set(cacheKey, Date.now());
+}
+
+function evictLiveMatchKey(cacheKey) {
+  liveMatchCache.delete(cacheKey);
+  liveMatchCacheTouchedAt.delete(cacheKey);
+  delete lastMatchDataByUserMatch[cacheKey];
+  delete lastFingerprintByUserMatch[cacheKey];
+  delete lastOverallFingerprintByUserMatch[cacheKey];
+  delete lastOverallTeamsByUserMatch[cacheKey];
+  delete lastDeadTeamIdsByUserMatch[cacheKey];
+}
+
 // socket.id -> userId, so disconnect can clean up the right entries
 const socketIdToUserId = new Map();
 
@@ -769,20 +839,29 @@ function startLiveMatchUpdater() {
       // RECONNECTS after an outage (socket.io makes a fresh socket + re-runs
       // this handler) — would otherwise only ever see partial teams. The
       // HTTP matchdata fetch on the dashboard's mount covers first load but
-      // not a reconnect. Replay whatever full snapshots liveMatchCache holds
-      // for this user's active match(es) — usually one; the client filters
-      // by its own matchId/_id so any extra is harmless. msgpack, non-
-      // volatile (a catch-up send must not be dropped under backpressure).
+      // not a reconnect. Replay the full snapshot for this user's currently
+      // LIVE match(es) only: an entry not written in the last
+      // LIVE_MATCH_HYDRATION_MAX_AGE_MS is a finished match, and re-sending
+      // every finished match this user has ever run (what this loop used to
+      // do — the "4 stale matchIds" in the [bw] logs, ~62 KB msgpack each)
+      // on every reconnect of the storm was a top bandwidth item. msgpack,
+      // non-volatile (a catch-up send must not be dropped under backpressure).
       //
       // Skipped on a recovered session (connectionStateRecovery): the missed
       // liveMatchUpdate deltas were already replayed, so a full re-send here
       // would just be redundant bytes.
       if (!socket.recovered) {
         const uidStr = String(sessionUserId);
+        const now = Date.now();
         for (const [cacheKey, fullMatch] of liveMatchCache) {
           if (!cacheKey.startsWith(`${uidStr}:`)) continue;
+          const touchedAt = liveMatchCacheTouchedAt.get(cacheKey) ?? 0;
+          if (now - touchedAt > LIVE_MATCH_HYDRATION_MAX_AGE_MS) continue;
           const hydratedMatchId = cacheKey.slice(uidStr.length + 1);
-          socket.emit('liveMatchUpdate', encodeMsgpack({ ...fullMatch, matchId: hydratedMatchId }));
+          // location stripped to match the user:<id> delta stream (see
+          // emitUpdates) — no dashboard consumer renders position off this
+          // feed, they read it from the local :10086 PCOB feed.
+          socket.emit('liveMatchUpdate', encodeMsgpack({ ...fullMatch, teams: stripPositionalFields(fullMatch.teams), matchId: hydratedMatchId }));
           console.log(c('dim', `[socket] user-room hydration -> ${socket.id} cacheKey=${cacheKey}`));
         }
       }
@@ -1272,6 +1351,25 @@ function startLiveMatchUpdater() {
         const memoryMatch = liveMatchCache.get(cacheKey);
         if (!memoryMatch) return;
 
+        // A socket that already received a full snapshot for this match on
+        // this connection is still in the room and getting every delta tick —
+        // re-sending the whole ~18.8 KB snapshot just because it switched
+        // view (Dom -> LiveStats -> Alerts: same match, same matchData tier)
+        // is pure waste and was ~5 MB/session of churn on its own. Keyed on
+        // the tier so a core -> positional switch (needs the extra location
+        // fields) still re-hydrates. Restored by connectionStateRecovery
+        // along with the rest of socket.data, so a recovered session — which
+        // already had its missed deltas replayed — correctly skips too.
+        const hydrateKey = `${cacheKey}:${joinMatchDataPositional ? 'pos' : 'core'}`;
+        // instanceof check (not just falsy) so a future non-in-memory adapter
+        // that JSON-round-trips socket.data can't turn this into a plain {}.
+        if (!(socket.data.hydratedMatches instanceof Set)) socket.data.hydratedMatches = new Set();
+        if (socket.data.hydratedMatches.has(hydrateKey)) {
+          console.log(`[bw][room] socket ${socket.id} joinRoundRoom hydrate SKIPPED (already sent ${hydrateKey})`);
+          return;
+        }
+        socket.data.hydratedMatches.add(hydrateKey);
+
         // volatile:false deliberately, unlike the regular tick path above
         // — this is a one-shot catch-up send for a socket that has nothing
         // yet, so it must not be silently dropped under backpressure the
@@ -1680,6 +1778,7 @@ function startLiveMatchUpdater() {
     }
 
     liveMatchCache.set(cacheKey, updatedObject);
+    touchLiveMatchCache(cacheKey);
     lastFingerprintByUserMatch[cacheKey] = newFingerprint;
 
     // Overwrites any still-pending snapshot for this match — see the
@@ -1832,6 +1931,18 @@ function startLiveMatchUpdater() {
         // ─────────────────────────────────────────────────────────────────
         const emitOverallUpdate = async () => {
           if (overallRecomputeInFlight.has(cacheKey)) return;
+          const overallRoom = `round:${selected.tournamentId}:${selected.roundId}:overall`;
+          // S3: computeOverallMatchDataForRound below is a round-wide
+          // MatchData.find + per-player re-aggregate — the single most
+          // expensive step in a tick. Skip it entirely when no overlay is
+          // subscribed to standings. A later joiner gets standings from the
+          // HTTP /api/public/bulk hydration on mount, then from the next
+          // elimination-changed tick after it has joined the room.
+          overallScansTotal++;
+          if (roomSize(io, overallRoom) === 0) {
+            overallScansSkippedNoSubscribers++;
+            return;
+          }
           overallRecomputeInFlight.add(cacheKey);
           try {
             const overallTeams = await computeOverallMatchDataForRound(
@@ -1849,7 +1960,6 @@ function startLiveMatchUpdater() {
               // it's absent from a given tick rather than blanking it.
               const changedOverallTeams = computeChangedTeams(overallTeams, lastOverallTeamsByUserMatch[cacheKey]);
               lastOverallTeamsByUserMatch[cacheKey] = overallTeams;
-              const overallRoom = `round:${selected.tournamentId}:${selected.roundId}:overall`;
               if (changedOverallTeams.length === 0) {
                 // Structurally near-impossible: the fingerprint gate above is
                 // a strict subset of what this full-object comparison
@@ -1889,117 +1999,126 @@ function startLiveMatchUpdater() {
         const emitUpdates = () => {
           memoryMatch.deadTeamList = updateDeadTeamList(selected.matchId, memoryMatch);
 
-          // Team-level (+ player-level) delta since the last tick. Computed
-          // ONCE here and reused for both the operator dashboard (user:
-          // room) and the public overlay rooms — all three now send this
-          // diff, not the whole memoryMatch. First tick for this
-          // (user, match): lastData is undefined, so computeChangedTeams
-          // returns the full roster — a natural full baseline.
-          const changedTeams = computeChangedTeams(memoryMatch.teams, lastData?.teams);
-          const matchDataRoom = `round:${selected.tournamentId}:${selected.roundId}:matchData`;
-          const matchDataPositionalRoom = `round:${selected.tournamentId}:${selected.roundId}:matchDataPositional`;
-
-          // volatile: if a client's socket buffer is backed up, drop this
-          // frame rather than queueing — always prefer the freshest data.
-          //
-          // Operator dashboard (user: room): a tiny liveness heartbeat for
-          // isPolling.tsx's "LIVE • data Xs ago" dot (that component used to
-          // join the PUBLIC round room and subscribe to the whole delta
-          // stream just for this), plus the liveMatchUpdate itself.
-          //
-          // liveMatchUpdate was the ENTIRE memoryMatch (every team, every
-          // player, ~40 fields incl. location + deadTeamList) every ~2s
-          // tick, as msgpack OR plain JSON. Now it's the same `changedTeams`
-          // delta the public rooms use, msgpack only. `location` is kept
-          // here (the dashboard's own map / observing-player views read it
-          // off matchData; desktop firing-detection uses a separate local
-          // PCOB feed, not this). Every consumer negotiates
-          // ?msgpackLiveUpdate=1 (the SharedWorker and the Rust hub both
-          // do), and a dashboard that connects or reconnects mid-match gets
-          // a full baseline from the user-room hydration in
-          // io.on('connection') above — so the plain-JSON fallback is gone.
-          // Relay sockets (s.data.userId set) never listen for this.
-          {
-            const userRoom = `user:${userKey}`;
-            const userRoomIds = io.sockets.adapter.rooms.get(userRoom);
-            if (userRoomIds && userRoomIds.size > 0) {
-              io.to(userRoom).volatile.emit('dataHeartbeat', {
-                tournamentId: String(selected.tournamentId),
-                roundId: String(selected.roundId),
-                matchId: String(selected.matchId),
-                at: Date.now(),
-              });
-
-              if (changedTeams.length > 0) {
-                const targets = [];
-                for (const id of userRoomIds) {
-                  const s = io.sockets.sockets.get(id);
-                  if (!s || s.data?.userId) continue;
-                  targets.push(id);
-                }
-                if (targets.length) {
-                  const encoded = encodeMsgpack({ ...memoryMatch, teams: changedTeams, matchId: String(selected.matchId) });
-                  console.log(`[bw][emit] liveMatchUpdate (delta) -> ${userRoom}: sockets=${targets.length} teams=${changedTeams.length}/${memoryMatch.teams.length} bytes=${encoded.length}`);
-                  io.to(targets).volatile.emit('liveMatchUpdate', encoded);
-                }
-              }
-            }
-          }
-
-          // Public overlay: only send the teams that actually changed since
-          // the last tick (team-level delta), to whichever sockets joined
-          // the matchData tier (view-scoped — see joinRoundRoom above),
-          // split by negotiated wire format (protobuf vs. msgpack).
-          if (changedTeams.length === 0) {
-            // Structurally near-impossible: the top-level `changed` gate
-            // (TRACKED_FIELDS-based) is a strict subset of what this
-            // full-object comparison covers, so if `changed` fired, at
-            // least one team should differ here too. Logged loudly rather
-            // than silently skipped so a future divergence is visible.
-            console.warn(`[bw][delta] ${cacheKey}: change gate fired but 0 teams differ — skipping ${matchDataRoom}/${matchDataPositionalRoom} emit this tick`);
-          } else {
-            console.log(`[bw][delta] ${cacheKey}: ${changedTeams.length}/${memoryMatch.teams.length} teams changed -> ${matchDataRoom}/${matchDataPositionalRoom}`);
-            // Core tier: no `location` — the vast majority of views (kill
-            // feeds, stat panels, standings, etc.) never render position,
-            // and location is the field most likely to differ on any given
-            // tick during combat, so stripping it here is what actually
-            // shrinks the common-case payload. emitToRoomSplitByFormat
-            // no-ops (skips encode entirely) when a room is empty, so this
-            // costs nothing extra when nobody's joined either room.
-            emitToRoomSplitByFormat(io, matchDataRoom, 'liveMatchUpdate', {
-              protoMessageName: 'MatchDataPayload',
-              mapToProto: toProtoMatchDataPayload,
-              data: { ...memoryMatch, teams: stripPositionalFields(changedTeams), matchId: String(selected.matchId) },
-              volatile: true,
-            });
-            // Positional tier: strict superset of the core payload (adds
-            // location back) — only mapPreview-type views join this room,
-            // and joinRoundRoom ensures a socket joins one or the other,
-            // never both.
-            emitToRoomSplitByFormat(io, matchDataPositionalRoom, 'liveMatchUpdate', {
-              protoMessageName: 'MatchDataPayload',
-              mapToProto: toProtoMatchDataPayload,
-              data: { ...memoryMatch, teams: changedTeams, matchId: String(selected.matchId) },
-              volatile: true,
-            });
-          }
-
-          // Round-wide standings only matter once a team's placement for
-          // THIS match is settled (rank/placePoints, kills counted toward
-          // the round total) — not on every live combat-stat tick, since
-          // computeOverallMatchDataForRound sums each match's CURRENT live
-          // player stats (health/damage/survivalTime, ...) regardless of
-          // whether that team has finished playing, and those change on
-          // essentially every tick a player is alive. Only recompute/
-          // broadcast when a team's alive/dead status actually changed —
-          // or this is the very first tick seen for this match, so a
-          // brand-new match still shows up in the standings immediately.
+          // Elimination tracking advances EVERY tick, before any gate below:
+          // a consumer that connects later still needs a correct alive/dead
+          // transition to trigger the first standings recompute after it
+          // joins. computeOverallMatchDataForRound is expensive and
+          // fire-and-forget, so it's only invoked when a team's alive/dead
+          // status actually changed (or the first tick for this match).
           const deadTeamIds = new Set(memoryMatch.deadTeamList.map(t => String(t.teamId)));
           const prevDeadTeamIds = lastDeadTeamIdsByUserMatch[cacheKey];
           const eliminationChanged = !prevDeadTeamIds ||
             deadTeamIds.size !== prevDeadTeamIds.size ||
             [...deadTeamIds].some(id => !prevDeadTeamIds.has(id));
           lastDeadTeamIdsByUserMatch[cacheKey] = deadTeamIds;
+
+          // Kill switch: totalPlayerList ingest, liveMatchCache refresh, the
+          // relay handshake and manual SAVE DATA all still ran this tick —
+          // this only suppresses the outbound socket burst.
+          if (!CLOUD_LIVE_DATA_ENABLED) return;
+          cloudLiveTicksTotal++;
+
+          const userRoom = `user:${userKey}`;
+          const matchDataRoom = `round:${selected.tournamentId}:${selected.roundId}:matchData`;
+          const matchDataPositionalRoom = `round:${selected.tournamentId}:${selected.roundId}:matchDataPositional`;
+          const overallRoom = `round:${selected.tournamentId}:${selected.roundId}:overall`;
+
+          // Consumer gate: only build the delta + encode + emit if something
+          // is actually subscribed. Relay sockets in user:<id> (s.data.userId
+          // set) never listen for liveMatchUpdate, so they don't count. When
+          // nothing is connected, the live player state was still merged (the
+          // totalPlayerList handler) and liveMatchCache was still refreshed
+          // (updateMatchDataWithLiveStats) this tick — so a dashboard/overlay
+          // that (re)connects later is hydrated correctly from that cache; it
+          // just won't replay the per-tick deltas it wasn't present for.
+          const userRoomIds = io.sockets.adapter.rooms.get(userRoom);
+          const userTargets = [];
+          if (userRoomIds) {
+            for (const id of userRoomIds) {
+              const s = io.sockets.sockets.get(id);
+              if (!s || s.data?.userId) continue;
+              userTargets.push(id);
+            }
+          }
+          const matchDataSize = roomSize(io, matchDataRoom);
+          const positionalSize = roomSize(io, matchDataPositionalRoom);
+          const overallSize = roomSize(io, overallRoom);
+
+          if (userTargets.length === 0 && matchDataSize === 0 && positionalSize === 0 && overallSize === 0) {
+            cloudLiveTicksSkippedNoConsumers++;
+            return;
+          }
+
+          // Team-level (+ player-level) delta since the last tick, reused by
+          // every room below. First tick for this (user, match): lastData is
+          // undefined, so computeChangedTeams returns the full roster — a
+          // natural full baseline.
+          const changedTeams = computeChangedTeams(memoryMatch.teams, lastData?.teams);
+
+          // ── Operator dashboard (user: room) ──
+          // volatile: if a client's buffer is backed up, drop this frame
+          // rather than queueing — always prefer the freshest data. The
+          // dataHeartbeat feeds isPolling.tsx's "LIVE • data Xs ago" dot.
+          if (userTargets.length > 0) {
+            io.to(userRoom).volatile.emit('dataHeartbeat', {
+              tournamentId: String(selected.tournamentId),
+              roundId: String(selected.roundId),
+              matchId: String(selected.matchId),
+              at: Date.now(),
+            });
+
+            if (changedTeams.length > 0) {
+              // location stripped: no user:-room consumer renders player
+              // position off THIS feed — ObservingPlayer.tsx and both
+              // (desktop + front) matchDataController.tsx read position from
+              // the local :10086 PCOB feed, not from here. Kept as msgpack
+              // (no client decode change); clients merge a partial teams[]
+              // by id, so an absent field just keeps its last-known value.
+              const encoded = encodeMsgpack({ ...memoryMatch, teams: stripPositionalFields(changedTeams), matchId: String(selected.matchId) });
+              console.log(`[bw][emit] liveMatchUpdate (delta) -> ${userRoom}: sockets=${userTargets.length} teams=${changedTeams.length}/${memoryMatch.teams.length} bytes=${encoded.length}`);
+              io.to(userTargets).volatile.emit('liveMatchUpdate', encoded);
+              // Count this fan-out into [bw][rollup]'s ws_fanout — this
+              // direct emit bypasses emitToRoomSplitByFormat, so it was
+              // previously invisible there (a ~10x under-report).
+              addWsFanout(encoded.length * userTargets.length);
+            }
+          }
+
+          // ── Public overlay rooms (view-scoped, wire-format split) ──
+          if (changedTeams.length === 0) {
+            // Structurally near-impossible: the top-level `changed` gate
+            // (TRACKED_FIELDS-based) is a strict subset of this full-object
+            // comparison. Logged loudly so a future divergence is visible.
+            console.warn(`[bw][delta] ${cacheKey}: change gate fired but 0 teams differ — skipping ${matchDataRoom}/${matchDataPositionalRoom} emit this tick`);
+          } else {
+            // Only build + encode a tier's payload when that tier actually
+            // has a subscriber — the stripPositionalFields transform + the
+            // object spread used to run every tick even for an empty room.
+            if (matchDataSize > 0) {
+              console.log(`[bw][delta] ${cacheKey}: ${changedTeams.length}/${memoryMatch.teams.length} teams changed -> ${matchDataRoom}`);
+              // Core tier: no `location` — most views never render position,
+              // and location is the field most likely to differ during
+              // combat, so stripping it shrinks the common-case payload.
+              emitToRoomSplitByFormat(io, matchDataRoom, 'liveMatchUpdate', {
+                protoMessageName: 'MatchDataPayload',
+                mapToProto: toProtoMatchDataPayload,
+                data: { ...memoryMatch, teams: stripPositionalFields(changedTeams), matchId: String(selected.matchId) },
+                volatile: true,
+              });
+            }
+            if (positionalSize > 0) {
+              console.log(`[bw][delta] ${cacheKey}: ${changedTeams.length}/${memoryMatch.teams.length} teams changed -> ${matchDataPositionalRoom}`);
+              // Positional tier: strict superset of the core payload (adds
+              // location back) — only mapPreview-type views join this room,
+              // and joinRoundRoom ensures a socket joins one or the other.
+              emitToRoomSplitByFormat(io, matchDataPositionalRoom, 'liveMatchUpdate', {
+                protoMessageName: 'MatchDataPayload',
+                mapToProto: toProtoMatchDataPayload,
+                data: { ...memoryMatch, teams: changedTeams, matchId: String(selected.matchId) },
+                volatile: true,
+              });
+            }
+          }
 
           if (eliminationChanged) {
             emitOverallUpdate().catch(err =>
@@ -2081,6 +2200,27 @@ function startLiveMatchUpdater() {
           activeUserKeys.delete(existingUid);
           console.log(`[discovery] NO LONGER ACTIVE → ${existingUid}`);
         }
+      }
+
+      // ── Idle-evict stale live-match snapshots ──────────────────────────
+      // Keep an entry while its match is a live selection OR it was written
+      // in the last LIVE_MATCH_CACHE_TTL_MS (a live match writes every ~2s,
+      // so an in-progress match never trips this). Everything else is a
+      // finished/abandoned match whose snapshot would otherwise sit in
+      // memory — and be replayed by the dashboard hydration loop — forever.
+      const keepMatchIds = new Set(selectedMatches.map(s => String(s.matchId)));
+      const now = Date.now();
+      let evicted = 0;
+      for (const cacheKey of Array.from(liveMatchCache.keys())) {
+        const matchId = cacheKey.slice(cacheKey.indexOf(':') + 1);
+        if (keepMatchIds.has(matchId)) continue;
+        const touchedAt = liveMatchCacheTouchedAt.get(cacheKey) ?? 0;
+        if (now - touchedAt < LIVE_MATCH_CACHE_TTL_MS) continue;
+        evictLiveMatchKey(cacheKey);
+        evicted++;
+      }
+      if (evicted) {
+        console.log(`[bw][cache-sweep] evicted ${evicted} stale liveMatchCache entr${evicted === 1 ? 'y' : 'ies'}; ${liveMatchCache.size} remain`);
       }
     } catch (e) {
       console.error('[discovery] Error:', e);
