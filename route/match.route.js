@@ -69,6 +69,18 @@ router.get(
   matchController.getMatchesByTournamentAndRound
 );
 
+// Repair: re-add group teams missing from the round's MatchData docs.
+router.post(
+  '/tournaments/:tournamentId/rounds/:roundId/matches/resync-teams',
+  requireAuth,
+  invalidateCacheMiddleware((req) => [
+    `cache:/api/tournaments/${req.params.tournamentId}/matches`,
+    `cache:/api/rounds/${req.params.roundId}/matches`,
+    `cache:/api/tournaments/${req.params.tournamentId}/rounds/${req.params.roundId}/matches`,
+  ]),
+  matchController.resyncRoundMatchTeams
+);
+
 // Update a match
 router.put(
   '/tournaments/:tournamentId/rounds/:roundId/matches/:id',

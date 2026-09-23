@@ -212,6 +212,137 @@ const createMatchDataForMatchDoc = async (matchOrId) => {
   }
 };
 
+// Builds a MatchData team entry from a populated Group slot — the same shape
+// createMatchDataForMatchDoc produces at match-creation time.
+function buildSlotTeam(slot) {
+  const teamName = slot.team.teamFullName || slot.team.teamName || '';
+  return {
+    slot: slot.slot,
+    teamId: slot.team._id,
+    teamLogo: slot.team.logo || '',
+    teamName,
+    teamTag: slot.team.teamTag || '',
+    players: (slot.team.players || []).slice(0, 4)
+      .map(player => buildFreshPlayer(player, slot.slot, teamName)),
+  };
+}
+
+// Any per-player value that only live/recorded data sets — a freshly
+// created roster player (buildFreshPlayer) has all of these at 0.
+const PLAYER_DATA_FIELDS = [
+  'killNum', 'damage', 'knockouts', 'assists', 'survivalTime', 'inDamage',
+  'heal', 'headShotNum', 'health', 'healthMax', 'liveState', 'rank',
+];
+
+// True once a match has ANY recorded data: a placement/rank on a team or any
+// live stat on a player. Such a match's slots are history: round-robin
+// groups get re-slotted between matches (a group plays 11–18 one match,
+// 3–10 the next), and rewriting a played match's slots/teams to the group's
+// new layout would make it collide with the other group's slots.
+//
+// rosterSynced is set in the DB by the live updater on the first tick that
+// carries live player data (pubgApiMatchData.controller.js) — a durable
+// "this match has gone live" signal even while LIVE_AUTOSAVE is off and the
+// stats themselves only live in memory until SAVE DATA.
+function matchHasResults(matchData) {
+  if (matchData?.rosterSynced) return true;
+  return (matchData?.teams || []).some(t =>
+    Number(t.placePoints || 0) > 0 ||
+    Number(t.rank || 0) > 0 ||
+    (t.players || []).some(p => PLAYER_DATA_FIELDS.some(f => Number(p?.[f] || 0) > 0))
+  );
+}
+
+// Projection with just enough of MatchData to evaluate matchHasResults.
+const RESULTS_PROJECTION = 'matchId rosterSynced teams.placePoints teams.rank ' +
+  PLAYER_DATA_FIELDS.map(f => `teams.players.${f}`).join(' ');
+
+// A locked match's MatchData is frozen against group edits: no slot moves,
+// no added/swapped teams — only team name/tag/logo still refresh. A match
+// locks automatically as soon as it has any data: recorded in the DB, or
+// live in the auto-update cache (not yet persisted by SAVE DATA). The live
+// updater routes squads by team.slot every tick, so a slot change mid-match
+// would put live stats on the wrong teams.
+function isMatchLocked(match, matchData) {
+  if (matchHasResults(matchData)) return true;
+  const matchId = match?._id || matchData?.matchId;
+  if (!matchId) return false;
+  // Lazy require: the live controller loads modules that load this file.
+  const { getLiveMatchData } = require('./Api_controllers/pubgApiMatchData.controller.js');
+  return matchHasResults(getLiveMatchData(matchId));
+}
+
+// Locked path: refresh display metadata of teams already in the match and
+// nothing else. Returns the per-team change list (empty when nothing moved).
+function refreshLockedMatchMetadata(matchData, slots) {
+  const changedTeams = [];
+  let changed = false;
+  for (const slot of slots) {
+    if (!slot.team) continue;
+    const existing = matchData.teams.find(t => String(t.teamId) === String(slot.team._id));
+    if (!existing) continue;
+    const { changed: metaChanged, fieldChanges } = refreshTeamMetadata(existing, slot, { keepSlot: true });
+    if (metaChanged) changed = true;
+    if (Object.keys(fieldChanges).length > 0) {
+      changedTeams.push({ teamId: existing.teamId, changes: fieldChanges });
+    }
+  }
+  return { changed, changedTeams };
+}
+
+// Same team — only refresh display metadata, never touch live stats/roster.
+// Returns the changed display fields ({} when nothing changed).
+function refreshTeamMetadata(existing, slot, { keepSlot = false } = {}) {
+  const teamName = slot.team.teamFullName || slot.team.teamName || '';
+  const teamTag = slot.team.teamTag || '';
+  const teamLogo = slot.team.logo || '';
+  const fieldChanges = {};
+  let changed = false;
+  if (!keepSlot && existing.slot !== slot.slot) { existing.slot = slot.slot; changed = true; }
+  if (existing.teamName !== teamName) { existing.teamName = teamName; changed = true; fieldChanges.teamName = teamName; }
+  if (existing.teamTag !== teamTag) { existing.teamTag = teamTag; changed = true; fieldChanges.teamTag = teamTag; }
+  if (existing.teamLogo !== teamLogo) { existing.teamLogo = teamLogo; changed = true; fieldChanges.teamLogo = teamLogo; }
+  return { changed, fieldChanges };
+}
+
+// Save a reconciled MatchData and push it to the operator console, the
+// overlay rooms, and (once per round) the public revision.
+async function persistSyncedMatchData(io, matchData, changedTeams, mref, bumpedRounds, reason) {
+  matchData.markModified('teams');
+  await matchData.save();
+
+  // Push to the operator console (per-team, same event/shape every other
+  // MatchData mutation already uses) and to the public overlay's round
+  // room (via the existing manual-edit broadcast helper), so a team
+  // rename/logo swap shows up immediately instead of waiting on the
+  // console's next fetch or the overlay's poll fallback.
+  for (const { teamId, changes } of changedTeams) {
+    io.to(`user:${matchData.userId}`).emit('matchDataUpdated', {
+      matchDataId: matchData._id,
+      teamId,
+      changes,
+    });
+  }
+  emitOverallUpdateAsync(io, matchData.matchId, matchData.userId, matchData.toObject());
+
+  // Team identity/roster in this MatchData changed -> the public bulk
+  // payload for the whole round changed (overallData folds every match).
+  if (mref && mref.roundId && !bumpedRounds.has(String(mref.roundId))) {
+    bumpedRounds.add(String(mref.roundId));
+    bumpRound(io, {
+      tournamentId: mref.tournamentId,
+      roundId: mref.roundId,
+      matchId: matchData.matchId,
+      reason,
+      scope: 'round',
+    });
+  }
+}
+
+const teamIdsOfGroup = (g) => (g?.slots || [])
+  .filter(s => s.team)
+  .map(s => String(s.team._id || s.team));
+
 // Reconciles existing MatchData docs against a Group's current slots.
 // createMatchDataForMatchDoc only ever runs once, at match-creation time —
 // if a team is added to (or swapped into) a group slot afterwards, the
@@ -219,6 +350,12 @@ const createMatchDataForMatchDoc = async (matchOrId) => {
 // walks every such match and patches in what's missing, without touching
 // already-recorded live stats (placePoints, per-player fields) for teams
 // that are unchanged.
+//
+// Teams are matched by teamId. Slot numbers are only unique WITHIN a group —
+// round-robin rounds reuse the same slot numbers in every group and pair
+// groups per match (A vs B, A vs C…) — so a bare slot match used to treat
+// the OTHER group's team at that slot as a "swap" and overwrite it, dropping
+// teams from the match (and from overall standings).
 const syncMatchDataTeamsForGroup = async (groupId) => {
   try {
     const group = await Group.findById(groupId).populate({
@@ -227,23 +364,40 @@ const syncMatchDataTeamsForGroup = async (groupId) => {
     }).lean();
     if (!group) return;
 
-    const matches = await Match.find({ groups: group._id }).select('_id').lean();
+    // Each match's groups (team ids only) so a slot-swap is only ever
+    // resolved against a team that doesn't belong to another group.
+    const matches = await Match.find({ groups: group._id })
+      .select('_id tournamentId roundId groups')
+      .populate({ path: 'groups', select: 'slots.team' })
+      .lean();
     if (!matches.length) return;
+    const matchById = new Map(matches.map(m => [String(m._id), m]));
 
     const matchDatas = await MatchData.find({ matchId: { $in: matches.map(m => m._id) } });
 
     const io = getSocket();
-
-    // matchId -> { tournamentId, roundId } so a reconciled MatchData can bump
-    // its round's publicRev without a per-doc query. Bump once per round.
-    const matchById = new Map(
-      (await Match.find({ _id: { $in: matchDatas.map(md => md.matchId) } })
-        .select('tournamentId roundId').lean())
-        .map(m => [String(m._id), m]),
-    );
     const bumpedRounds = new Set();
+    const thisGroupTeamIds = new Set(teamIdsOfGroup(group));
 
     for (const matchData of matchDatas) {
+      const mref = matchById.get(String(matchData.matchId));
+
+      // Locked match: the group edit must not reach inside it (slots and
+      // team list stay as played/configured) — only names/logos refresh.
+      if (isMatchLocked(mref, matchData)) {
+        const locked = refreshLockedMatchMetadata(matchData, group.slots || []);
+        if (locked.changed) {
+          await persistSyncedMatchData(io, matchData, locked.changedTeams, mref, bumpedRounds, 'syncGroup');
+        }
+        continue;
+      }
+
+      const otherGroupTeamIds = new Set(
+        (mref?.groups || [])
+          .filter(g => g && String(g._id) !== String(group._id))
+          .flatMap(teamIdsOfGroup)
+      );
+
       let changed = false;
       // Per-team diffs collected as we go, so we can push exactly what
       // changed to live listeners after save instead of re-diffing.
@@ -252,93 +406,142 @@ const syncMatchDataTeamsForGroup = async (groupId) => {
       for (const slot of group.slots || []) {
         if (!slot.team) continue;
 
-        const existing = matchData.teams.find(
-          t => String(t.teamId) === String(slot.team._id) || t.slot === slot.slot
-        );
-
-        const freshPlayers = (slot.team.players || []).slice(0, 4)
-          .map(player => buildFreshPlayer(player, slot.slot, slot.team.teamFullName || ''));
-
-        if (!existing) {
-          // Brand new team in this slot — add it.
-          const teamName = slot.team.teamFullName || slot.team.teamName || '';
-          const teamTag = slot.team.teamTag || '';
-          const teamLogo = slot.team.logo || '';
-          matchData.teams.push({
-            slot: slot.slot,
-            teamId: slot.team._id,
-            teamLogo,
-            teamName,
-            teamTag,
-            players: freshPlayers,
-          });
-          changed = true;
-          changedTeams.push({ teamId: slot.team._id, changes: { teamName, teamTag, teamLogo, players: freshPlayers } });
-        } else if (String(existing.teamId) !== String(slot.team._id)) {
-          // Slot's team was swapped — replace identity/roster, drop stale stats.
-          const teamName = slot.team.teamFullName || slot.team.teamName || '';
-          const teamTag = slot.team.teamTag || '';
-          const teamLogo = slot.team.logo || '';
-          existing.teamId = slot.team._id;
-          existing.slot = slot.slot;
-          existing.teamLogo = teamLogo;
-          existing.teamName = teamName;
-          existing.teamTag = teamTag;
-          existing.players = freshPlayers;
-          changed = true;
-          changedTeams.push({ teamId: slot.team._id, changes: { teamName, teamTag, teamLogo, players: freshPlayers } });
-        } else {
-          // Same team — only refresh display metadata, never touch live stats/roster.
-          const teamName = slot.team.teamFullName || slot.team.teamName || '';
-          const teamTag = slot.team.teamTag || '';
-          const teamLogo = slot.team.logo || '';
-          const fieldChanges = {};
-          if (existing.slot !== slot.slot) { existing.slot = slot.slot; changed = true; }
-          if (existing.teamName !== teamName) { existing.teamName = teamName; changed = true; fieldChanges.teamName = teamName; }
-          if (existing.teamTag !== teamTag) { existing.teamTag = teamTag; changed = true; fieldChanges.teamTag = teamTag; }
-          if (existing.teamLogo !== teamLogo) { existing.teamLogo = teamLogo; changed = true; fieldChanges.teamLogo = teamLogo; }
+        const existing = matchData.teams.find(t => String(t.teamId) === String(slot.team._id));
+        if (existing) {
+          const { changed: metaChanged, fieldChanges } = refreshTeamMetadata(existing, slot);
+          if (metaChanged) changed = true;
           if (Object.keys(fieldChanges).length > 0) {
             changedTeams.push({ teamId: existing.teamId, changes: fieldChanges });
           }
+          continue;
         }
+
+        const fresh = buildSlotTeam(slot);
+        // A real in-group swap: the team at this slot is no longer in this
+        // group and isn't another group's team either.
+        const swapped = matchData.teams.find(t =>
+          t.slot === slot.slot &&
+          !thisGroupTeamIds.has(String(t.teamId)) &&
+          !otherGroupTeamIds.has(String(t.teamId))
+        );
+
+        if (swapped) {
+          // Slot's team was swapped — replace identity/roster, drop stale stats.
+          Object.assign(swapped, fresh, { placePoints: 0, rank: 0, placePointsLocked: false });
+        } else {
+          // Brand new team in this match — add it.
+          matchData.teams.push(fresh);
+        }
+        changed = true;
+        const { teamName, teamTag, teamLogo, players } = fresh;
+        changedTeams.push({ teamId: slot.team._id, changes: { teamName, teamTag, teamLogo, players } });
       }
 
       if (changed) {
-        matchData.markModified('teams');
-        await matchData.save();
-
-        // Push to the operator console (per-team, same event/shape every other
-        // MatchData mutation already uses) and to the public overlay's round
-        // room (via the existing manual-edit broadcast helper), so a team
-        // rename/logo swap shows up immediately instead of waiting on the
-        // console's next fetch or the overlay's poll fallback.
-        for (const { teamId, changes } of changedTeams) {
-          io.to(`user:${matchData.userId}`).emit('matchDataUpdated', {
-            matchDataId: matchData._id,
-            teamId,
-            changes,
-          });
-        }
-        emitOverallUpdateAsync(io, matchData.matchId, matchData.userId, matchData.toObject());
-
-        // Team identity/roster in this MatchData changed -> the public bulk
-        // payload for the whole round changed (overallData folds every match).
-        const mref = matchById.get(String(matchData.matchId));
-        if (mref && mref.roundId && !bumpedRounds.has(String(mref.roundId))) {
-          bumpedRounds.add(String(mref.roundId));
-          bumpRound(io, {
-            tournamentId: mref.tournamentId,
-            roundId: mref.roundId,
-            matchId: matchData.matchId,
-            reason: 'syncGroup',
-            scope: 'round',
-          });
-        }
+        await persistSyncedMatchData(io, matchData, changedTeams, mref, bumpedRounds, 'syncGroup');
       }
     }
   } catch (error) {
     console.error('Error syncing MatchData teams for group:', error);
   }
+};
+
+// Reconciles ONE match's MatchData against the teams of every group the
+// match currently has: adds any team (by teamId) that is missing and
+// refreshes display metadata of those present. Never removes a team and
+// never touches recorded stats. Used when a match's / round's groups change,
+// and as the repair for MatchData damaged by the old slot-based sync
+// (duplicate teamIds are collapsed, keeping the later — original — entry).
+// A locked match (see isMatchLocked) only gets name/logo refreshes unless
+// `force` is set — force is reserved for the explicit Resync Teams repair,
+// which still never moves an existing team's slot in a locked match.
+// Returns { added, deduped, locked } counts.
+const syncMatchDataTeamsForMatch = async (matchId, { reason = 'syncMatch', force = false } = {}) => {
+  const match = await Match.findById(matchId).populate({
+    path: 'groups',
+    populate: { path: 'slots.team', populate: { path: 'players' } },
+  }).lean();
+  if (!match) return { added: 0, deduped: 0 };
+
+  const matchData = await MatchData.findOne({ matchId: match._id });
+  if (!matchData) {
+    const created = await createMatchDataForMatchDoc(match._id);
+    return { added: created?.teams?.length || 0, deduped: 0 };
+  }
+
+  const locked = isMatchLocked(match, matchData);
+  const allSlots = (match.groups || []).flatMap(g => g?.slots || []);
+  if (locked && !force) {
+    const res = refreshLockedMatchMetadata(matchData, allSlots);
+    if (res.changed) {
+      await persistSyncedMatchData(getSocket(), matchData, res.changedTeams, match, new Set(), reason);
+    }
+    return { added: 0, deduped: 0, locked: true };
+  }
+
+  let changed = false;
+  const changedTeams = [];
+
+  // Collapse duplicate teamIds left behind by the old slot-based "swap".
+  // The EARLIER entry is the overwritten other-group team (roster reset,
+  // but its placePoints/rank are still that overwritten team's real
+  // placement); the LATER entry is the original with the real live stats.
+  // Keep the later one and remember what the dropped one held, by slot.
+  const lastIndexByTeam = new Map();
+  matchData.teams.forEach((t, i) => lastIndexByTeam.set(String(t.teamId), i));
+  const before = matchData.teams.length;
+  const droppedBySlot = new Map(); // slot -> { placePoints, rank }
+  const deduped = matchData.teams.filter((t, i) => {
+    if (lastIndexByTeam.get(String(t.teamId)) === i) return true;
+    if (!droppedBySlot.has(t.slot)) {
+      droppedBySlot.set(t.slot, { placePoints: Number(t.placePoints || 0), rank: Number(t.rank || 0) });
+    }
+    return false;
+  });
+  if (deduped.length !== before) {
+    console.warn(`[syncMatch] match=${match._id} removed ${before - deduped.length} duplicate team entr(y/ies)`);
+    matchData.teams = deduped;
+    changed = true;
+  }
+
+  const keepSlot = locked; // forced repair of a locked match never moves slots
+  let added = 0;
+  for (const group of match.groups || []) {
+    for (const slot of group?.slots || []) {
+      if (!slot.team) continue;
+      const existing = matchData.teams.find(t => String(t.teamId) === String(slot.team._id));
+      if (existing) {
+        const { changed: metaChanged, fieldChanges } = refreshTeamMetadata(existing, slot, { keepSlot });
+        if (metaChanged) changed = true;
+        if (Object.keys(fieldChanges).length > 0) {
+          changedTeams.push({ teamId: existing.teamId, changes: fieldChanges });
+        }
+        continue;
+      }
+      const fresh = buildSlotTeam(slot);
+      // A team re-added into the slot a dropped duplicate occupied gets that
+      // entry's placement back (it was this team's result before the old
+      // sync overwrote it). Kills were reset by that overwrite and are lost.
+      const recovered = droppedBySlot.get(fresh.slot);
+      if (recovered) {
+        fresh.placePoints = recovered.placePoints;
+        fresh.rank = recovered.rank;
+        droppedBySlot.delete(fresh.slot);
+      }
+      matchData.teams.push(fresh);
+      added++;
+      changed = true;
+      console.log(`[syncMatch] match=${match._id} re-added team ${fresh.teamName} (slot ${fresh.slot}, group ${group.groupName || group._id})${recovered ? ` with recovered placePoints=${recovered.placePoints}` : ''}`);
+      const { teamName, teamTag, teamLogo, players } = fresh;
+      changedTeams.push({ teamId: slot.team._id, changes: { teamName, teamTag, teamLogo, players } });
+    }
+  }
+
+  if (changed) {
+    matchData.teams.sort((a, b) => a.slot - b.slot);
+    await persistSyncedMatchData(getSocket(), matchData, changedTeams, match, new Set(), reason);
+  }
+  return { added, deduped: before - deduped.length, locked };
 };
 
 // Get MatchData by matchId (user-scoped)
@@ -1071,6 +1274,10 @@ const getUnmatchedPlayersForMatch = async (req, res) => {
 module.exports = {
   createMatchDataForMatchDoc,
   syncMatchDataTeamsForGroup,
+  syncMatchDataTeamsForMatch,
+  isMatchLocked,
+  matchHasResults,
+  RESULTS_PROJECTION,
   getMatchDataByMatchId,
   updateTeamPoints,
   deleteMatchDataById,

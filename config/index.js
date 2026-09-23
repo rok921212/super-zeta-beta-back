@@ -25,7 +25,7 @@ const config = {
   NODE_ENV: envVars.NODE_ENV || 'production',
   
   // Security
-  ADMIN_CODE: envVars.ADMIN_CODE,
+  ADMIN_CODE: envVars.ADMIN_CODE || process.env.ADMIN_CODE,
   // SECURITY: no fallback. The embedded config/env.config.js does NOT carry a
   // JWT_SECRET, so `|| 'your-secret-key'` meant production tokens were signed
   // with a publicly-known string (every JWT forgeable). Take it from the
@@ -36,9 +36,12 @@ const config = {
   SESSION_SECRET: envVars.SESSION_SECRET || process.env.SESSION_SECRET, // legacy/unused (no express-session)
   
 // Database
-  MONGODB_URI: envVars.MONGODB_URI || 'mongodb+srv://DEMON:1RpRCPfA2TIjcXXL@cluster0.znuinux.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0',
-  UPSTASH_REDIS_REST_URL: envVars.UPSTASH_REDIS_REST_URL || 'https://striking-ocelot-154242.upstash.io',
-  UPSTASH_REDIS_REST_TOKEN: envVars.UPSTASH_REDIS_REST_TOKEN || 'gQAAAAAAAlqCAAIgcDEyYmZmNTdhMzBkODE0NmMzODYzYjZlOWU2MGM4NGVjYQ',
+  // SECURITY: no hardcoded fallbacks — these used to bake live Mongo/Upstash
+  // credentials directly into a tracked source file. Real environment (the
+  // embedded config if present, otherwise Render's dashboard vars) only.
+  MONGODB_URI: envVars.MONGODB_URI || process.env.MONGODB_URI,
+  UPSTASH_REDIS_REST_URL: envVars.UPSTASH_REDIS_REST_URL || process.env.UPSTASH_REDIS_REST_URL,
+  UPSTASH_REDIS_REST_TOKEN: envVars.UPSTASH_REDIS_REST_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN,
   
   // Logging
   LOG_LEVEL: envVars.LOG_LEVEL || 'info',

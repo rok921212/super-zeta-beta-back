@@ -25,6 +25,19 @@ const MatchModel = require('../../models/match.model');
 // ─── In-Memory Live Match Cache ───────────────────────────────────────────────
 const liveMatchCache = new Map();
 
+// Live (not yet SAVE-DATA-persisted) MatchData for a match, from any user's
+// cache entry (keys are `${userId}:${matchId}`), or null. Used by the
+// group-edit lock (isMatchLocked in matchData.controller.js): with
+// LIVE_AUTOSAVE off the DB copy stays at zero during a live match, so the
+// lock has to look here to know the match is being played.
+function getLiveMatchData(matchId) {
+  const suffix = `:${String(matchId)}`;
+  for (const [key, entry] of liveMatchCache) {
+    if (key.endsWith(suffix)) return entry;
+  }
+  return null;
+}
+
 // ─── Group (roster) Cache ─────────────────────────────────────────────────────
 // Group.find(...).populate('slots.team') was being re-run — populate
 // round trip and all — on every single live tick, per match, per user, even
@@ -728,6 +741,107 @@ function currentLiveSeq(cacheKey) {
   return liveSeqByUserMatch.get(cacheKey) || 0;
 }
 
+// ─── Full-snapshot channel (stale-elimination fix) ──────────────────────────
+// liveMatchUpdate is a field-level delta against ONE shared per-(user,match)
+// baseline that advances whether or not a given socket actually received the
+// frame (volatile emits, session recovery that never replays volatile
+// packets). A fully-dead team never changes again, so a lost "last player
+// died" delta was never re-sent — the overlay showed that team alive until
+// SAVE DATA bumped publicRev and a (Mongo) bulk refetch finally corrected it.
+//
+// `liveMatchSnapshot` is the self-healing counterpart: the FULL roster from
+// liveMatchCache, stamped with the current seq, always non-volatile. Clients
+// REPLACE (not merge) on it. Sent:
+//   - as a periodic keyframe (every LIVE_KEYFRAME_MS, alongside that tick's
+//     delta) so any divergence is bounded,
+//   - as joinRoundRoom hydration (when the joiner declared `snapshots: true`),
+//   - on demand via `requestLiveSnapshot` (client seq gap / stall watchdog).
+// A distinct event name (not liveMatchUpdate) lets the desktop relay cache
+// the latest one verbatim without decoding it.
+const LIVE_KEYFRAME_MS = Math.max(2000, Number(process.env.LIVE_KEYFRAME_MS) || 10000);
+const lastKeyframeAtByUserMatch = new Map();
+const SNAPSHOT_REQUEST_MIN_INTERVAL_MS = 1000;
+
+// A delta that carries any liveState/bHasDied change (knock, death, revive)
+// is sent non-volatile: these are exactly the one-shot transitions that are
+// never re-sent by a later delta.
+function deltaHasLifeStateChange(changedTeams) {
+  return changedTeams.some((t) =>
+    (t.players || []).some((p) => 'liveState' in p || 'bHasDied' in p)
+  );
+}
+
+function emitLiveSnapshot(io, target, memoryMatch, matchId, seq, positional) {
+  emitToRoomSplitByFormat(io, target, 'liveMatchSnapshot', {
+    protoMessageName: 'MatchDataPayload',
+    mapToProto: toProtoMatchDataPayload,
+    data: {
+      ...memoryMatch,
+      teams: positional ? memoryMatch.teams : stripPositionalFields(memoryMatch.teams),
+      matchId: String(matchId),
+      seq,
+    },
+    volatile: false,
+  });
+}
+
+// Full-roster catch-up send to ONE socket from liveMatchCache — shared by
+// joinRoundRoom (instant hydration, deduped per socket+match+tier via
+// hydratedMatches) and requestLiveSnapshot (force: the client detected a gap
+// or stall, so the dedupe must not apply). isSelected is unique per
+// (tournamentId, roundId) globally, so this needs no session/auth.
+//
+// `asSnapshot`: the client declared (joinRoundRoom `snapshots: true`) that it
+// understands `liveMatchSnapshot` (replace, not merge). Older overlay / relay
+// builds never send it and keep getting the full roster as a
+// `liveMatchUpdate`, which they merge — same bytes, same effect on a fresh
+// socket.
+async function hydrateRoundSocket(io, socket, tournamentId, roundId, { positional, force, asSnapshot }) {
+  try {
+    const selection = await MatchSelection.findOne({ tournamentId, roundId, isSelected: true })
+      .select('userId matchId')
+      .lean();
+    if (!selection) return;
+    const cacheKey = `${String(selection.userId)}:${String(selection.matchId)}`;
+    const memoryMatch = liveMatchCache.get(cacheKey);
+    if (!memoryMatch) return;
+
+    // A socket that already received a full snapshot for this match on this
+    // connection is still in the room and getting every tick — re-sending
+    // the whole roster just because it switched view (same tier) is pure
+    // waste. Keyed on the tier so core -> positional still re-hydrates.
+    // Cleared on a recovered session (see io.on('connection')), since
+    // recovery never replays the volatile deltas missed while down.
+    const hydrateKey = `${cacheKey}:${positional ? 'pos' : 'core'}`;
+    if (!(socket.data.hydratedMatches instanceof Set)) socket.data.hydratedMatches = new Set();
+    if (!force && socket.data.hydratedMatches.has(hydrateKey)) {
+      console.log(`[bw][room] socket ${socket.id} hydrate SKIPPED (already sent ${hydrateKey})`);
+      return;
+    }
+    socket.data.hydratedMatches.add(hydrateKey);
+
+    const seq = currentLiveSeq(cacheKey);
+    if (asSnapshot) {
+      emitLiveSnapshot(io, [socket.id], memoryMatch, selection.matchId, seq, positional);
+    } else {
+      emitToRoomSplitByFormat(io, [socket.id], 'liveMatchUpdate', {
+        protoMessageName: 'MatchDataPayload',
+        mapToProto: toProtoMatchDataPayload,
+        data: {
+          ...memoryMatch,
+          teams: positional ? memoryMatch.teams : stripPositionalFields(memoryMatch.teams),
+          matchId: String(selection.matchId),
+          seq,
+        },
+        volatile: false,
+      });
+    }
+    console.log(`[bw][room] socket ${socket.id} hydrated ${hydrateKey} seq=${seq} as=${asSnapshot ? 'snapshot' : 'update'}${force ? ' (requested)' : ''}`);
+  } catch (err) {
+    console.error(`[bw][room] hydration failed for ${socket.id}:`, err.message);
+  }
+}
+
 // ─── liveMatchCache idle eviction ────────────────────────────────────────────
 // liveMatchCache and the five last*ByUserMatch maps above were never pruned:
 // every (user, match) pair seen since the process booted stayed resident for
@@ -760,6 +874,7 @@ function evictLiveMatchKey(cacheKey) {
   delete lastOverallTeamsByUserMatch[cacheKey];
   delete lastDeadTeamIdsByUserMatch[cacheKey];
   liveSeqByUserMatch.delete(cacheKey);
+  lastKeyframeAtByUserMatch.delete(cacheKey);
 }
 
 // socket.id -> userId, so disconnect can clean up the right entries
@@ -816,6 +931,12 @@ function startLiveMatchUpdater() {
     if (socket.recovered && socket.data.wireFormat === 'protobuf') {
       setSocketWireFormat(socket.id, 'protobuf');
     }
+    // Recovery restores socket.data.hydratedMatches too, but NOT the volatile
+    // liveMatchUpdate deltas missed while disconnected — clear it so the
+    // client's post-reconnect joinRoundRoom re-hydrates with a full snapshot.
+    if (socket.recovered && socket.data.hydratedMatches instanceof Set) {
+      socket.data.hydratedMatches.clear();
+    }
 
     // DIAGNOSTIC (2026-08-23): fills the gap identified while chasing the
     // relay's ~2-4s connect/die flap — until now this app never logged
@@ -871,10 +992,12 @@ function startLiveMatchUpdater() {
       // on every reconnect of the storm was a top bandwidth item. msgpack,
       // non-volatile (a catch-up send must not be dropped under backpressure).
       //
-      // Skipped on a recovered session (connectionStateRecovery): the missed
-      // liveMatchUpdate deltas were already replayed, so a full re-send here
-      // would just be redundant bytes.
-      if (!socket.recovered) {
+      // NOT skipped on a recovered session: connectionStateRecovery only
+      // replays NON-volatile packets (socket.io-adapter stores a packet only
+      // when `notVolatile`), and every liveMatchUpdate delta on this room is
+      // volatile — so a recovered socket has silently lost every delta sent
+      // while it was down and needs this full baseline just as much.
+      {
         const uidStr = String(sessionUserId);
         const now = Date.now();
         for (const [cacheKey, fullMatch] of liveMatchCache) {
@@ -1261,7 +1384,7 @@ socket.on('relayPing', (cb) => {
     // joinBulkRoom/leaveBulkRoom from comsock.js). Scoped per round rather
     // than per match so a followSelected overlay keeps receiving whichever
     // match is currently selected, without needing to rejoin on a switch.
-    socket.on('joinRoundRoom', async ({ tournamentId, roundId, view, wireFormat, tiers } = {}) => {
+    socket.on('joinRoundRoom', async ({ tournamentId, roundId, view, wireFormat, tiers, snapshots } = {}) => {
       if (!tournamentId || !roundId) return;
 
       // Leave whatever round/tier this socket was previously scoped to
@@ -1370,63 +1493,27 @@ socket.on('relayPing', (cb) => {
       // documented above as the most expensive step in the tick path) on
       // every single join, which is out of scope for this fix.
       if (!joinMatchData && !joinMatchDataPositional) return;
-      try {
-        // isSelected is unique per (tournamentId, roundId) globally (see
-        // MatchSelection.controller.js's selectMatch, which unconditionally
-        // clears isSelected for every other selection in that round before
-        // setting the new one) — this needs no session/auth, so it also
-        // works for the fully anonymous public-overlay case this handler's
-        // own comment says it must support.
-        const selection = await MatchSelection.findOne({ tournamentId, roundId, isSelected: true })
-          .select('userId matchId')
-          .lean();
-        if (!selection) return;
-        const cacheKey = `${String(selection.userId)}:${String(selection.matchId)}`;
-        const memoryMatch = liveMatchCache.get(cacheKey);
-        if (!memoryMatch) return;
+      await hydrateRoundSocket(io, socket, tournamentId, roundId, {
+        positional: joinMatchDataPositional,
+        force: false,
+        asSnapshot: snapshots === true,
+      });
+    });
 
-        // A socket that already received a full snapshot for this match on
-        // this connection is still in the room and getting every delta tick —
-        // re-sending the whole ~18.8 KB snapshot just because it switched
-        // view (Dom -> LiveStats -> Alerts: same match, same matchData tier)
-        // is pure waste and was ~5 MB/session of churn on its own. Keyed on
-        // the tier so a core -> positional switch (needs the extra location
-        // fields) still re-hydrates. Restored by connectionStateRecovery
-        // along with the rest of socket.data, so a recovered session — which
-        // already had its missed deltas replayed — correctly skips too.
-        const hydrateKey = `${cacheKey}:${joinMatchDataPositional ? 'pos' : 'core'}`;
-        // instanceof check (not just falsy) so a future non-in-memory adapter
-        // that JSON-round-trips socket.data can't turn this into a plain {}.
-        if (!(socket.data.hydratedMatches instanceof Set)) socket.data.hydratedMatches = new Set();
-        if (socket.data.hydratedMatches.has(hydrateKey)) {
-          console.log(`[bw][room] socket ${socket.id} joinRoundRoom hydrate SKIPPED (already sent ${hydrateKey})`);
-          return;
-        }
-        socket.data.hydratedMatches.add(hydrateKey);
-
-        // volatile:false deliberately, unlike the regular tick path above
-        // — this is a one-shot catch-up send for a socket that has nothing
-        // yet, so it must not be silently dropped under backpressure the
-        // way a routine tick's delta safely can be.
-        const basePayload = { ...memoryMatch, matchId: String(selection.matchId), seq: currentLiveSeq(cacheKey) };
-        if (joinMatchDataPositional) {
-          emitToRoomSplitByFormat(io, [socket.id], 'liveMatchUpdate', {
-            protoMessageName: 'MatchDataPayload',
-            mapToProto: toProtoMatchDataPayload,
-            data: { ...basePayload, teams: memoryMatch.teams },
-            volatile: false,
-          });
-        } else {
-          emitToRoomSplitByFormat(io, [socket.id], 'liveMatchUpdate', {
-            protoMessageName: 'MatchDataPayload',
-            mapToProto: toProtoMatchDataPayload,
-            data: { ...basePayload, teams: stripPositionalFields(memoryMatch.teams) },
-            volatile: false,
-          });
-        }
-      } catch (err) {
-        console.error(`[bw][room] joinRoundRoom hydration failed for ${socket.id}:`, err.message);
-      }
+    // On-demand full snapshot (client seq gap / stall watchdog / relay local
+    // join). Bypasses the hydratedMatches dedupe — the caller is telling us
+    // its state is known-bad. Tier is taken from the room this socket is
+    // actually in, so it can't ask for more than it joined. Rate-limited per
+    // socket; a burst of gap detections collapses to one send.
+    socket.on('requestLiveSnapshot', async ({ tournamentId, roundId } = {}) => {
+      if (!tournamentId || !roundId) return;
+      const now = Date.now();
+      if (now - (socket.data.lastSnapshotRequestAt || 0) < SNAPSHOT_REQUEST_MIN_INTERVAL_MS) return;
+      socket.data.lastSnapshotRequestAt = now;
+      const positional = socket.rooms.has(`round:${tournamentId}:${roundId}:matchDataPositional`);
+      const core = socket.rooms.has(`round:${tournamentId}:${roundId}:matchData`);
+      if (!positional && !core) return;
+      await hydrateRoundSocket(io, socket, tournamentId, roundId, { positional, force: true, asSnapshot: true });
     });
 
     socket.on('leaveRoundRoom', ({ tournamentId, roundId } = {}) => {
@@ -2131,6 +2218,9 @@ socket.on('relayPing', (cb) => {
             // comparison. Logged loudly so a future divergence is visible.
             console.warn(`[bw][delta] ${cacheKey}: change gate fired but 0 teams differ — skipping ${matchDataRoom}/${matchDataPositionalRoom} emit this tick`);
           } else {
+            // A knock/death/revive is a one-shot transition no later delta
+            // repeats — never let backpressure drop it.
+            const deltaVolatile = !deltaHasLifeStateChange(changedTeams);
             // Only build + encode a tier's payload when that tier actually
             // has a subscriber — the stripPositionalFields transform + the
             // object spread used to run every tick even for an empty room.
@@ -2143,7 +2233,7 @@ socket.on('relayPing', (cb) => {
                 protoMessageName: 'MatchDataPayload',
                 mapToProto: toProtoMatchDataPayload,
                 data: { ...memoryMatch, teams: stripPositionalFields(changedTeams), matchId: String(selected.matchId), seq },
-                volatile: true,
+                volatile: deltaVolatile,
               });
             }
             if (positionalSize > 0) {
@@ -2155,8 +2245,23 @@ socket.on('relayPing', (cb) => {
                 protoMessageName: 'MatchDataPayload',
                 mapToProto: toProtoMatchDataPayload,
                 data: { ...memoryMatch, teams: changedTeams, matchId: String(selected.matchId), seq },
-                volatile: true,
+                volatile: deltaVolatile,
               });
+            }
+
+            // Keyframe: every LIVE_KEYFRAME_MS also push the FULL roster
+            // (non-volatile, same seq) so any overlay whose merged state has
+            // diverged — a dropped delta, a lost reconnect window — is
+            // corrected within one interval instead of waiting for SAVE DATA.
+            // Sent in addition to (not instead of) this tick's delta, so an
+            // old overlay build that doesn't know liveMatchSnapshot is
+            // unaffected.
+            const now = Date.now();
+            if ((matchDataSize > 0 || positionalSize > 0) &&
+                now - (lastKeyframeAtByUserMatch.get(cacheKey) || 0) >= LIVE_KEYFRAME_MS) {
+              lastKeyframeAtByUserMatch.set(cacheKey, now);
+              if (matchDataSize > 0) emitLiveSnapshot(io, matchDataRoom, memoryMatch, selected.matchId, seq, false);
+              if (positionalSize > 0) emitLiveSnapshot(io, matchDataPositionalRoom, memoryMatch, selected.matchId, seq, true);
             }
           }
 
@@ -2286,4 +2391,4 @@ socket.on('relayPing', (cb) => {
   setInterval(discoverAndStartPollingUsers, 60000);
 }
 
-module.exports = { startLiveMatchUpdater, getUnmatchedPlayers, markUserActiveForPolling, markUserInactiveForPolling, saveLiveMatchSnapshot };
+module.exports = { startLiveMatchUpdater, getUnmatchedPlayers, markUserActiveForPolling, markUserInactiveForPolling, saveLiveMatchSnapshot, getLiveMatchData };

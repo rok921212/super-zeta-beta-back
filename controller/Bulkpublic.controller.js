@@ -627,7 +627,7 @@ async function buildBulkPayload({ tournamentId, roundId, matchId, view = null, f
     enrichedMatches = roundMatches.map(m => {
       if (groups && m.groups && m.groups.length > 0) {
         m.groupName = groupMap.get(m.groups[0].toString()) || 'Unknown';
-        m.groupNames = m.groups.slice(0, 2).map(id => groupMap.get(id.toString()) || 'Unknown').filter(Boolean);
+        m.groupNames = m.groups.map(id => groupMap.get(id.toString()) || 'Unknown').filter(Boolean);
       } else if (groups) {
         m.groupName = 'Unknown';
         m.groupNames = [];

@@ -7,7 +7,13 @@ const User = require('../models/User.model.js');
 
 const mongoose = require('mongoose');
 
-const { createMatchDataForMatchDoc } = require('./matchData.controller.js');
+const {
+  createMatchDataForMatchDoc,
+  syncMatchDataTeamsForMatch,
+  isMatchLocked,
+  matchHasResults,
+  RESULTS_PROJECTION,
+} = require('./matchData.controller.js');
 const { getSocket } = require('../socket.js');
 const { notifyRoundStructureChanged } = require('../utils/roundStructure.js');
 const { saveLiveMatchSnapshot } = require('./Api_controllers/pubgApiMatchData.controller.js');
@@ -38,7 +44,13 @@ async function fetchMatchWithData(match) {
     path: 'groups',
     populate: { path: 'slots.team', model: 'Team' },
   });
-  return populatedMatch.toObject();
+  const obj = populatedMatch.toObject();
+  // autoLocked: the match has results, so group edits no longer reach it
+  // (see isMatchLocked). Lean projection — just enough to decide.
+  const md = await MatchData.findOne({ matchId: populatedMatch._id })
+    .select(RESULTS_PROJECTION).lean();
+  obj.autoLocked = isMatchLocked(populatedMatch, md);
+  return obj;
 }
 
 // ✅ Create match (user-based)
@@ -155,8 +167,27 @@ const updateMatch = async (req, res) => {
       delete req.body.time;
     }
 
+    // The dashboard sends `groupIds`, not the schema's `groups` — map it, or
+    // a match's group edit is silently dropped by Object.assign.
+    let groupsChanged = false;
+    if (Array.isArray(req.body.groupIds) && req.body.groupIds.length > 0) {
+      const prev = (match.groups || []).map(String).sort().join(',');
+      const next = req.body.groupIds.map(String).sort().join(',');
+      groupsChanged = prev !== next;
+      if (groupsChanged) {
+        const md = await MatchData.findOne({ matchId: match._id })
+          .select(RESULTS_PROJECTION).lean();
+        if (isMatchLocked(match, md)) {
+          return res.status(409).json({ error: 'Match is locked — it already has data, so its groups cannot change' });
+        }
+      }
+      match.groups = req.body.groupIds;
+    }
+    delete req.body.groupIds;
+
     Object.assign(match, req.body);
     const updatedMatch = await match.save();
+    if (groupsChanged) await syncMatchDataTeamsForMatch(updatedMatch._id, { reason: 'matchGroupsChanged' });
     const updatedMatchWithData = await fetchMatchWithData(updatedMatch);
 
     getSocket().to(`user:${req.session.userId}`).emit('matchUpdated', updatedMatchWithData);
@@ -189,6 +220,29 @@ const deleteMatch = async (req, res) => {
   }
 };
 
+// Repair: re-add any group team missing from each match's MatchData in a
+// round (and collapse duplicate teamIds), without changing any groups.
+const resyncRoundMatchTeams = async (req, res) => {
+  try {
+    const { tournamentId, roundId } = req.params;
+    const matches = await Match.find({ tournamentId, roundId, userId: req.session.userId })
+      .select('_id matchNo').lean();
+    if (!matches.length) return res.status(404).json({ error: 'No matches found for this round' });
+
+    const results = [];
+    for (const m of matches) {
+      // Explicit repair: runs on locked matches too (force), but never moves
+      // an existing team's slot there.
+      const r = await syncMatchDataTeamsForMatch(m._id, { reason: 'resyncTeams', force: true });
+      results.push({ matchId: m._id, matchNo: m.matchNo, ...r });
+    }
+    notifyRoundStructureChanged(tournamentId, roundId);
+    res.json({ message: 'Match teams resynced', results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
 // ✅ Update all matches in a round (user-based)
 const updateAllMatchesWithRoundGroups = async (req, res) => {
   try {
@@ -196,10 +250,24 @@ const updateAllMatchesWithRoundGroups = async (req, res) => {
     const round = await Round.findOne({ _id: roundId, createdBy: req.session.userId }).populate('groups');
     if (!round) return res.status(404).json({ message: 'Round not found or not yours' });
 
+    // Locked matches (manual lock or has results) keep their groups.
+    const roundMatches = await Match.find({ roundId: round._id, userId: req.session.userId })
+      .select('_id').lean();
+    const matchDatas = await MatchData.find({ matchId: { $in: roundMatches.map(m => m._id) } })
+      .select(RESULTS_PROJECTION).lean();
+    const mdByMatch = new Map(matchDatas.map(md => [String(md.matchId), md]));
+    const unlocked = roundMatches.filter(m => !isMatchLocked(m, mdByMatch.get(String(m._id))));
+    const skippedLocked = roundMatches.length - unlocked.length;
+
     const result = await Match.updateMany(
-      { roundId: round._id, userId: req.session.userId },
+      { _id: { $in: unlocked.map(m => m._id) } },
       { $set: { groups: round.groups.map(g => g._id) } }
     );
+
+    // Match.groups changed -> bring each match's MatchData teams in line.
+    for (const m of unlocked) {
+      await syncMatchDataTeamsForMatch(m._id, { reason: 'roundGroupsChanged' });
+    }
 
     getSocket().to(`user:${req.session.userId}`).emit('roundGroupsUpdated', {
       roundId: round._id,
@@ -210,6 +278,7 @@ const updateAllMatchesWithRoundGroups = async (req, res) => {
     res.status(200).json({
       message: 'All matches updated with round groups',
       modifiedCount: result.modifiedCount,
+      skippedLocked,
     });
   } catch (err) {
     res.status(500).json({ message: 'Error updating matches', error: err.message });
@@ -317,6 +386,7 @@ module.exports = {
   updateMatch,
   deleteMatch,
   updateAllMatchesWithRoundGroups,
+  resyncRoundMatchTeams,
   saveCurrentMatchData,
   getMatchUsage,
 };

@@ -235,6 +235,11 @@ app.use((req, res, next) => {
 
 
 // --- REGISTER ROUTES ---
+// Unauthenticated: lets a curl confirm which commit is actually live,
+// instead of inferring it from route behavior after the fact.
+app.get('/api/version', (req, res) => {
+  res.json({ commit: process.env.RENDER_GIT_COMMIT || 'unknown' });
+});
 app.use('/api/users', userRoutes);
 // Hidden admin panel. Additive surface — every route inside is behind
 // requireAdminPanel (panel cookie + existing Bearer JWT + User.isAdmin).
@@ -612,7 +617,7 @@ async function startServer() {
       process.exit(1);
     }
 
-    await mongoose.connect(config.MONGODB_URI || "mongodb+srv://DEMON:1RpRCPfA2TIjcXXL@cluster0.znuinux.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0", {
+    await mongoose.connect(config.MONGODB_URI, {
       serverSelectionTimeoutMS: 10000,
       connectTimeoutMS: 10000,
       socketTimeoutMS: 45000,
