@@ -16,6 +16,7 @@ const { VIEWS_NEEDING_OVERALL, VIEWS_NEEDING_MATCH_DATA, VIEWS_NEEDING_POSITIONA
 const { setSocketWireFormat, clearSocketWireFormat } = require('../../utils/socketFormatRegistry');
 const { emitToRoomSplitByFormat, roomSize, countNonRelaySockets } = require('../../utils/roomEmit');
 const { addWsFanout } = require('../../utils/bwCounters');
+const wsAccounting = require('../../utils/wsAccounting');
 const { toProtoMatchDataPayload, toProtoOverallDataPayload } = require('../../utils/protobufCodec');
 const { computeChangedTeams, TRACKED_FIELDS, stripPositionalFields } = require('../../utils/matchTeamDiff');
 const { getRoundStructureVersion } = require('../../utils/roundStructure');
@@ -760,6 +761,9 @@ function currentLiveSeq(cacheKey) {
 // the latest one verbatim without decoding it.
 const LIVE_KEYFRAME_MS = Math.max(2000, Number(process.env.LIVE_KEYFRAME_MS) || 10000);
 const lastKeyframeAtByUserMatch = new Map();
+// cacheKey -> sha1 of the last keyframe's teams, so an unchanged roster is
+// not re-broadcast every LIVE_KEYFRAME_MS.
+const lastKeyframeHashByUserMatch = new Map();
 const SNAPSHOT_REQUEST_MIN_INTERVAL_MS = 1000;
 
 // A delta that carries any liveState/bHasDied change (knock, death, revive)
@@ -875,6 +879,7 @@ function evictLiveMatchKey(cacheKey) {
   delete lastDeadTeamIdsByUserMatch[cacheKey];
   liveSeqByUserMatch.delete(cacheKey);
   lastKeyframeAtByUserMatch.delete(cacheKey);
+  lastKeyframeHashByUserMatch.delete(cacheKey);
 }
 
 // socket.id -> userId, so disconnect can clean up the right entries
@@ -920,6 +925,7 @@ function startLiveMatchUpdater() {
 
   // ── Receive live player data pushed from each user's local relay ───────────
   io.on('connection', (socket) => {
+    wsAccounting.track(socket);
     console.log(c('dim', `[socket] client connected: ${socket.id} transport=${socket.conn.transport.name}${socket.recovered ? ' (recovered)' : ''}`));
 
     // connectionStateRecovery (socket.js): on a resumed session, rooms and
@@ -965,8 +971,13 @@ function startLiveMatchUpdater() {
     // token handshake (the relay has no cookie to present; this does).
     // Deliberately does not set socket.data.userId — that stays reserved
     // for the relay's own registration/eviction logic.
+    //
+    // Overlay pages (client=overlay) also carry the stored JWT, but they only
+    // consume the public round: feed — joining user:<id> would hand every
+    // OBS source the dashboard delta stream plus a full hydration replay on
+    // each reconnect. Unlabelled (older) builds keep the old behaviour.
     const sessionUserId = socket.request.session?.userId;
-    if (sessionUserId) {
+    if (sessionUserId && socket.handshake.query?.client !== 'overlay') {
       socket.join(`user:${sessionUserId}`);
 
       // Bandwidth: this dashboard socket can declare msgpack support for the
@@ -1130,6 +1141,7 @@ function startLiveMatchUpdater() {
   }
 
   socket.data.userId = key;
+  wsAccounting.markKind(socket.id, 'fetcher');
   socketIdToUserId.set(socket.id, key);
   socket.join(`user:${key}`);
 
@@ -1480,6 +1492,7 @@ socket.on('relayPing', (cb) => {
       if (joinOverall) socket.join(overallRoom);
 
       console.log(`[bw][room] socket ${socket.id} joinRoundRoom view=${view ?? '(none)'} tiers=${explicitTiers ? [...explicitTiers].join('+') : '(none)'} wireFormat=${wireFormat ?? 'msgpack'} -> matchData=${joinMatchData} matchDataPositional=${joinMatchDataPositional} overall=${joinOverall}`);
+      wsAccounting.setView(socket.id, view ?? (explicitTiers ? [...explicitTiers].join('+') : null));
 
       // Instant hydration: without this, a socket that just joined gets
       // nothing until the NEXT live tick from the desktop relay — could be
@@ -2187,7 +2200,9 @@ socket.on('relayPing', (cb) => {
           // rather than queueing — always prefer the freshest data. The
           // dataHeartbeat feeds isPolling.tsx's "LIVE • data Xs ago" dot.
           if (userTargets.length > 0) {
-            io.to(userRoom).volatile.emit('dataHeartbeat', {
+            // userTargets, not userRoom: the fetcher relay sockets in
+            // user:<id> never listen for this.
+            io.to(userTargets).volatile.emit('dataHeartbeat', {
               tournamentId: String(selected.tournamentId),
               roundId: String(selected.roundId),
               matchId: String(selected.matchId),
@@ -2260,8 +2275,12 @@ socket.on('relayPing', (cb) => {
             if ((matchDataSize > 0 || positionalSize > 0) &&
                 now - (lastKeyframeAtByUserMatch.get(cacheKey) || 0) >= LIVE_KEYFRAME_MS) {
               lastKeyframeAtByUserMatch.set(cacheKey, now);
-              if (matchDataSize > 0) emitLiveSnapshot(io, matchDataRoom, memoryMatch, selected.matchId, seq, false);
-              if (positionalSize > 0) emitLiveSnapshot(io, matchDataPositionalRoom, memoryMatch, selected.matchId, seq, true);
+              const keyframeHash = crypto.createHash('sha1').update(JSON.stringify(memoryMatch.teams)).digest('base64');
+              if (lastKeyframeHashByUserMatch.get(cacheKey) !== keyframeHash) {
+                lastKeyframeHashByUserMatch.set(cacheKey, keyframeHash);
+                if (matchDataSize > 0) emitLiveSnapshot(io, matchDataRoom, memoryMatch, selected.matchId, seq, false);
+                if (positionalSize > 0) emitLiveSnapshot(io, matchDataPositionalRoom, memoryMatch, selected.matchId, seq, true);
+              }
             }
           }
 
