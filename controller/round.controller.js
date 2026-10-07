@@ -7,6 +7,7 @@ const Tournament = require('../models/tournament.model');
 const { invalidateScope } = require('../middleware/cache.js');
 const { getSocket } = require('../socket');
 const { notifyRoundStructureChanged } = require('../utils/roundStructure.js');
+const { followApiRound } = require('./overlaySync.controller.js');
 
 const ALLOWED_UPDATE_FIELDS = ['roundName', 'torLogo', 'day', 'groups', 'apiEnable', 'selectedMatch'];
 
@@ -87,6 +88,8 @@ const createRoundInTournament = async (req, res) => {
     invalidatePublicScope(tournamentId);
     getSocket().to(`user:${createdBy}`).emit('roundUpdated', { round: savedRound });
     notifyRoundStructureChanged(tournamentId, savedRound._id);
+    // Permanent overlay links go to the round the API is on.
+    if (savedRound.apiEnable) followApiRound(createdBy, String(tournamentId), String(savedRound._id));
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
@@ -205,6 +208,8 @@ const updateRound = async (req, res) => {
     invalidatePublicScope(tournamentId);
     getSocket().to(`user:${userId}`).emit('roundUpdated', { round: updatedRound });
     notifyRoundStructureChanged(tournamentId, updatedRound._id);
+    // Permanent overlay links go to the round the API was just switched on for.
+    if (!wasApiEnabled && updatedRound.apiEnable) followApiRound(userId, String(tournamentId), String(updatedRound._id));
   } catch (err) {
     await session.abortTransaction();
     session.endSession();

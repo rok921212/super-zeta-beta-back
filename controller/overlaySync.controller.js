@@ -22,6 +22,14 @@
 // (/public/live/<key>, /o/<publicId>?k=<key>) names no tournament or round at
 // all and asks GET /api/public/overlay-sync/key/<key> for the target, so it
 // never has to be re-pasted. With no target set such a link renders nothing.
+//
+// The API round wins: while the account has a round with apiEnable on (at
+// most one, see round.model.js), that round is the target. Switching the API
+// on for a round moves the target there at once (followApiRound, called from
+// round.controller.js), and a PUT naming another round is answered with the
+// API round instead. With no API round, the target is the round DisplayHud
+// picked. The match shown is the round's selected one: the links carry
+// followSelected=true.
 
 const mongoose = require('mongoose');
 const User = require('../models/User.model.js');
@@ -79,6 +87,26 @@ async function announce(userId, payload) {
   }
 }
 
+// The account's API-enabled round, if it has one.
+const apiRoundOf = (userId) => Round.findOne({ createdBy: userId, apiEnable: true }).select('_id tournamentId').lean();
+
+// A round's API was just switched on: if the account's permanent links are
+// on and show another round, move them to this one and tell every overlay.
+// Called after the response has gone out, so it never throws.
+async function followApiRound(userId, tournamentId, roundId) {
+  try {
+    const user = await User.findById(userId).select('overlaySync').lean();
+    const cur = user?.overlaySync;
+    if (!cur?.tournamentId || !cur?.roundId) return; // permanent links are off
+    if (String(cur.roundId) === String(roundId)) return;
+    const overlaySync = { tournamentId, roundId, scheduleMatches: [], stamp: Date.now() };
+    await User.updateOne({ _id: userId }, { $set: { overlaySync } });
+    await announce(userId, publicShape(overlaySync));
+  } catch (err) {
+    console.warn('[overlay-sync] follow API round failed:', err.message);
+  }
+}
+
 const getOverlaySync = async (req, res) => {
   try {
     const user = await User.findById(req.session.userId).select('overlaySync overlayKey').lean();
@@ -112,7 +140,12 @@ const setOverlaySync = async (req, res) => {
     }
 
     const key = await ensureOverlayKey(userId);
-    const overlaySync = { tournamentId, roundId, scheduleMatches, stamp: Date.now() };
+    // The API round wins over the round asked for; schedule picks belong to
+    // the round they were made in.
+    const apiRound = await apiRoundOf(userId);
+    const overlaySync = apiRound && String(apiRound._id) !== String(roundId)
+      ? { tournamentId: String(apiRound.tournamentId), roundId: String(apiRound._id), scheduleMatches: [], stamp: Date.now() }
+      : { tournamentId, roundId, scheduleMatches, stamp: Date.now() };
     await User.updateOne({ _id: userId }, { $set: { overlaySync } });
     const payload = publicShape(overlaySync);
     announce(userId, payload);
@@ -224,4 +257,4 @@ const sendOverlayPage = async (req, res) => {
   }
 };
 
-module.exports = { getOverlaySync, setOverlaySync, clearOverlaySync, sendOverlayPage, resolveOverlaySync, resolveOverlaySyncByKey };
+module.exports = { getOverlaySync, setOverlaySync, clearOverlaySync, sendOverlayPage, resolveOverlaySync, resolveOverlaySyncByKey, followApiRound };

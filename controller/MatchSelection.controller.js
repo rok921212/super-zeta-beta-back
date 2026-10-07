@@ -85,7 +85,10 @@ const selectMatch = async (req, res) => {
     console.log(`[socket] matchDeselected x${previousSelections.length} -> ${room}`);
     previousSelections.forEach(prevMatch => {
       io.to(room).emit('matchDeselected', {
-        matchId: prevMatch._id,
+        // The match's id, as in the single-deselect emit above (this used to
+        // send the selection document's id, which no listener could match).
+        matchId: prevMatch.matchId,
+        selectionId: prevMatch._id,
         tournamentId: prevMatch.tournamentId,
         roundId: prevMatch.roundId,
         userId: prevMatch.userId
