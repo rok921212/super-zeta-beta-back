@@ -29,6 +29,9 @@ router.get('/me', adminPanel.me);
 // Per-socket / per-event WebSocket egress since boot (utils/wsAccounting.js).
 router.get('/ws-bandwidth', (req, res) => res.json(require('../utils/wsAccounting').report()));
 
+// MongoDB storage used / left per cluster (services/dbStorage.js). ?fresh=1 skips the 60s memo.
+router.get('/storage', adminPanel.storage);
+
 // ── Cross-user overview (read-only) ────────────────────────────────────
 router.get('/overview', adminPanel.overview);                        // every user + totals + last login + active API round
 router.get('/users/:id/activity', adminPanel.userActivity);          // one user's tournament -> round -> match-count tree

@@ -22,6 +22,25 @@ const userSchema = new mongoose.Schema({
   // select: false keeps it out of normal find()/findById() results so it
   // never leaks through getAllUsers or any other user's response.
   relayToken: { type: String, unique: true, sparse: true, select: false },
+  // SYNC OVERLAY (controller/overlaySync.controller.js): while tournamentId +
+  // roundId are set, every public overlay link of this account renders THAT
+  // round instead of the one in its own URL. `stamp` (ms) outlives a stop, so
+  // an overlay can tell a newer "off" from an older "on". select: false keeps
+  // it out of ordinary user reads.
+  overlaySync: {
+    type: new mongoose.Schema({
+      tournamentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tournament', default: null },
+      roundId: { type: mongoose.Schema.Types.ObjectId, ref: 'Round', default: null },
+      scheduleMatches: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Match' }],
+      stamp: { type: Number, default: 0 },
+    }, { _id: false }),
+    select: false,
+  },
+  // Permanent overlay links: the public id in /public/live/<overlayKey> and
+  // /o/<publicId>?k=<overlayKey>. Those links name no tournament or round and
+  // render whatever `overlaySync` points at. Created the first time permanent
+  // links are switched on and never changed, so the links in OBS stay valid.
+  overlayKey: { type: String, unique: true, sparse: true, select: false },
 }, { timestamps: true });
 
 // Hash password before saving.

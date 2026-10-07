@@ -11,6 +11,7 @@ const User = require('../models/User.model.js');
 const Tournament = require('../models/tournament.model');
 const Round = require('../models/round.model');
 const Match = require('../models/match.model');
+const { getStorageReport } = require('../services/dbStorage');
 
 // ── helpers ──────────────────────────────────────────────────────────────
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -327,8 +328,20 @@ const userActivity = async (req, res) => {
   }
 };
 
+// ── MONGODB STORAGE ───────────────────────────────────────────────────
+// GET /api/admin-panel/storage[?fresh=1]
+// Used / left per cluster — see services/dbStorage.js for how it is counted.
+const storage = async (req, res) => {
+  try {
+    return res.json(await getStorageReport({ fresh: req.query.fresh === '1' }));
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+};
+
 module.exports = {
   me,
+  storage,
   createUser,
   setUserAccess,
   guardSelfDemote,

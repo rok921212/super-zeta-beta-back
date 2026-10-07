@@ -40,6 +40,15 @@ const config = {
   // credentials directly into a tracked source file. Real environment (the
   // embedded config if present, otherwise Render's dashboard vars) only.
   MONGODB_URI: envVars.MONGODB_URI || process.env.MONGODB_URI,
+  // Designer overlays (layouts, revisions, custom themes) live on their OWN
+  // cluster. Optional: unset -> they share the main connection (with a warning).
+  OVERLAY_MONGODB_URI: envVars.OVERLAY_MONGODB_URI || process.env.OVERLAY_MONGODB_URI || '',
+  OVERLAY_MONGODB_DB: envVars.OVERLAY_MONGODB_DB || process.env.OVERLAY_MONGODB_DB || 'scoresync_overlays',
+  // Storage cap per cluster, in MB, for the admin panel's "storage left"
+  // figure. Atlas does not report the quota through the driver on shared
+  // tiers, so it is stated here. Default = Atlas Free (M0) = 512 MB.
+  MONGODB_QUOTA_MB: Number(envVars.MONGODB_QUOTA_MB || process.env.MONGODB_QUOTA_MB) || 512,
+  OVERLAY_MONGODB_QUOTA_MB: Number(envVars.OVERLAY_MONGODB_QUOTA_MB || process.env.OVERLAY_MONGODB_QUOTA_MB) || 512,
   UPSTASH_REDIS_REST_URL: envVars.UPSTASH_REDIS_REST_URL || process.env.UPSTASH_REDIS_REST_URL,
   UPSTASH_REDIS_REST_TOKEN: envVars.UPSTASH_REDIS_REST_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN,
   

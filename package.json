@@ -5,12 +5,13 @@
   "main": "index.js",
   "bin": "./index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test \"test/**/*.test.cjs\"",
     "dev": "nodemon index.js",
     "start": "node index.js",
     "build": "node build.js",
     "package": "pkg . --out-path build --targets node18-win-x64",
-    "proto:gen": "pbjs -t static-module -w commonjs -o proto/overlay.pb.js proto/overlay.proto && pbts -o proto/overlay.pb.d.ts proto/overlay.pb.js"
+    "proto:gen": "pbjs -t static-module -w commonjs -o proto/overlay.pb.js proto/overlay.proto && pbts -o proto/overlay.pb.d.ts proto/overlay.pb.js",
+    "schema:check": "node ../../front/scripts/sync-layout-schema.mjs --check"
   },
   "keywords": [],
   "author": "",

@@ -27,10 +27,19 @@ const matchRoutes = require('./route/match.route.js');
 const matchDataRoutes = require('./route/matchData.route.js');
 const matchSelectionRoutes = require('./route/matchSelection.route.js');
 const overallRoutes = require('./route/overall.route.js');
+const overlaySyncRoutes = require('./route/overlaySync.route.js');
 
 const userRoutes = require('./route/User.route.js');
 const bulkRoutes = require('./route/Bulkpublic.route.js');
 const adminPanelRoutes = require('./route/adminPanel.route.js');
+const { createOverlayLayoutRouters } = require('./route/overlayLayout.route.js');
+const { createMongoStore } = require('./services/overlayLayoutStore.js');
+const { createCustomThemeRouter } = require('./route/customTheme.route.js');
+const { createMongoThemeStore } = require('./services/customThemeStore.js');
+const { createOverlayFontRouter } = require('./route/overlayFont.route.js');
+const { createMongoFontStore } = require('./services/overlayFontStore.js');
+const { withLayoutCache, withThemeCache, withFontCache, designerCacheStats } = require('./services/designerCache.js');
+const { getOverlayConnection, connectOverlayDb, overlayDbState } = require('./db/overlayConnection.js');
 
 const { cacheMiddleware } = require('./middleware/cache.js');
 
@@ -143,7 +152,10 @@ app.use(cors({
     "Origin",
     "Cache-Control",
     "Pragma",
-    "Expires"
+    "Expires",
+    // gzipped Designer saves (body-parser inflates them)
+    "Content-Encoding",
+    "If-None-Match"
   ],
   exposedHeaders: ["Authorization"],
   maxAge: 600 // Cache preflight requests for 10 minutes
@@ -155,7 +167,7 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
     res.header('Access-Control-Allow-Credentials', 'true');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, Pragma, Expires');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Cache-Control, Pragma, Expires, Content-Encoding, If-None-Match');
     res.header('Access-Control-Max-Age', '600');
     res.sendStatus(200);
     return;
@@ -255,6 +267,27 @@ app.use('/api', matchDataRoutes);
 app.use('/api/matchSelection', matchSelectionRoutes);
 app.use('/api', overallRoutes);
 app.use('/api/public', bulkRoutes);
+// SYNC OVERLAY: operator set/clear + the public resolve the overlay pages call.
+app.use('/api/overlay-sync', overlaySyncRoutes.router);
+app.use('/api/public', overlaySyncRoutes.publicRouter);
+// Designer layouts (ScoreSync Graphics Engine). The public render route is
+// deliberately NOT under /api/public, so overlays fetch it straight from the
+// cloud instead of through the local relay's public-feed cache.
+{
+  // Overlays use their own cluster (OVERLAY_MONGODB_URI) — see db/overlayConnection.js.
+  // Each store is wrapped in the Designer cache (services/designerCache.js): Redis for the
+  // small shared lists / lookups, process memory for immutable revisions and font files.
+  const layoutStore = withLayoutCache(createMongoStore({ connection: getOverlayConnection() }));
+  const themeStore = withThemeCache(createMongoThemeStore({ connection: getOverlayConnection() }));
+  const fontStore = withFontCache(createMongoFontStore({ connection: getOverlayConnection() }));
+  const overlayLayoutRouters = createOverlayLayoutRouters({ store: layoutStore, themeStore, fontStore });
+  app.use('/api/overlay-layouts', overlayLayoutRouters.layouts);
+  app.use('/api/overlay-render', overlayLayoutRouters.render);
+  // Uploaded .woff2 fonts for the Designer (per-account library; the file route is public).
+  app.use('/api/overlay-fonts', createOverlayFontRouter({ fontStore }));
+  // Custom themes (Theme9, Theme10, …) = groups of published layouts, one per overlay view.
+  app.use('/api/custom-themes', createCustomThemeRouter({ themeStore, layoutStore, fontStore }));
+}
 
 // --- PUBLIC ROUTES (No Authentication Required) ---
 const Tournament = require('./models/tournament.model');
@@ -593,6 +626,8 @@ app.get('/api/health', (req, res) => {
     version: '1.0.0', 
     status: 'ok',
     dbConnected: mongoose.connection.readyState === 1,
+    overlayDb: overlayDbState(),
+    designerCache: designerCacheStats,
     redisConnected: false // Add redis check if needed
   });
 });
@@ -626,6 +661,10 @@ async function startServer() {
     });
 
     console.log("✅ MongoDB connected");
+
+    // Designer overlays' dedicated cluster. Never fatal: the rest of the app
+    // must keep running even if the overlay cluster is unreachable.
+    await connectOverlayDb();
 
     server = http.createServer(app);
     io = initializeSocket(server);
