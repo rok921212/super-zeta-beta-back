@@ -38,7 +38,11 @@ const { createCustomThemeRouter } = require('./route/customTheme.route.js');
 const { createMongoThemeStore } = require('./services/customThemeStore.js');
 const { createOverlayFontRouter } = require('./route/overlayFont.route.js');
 const { createMongoFontStore } = require('./services/overlayFontStore.js');
-const { withLayoutCache, withThemeCache, withFontCache, designerCacheStats } = require('./services/designerCache.js');
+const { withLayoutCache, withThemeCache, withFontCache, withAssetCache, withCategoryCache, designerCacheStats } = require('./services/designerCache.js');
+const { createOverlayAssetRouter } = require('./route/overlayAsset.route.js');
+const { createMongoAssetStore } = require('./services/overlayAssetStore.js');
+const { createOverlayCategoryRouter } = require('./route/overlayCategory.route.js');
+const { createMongoCategoryStore } = require('./services/overlayCategoryStore.js');
 const { getOverlayConnection, connectOverlayDb, overlayDbState } = require('./db/overlayConnection.js');
 
 const { cacheMiddleware } = require('./middleware/cache.js');
@@ -59,6 +63,7 @@ app.set('trust proxy', 1);
 // res.locals.__bwWire for the [bw][http] line below, and summed into
 // utils/bwCounters for the periodic [bw][rollup].
 const { addHttpWire } = require('./utils/bwCounters');
+const bwByUser = require('./utils/bwByUser');
 app.use((req, res, next) => {
   let wire = 0;
   const measure = (chunk, enc) => {
@@ -74,6 +79,7 @@ app.use((req, res, next) => {
     measure(chunk, enc);
     res.locals.__bwWire = wire;
     addHttpWire(wire);
+    bwByUser.addHttp(req, wire);
     return origEnd(chunk, enc, cb);
   };
   next();
@@ -280,13 +286,22 @@ app.use('/api/public', overlaySyncRoutes.publicRouter);
   const layoutStore = withLayoutCache(createMongoStore({ connection: getOverlayConnection() }));
   const themeStore = withThemeCache(createMongoThemeStore({ connection: getOverlayConnection() }));
   const fontStore = withFontCache(createMongoFontStore({ connection: getOverlayConnection() }));
-  const overlayLayoutRouters = createOverlayLayoutRouters({ store: layoutStore, themeStore, fontStore });
+  // Uploaded images + the account's own design categories: two NEW collections. They exist on
+  // the overlay cluster only. Without OVERLAY_MONGODB_URI these routes answer 503 instead of
+  // creating a collection on the main cluster (which is at its collection cap).
+  // The stores are not even built then: registering a model is enough for mongoose to create its collection.
+  const overlayDedicated = overlayDbState().dedicated;
+  const assetStore = overlayDedicated ? withAssetCache(createMongoAssetStore({ connection: getOverlayConnection() })) : null;
+  const categoryStore = overlayDedicated ? withCategoryCache(createMongoCategoryStore({ connection: getOverlayConnection() })) : null;
+  const overlayLayoutRouters = createOverlayLayoutRouters({ store: layoutStore, themeStore, fontStore, assetStore, categoryStore });
+  app.use('/api/overlay-assets', createOverlayAssetRouter({ assetStore, layoutStore, available: () => overlayDedicated }));
+  app.use('/api/overlay-categories', createOverlayCategoryRouter({ categoryStore, layoutStore, available: () => overlayDedicated }));
   app.use('/api/overlay-layouts', overlayLayoutRouters.layouts);
   app.use('/api/overlay-render', overlayLayoutRouters.render);
   // Uploaded .woff2 fonts for the Designer (per-account library; the file route is public).
   app.use('/api/overlay-fonts', createOverlayFontRouter({ fontStore }));
   // Custom themes (Theme9, Theme10, …) = groups of published layouts, one per overlay view.
-  app.use('/api/custom-themes', createCustomThemeRouter({ themeStore, layoutStore, fontStore }));
+  app.use('/api/custom-themes', createCustomThemeRouter({ themeStore, layoutStore, fontStore, assetStore }));
 }
 
 // --- PUBLIC ROUTES (No Authentication Required) ---

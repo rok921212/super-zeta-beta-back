@@ -44,6 +44,13 @@ function toSummary(l) {
     productionLocked: !!l.productionLocked,
     defaults: l.defaults || { tournamentId: null, roundId: null, matchMode: 'selectedMatch' },
     assetBase: l.assetBase || '',
+    description: l.description || '',
+    categoryId: l.categoryId || null,
+    tags: Array.isArray(l.tags) ? l.tags : [],
+    archivedAt: l.archivedAt || null,
+    isTemplate: !!l.isTemplate,
+    // Canvas size as of the last save (null on a design saved before this field existed).
+    stage: l.stage && l.stage.width && l.stage.height ? { width: l.stage.width, height: l.stage.height } : null,
     createdAt: l.createdAt,
     updatedAt: l.updatedAt,
   };
@@ -55,7 +62,58 @@ const SAVE_CAPABILITIES = ['gzip-save', 'summary-save'];
 const toFull = (l) => ({ ...toSummary(l), draft: l.draft, capabilities: SAVE_CAPABILITIES });
 
 /** Changes whenever anything a GET of the layout returns changes. */
-const layoutEtag = (l) => `"${String(l._id)}-${l.draftRev}-${l.publishedRev}-${l.productionLocked ? 1 : 0}"`;
+const layoutEtag = (l) => `"${String(l._id)}-${l.draftRev}-${l.publishedRev}-${l.productionLocked ? 1 : 0}-${new Date(l.updatedAt || 0).getTime()}"`;
+
+/** Record fields that are derived from a validated draft and stored beside it. */
+const draftFields = (doc) => ({
+  stage: { width: doc.stage.width, height: doc.stage.height },
+  assetIds: schema.extractAssetIds(doc),
+});
+
+const BUILTIN_CATEGORY_IDS = schema.DESIGN_CATEGORIES.map((c) => c.id);
+const TAG_RE = /^[^\u0000-\u001f<>,]{1,30}$/;
+
+/**
+ * Validate a library-metadata patch (PATCH /:id/meta). Returns { set } or { errors }.
+ * `ownsCategory(id)` answers whether a non-built-in category id is the caller's.
+ */
+async function checkLibraryMeta(body, ownsCategory) {
+  const set = {};
+  const errors = [];
+  if (body.name !== undefined) {
+    if (typeof body.name !== 'string' || !body.name.trim() || body.name.length > 120) errors.push({ path: 'name', message: 'name must be 1-120 characters' });
+    else set.name = body.name.trim();
+  }
+  if (body.description !== undefined) {
+    if (typeof body.description !== 'string' || body.description.length > 500) errors.push({ path: 'description', message: 'description must be at most 500 characters' });
+    else set.description = body.description.trim();
+  }
+  if (body.categoryId !== undefined) {
+    const c = body.categoryId;
+    if (c === null || c === '') set.categoryId = null;
+    else if (typeof c === 'string' && BUILTIN_CATEGORY_IDS.includes(c)) set.categoryId = c;
+    else if (typeof c === 'string' && OBJECT_ID_RE.test(c) && await ownsCategory(c)) set.categoryId = c;
+    else errors.push({ path: 'categoryId', message: 'unknown category' });
+  }
+  if (body.tags !== undefined) {
+    if (!Array.isArray(body.tags) || body.tags.length > 12 || !body.tags.every((t) => typeof t === 'string' && TAG_RE.test(t.trim()))) {
+      errors.push({ path: 'tags', message: 'tags must be up to 12 short labels (max 30 characters, no commas)' });
+    } else {
+      const seen = new Set();
+      set.tags = body.tags.map((t) => t.trim().replace(/\s+/g, ' ')).filter((t) => { const k = t.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
+    }
+  }
+  if (body.archived !== undefined) {
+    if (typeof body.archived !== 'boolean') errors.push({ path: 'archived', message: 'archived must be true or false' });
+    else set.archivedAt = body.archived ? new Date() : null;
+  }
+  if (body.isTemplate !== undefined) {
+    if (typeof body.isTemplate !== 'boolean') errors.push({ path: 'isTemplate', message: 'isTemplate must be true or false' });
+    else set.isTemplate = body.isTemplate;
+  }
+  if (!errors.length && !Object.keys(set).length) errors.push({ path: '', message: 'nothing to change' });
+  return errors.length ? { errors } : { set };
+}
 
 /**
  * Atlas shared tiers cap a cluster at 500 collections; the first insert into a
@@ -140,6 +198,8 @@ async function publishLayout(store, fontStore, layout, userId, doc) {
       document: doc,
       publishedBy: userId,
       fonts,
+      // While this revision exists, the images it uses cannot be deleted.
+      assets: schema.extractAssetIds(doc),
     });
   } catch (err) {
     if (err && err.code === 11000) return { conflict: true, rev: nextRev };
@@ -150,7 +210,7 @@ async function publishLayout(store, fontStore, layout, userId, doc) {
   return { layout: updated, rev: nextRev };
 }
 
-function createOverlayLayoutController(store, { themeStore = null, fontStore = null } = {}) {
+function createOverlayLayoutController(store, { themeStore = null, fontStore = null, assetStore = null, categoryStore = null } = {}) {
   const userOf = (req) => String(req.session.userId);
 
   // 404 for a malformed id too — never a CastError 500.
@@ -207,6 +267,7 @@ function createOverlayLayoutController(store, { themeStore = null, fontStore = n
         ownerId: userOf(req),
         schemaVersion: schema.SCHEMA_VERSION,
         draft: draft.doc,
+        ...draftFields(draft.doc),
         ...meta.set,
       });
       log('created', { layoutId: String(layout._id), userId: userOf(req) });
@@ -253,6 +314,7 @@ function createOverlayLayoutController(store, { themeStore = null, fontStore = n
         if (draft.errors) return res.status(400).json({ message: 'Invalid layout', errors: draft.errors });
         set.draft = draft.doc;
         set.schemaVersion = schema.SCHEMA_VERSION;
+        Object.assign(set, draftFields(draft.doc));
       }
       const updated = await store.updateDraft(req.params.id, userOf(req), body.expectedRev, set);
       if (!updated) return explainMiss(res, req.params.id, userOf(req));
@@ -284,6 +346,19 @@ function createOverlayLayoutController(store, { themeStore = null, fontStore = n
       }
       const draft = checkDraft(layout.draft);
       if (draft.errors) return res.status(400).json({ message: 'Draft is not publishable', errors: draft.errors });
+      // Every uploaded image the draft uses must still be in the owner's library:
+      // a published overlay must never point at a picture that is not there.
+      if (assetStore) {
+        const used = schema.extractAssetIds(draft.doc);
+        const owned = new Set(used.length ? await assetStore.ownedIds(userId, used) : []);
+        const missing = used.filter((a) => !owned.has(a));
+        if (missing.length) {
+          return res.status(400).json({
+            message: 'Draft is not publishable',
+            errors: missing.map((a) => ({ path: `asset:${a}`, message: 'this image is no longer in your library - replace or remove it' })),
+          });
+        }
+      }
 
       const out = await publishLayout(store, fontStore, layout, userId, draft.doc);
       if (out.conflict) return res.status(409).json({ message: 'Another publish of this layout just happened', publishedRev: out.rev });
@@ -312,7 +387,7 @@ function createOverlayLayoutController(store, { themeStore = null, fontStore = n
       if (!revision) return res.status(404).json({ message: 'Revision not found' });
       const draft = checkDraft(revision.document);
       if (draft.errors) return res.status(400).json({ message: 'Revision is not valid under the current schema', errors: draft.errors });
-      const updated = await store.updateDraft(req.params.id, userOf(req), body.expectedRev, { draft: draft.doc });
+      const updated = await store.updateDraft(req.params.id, userOf(req), body.expectedRev, { draft: draft.doc, ...draftFields(draft.doc) });
       if (!updated) return explainMiss(res, req.params.id, userOf(req));
       log('restored', { layoutId: req.params.id, userId: userOf(req), rev });
       res.json(toFull(updated));
@@ -329,10 +404,31 @@ function createOverlayLayoutController(store, { themeStore = null, fontStore = n
         schemaVersion: schema.SCHEMA_VERSION,
         name: `${layout.name} (copy)`.slice(0, 120),
         draft: draft.doc,
+        ...draftFields(draft.doc),
         defaults: layout.defaults,
         assetBase: layout.assetBase || '',
+        // A copy stays where the original is filed; it is never born archived or as a template.
+        description: layout.description || '',
+        categoryId: layout.categoryId || null,
+        tags: Array.isArray(layout.tags) ? layout.tags : [],
       });
       res.status(201).json(toFull(copy));
+    }),
+
+    /**
+     * PATCH /:id/meta: library metadata (name, description, category, tags,
+     * archive, template flag). Not part of the document: the draft revision
+     * does not move, and it works on a production-locked design too (filing a
+     * design away is not an edit of what is on air).
+     */
+    patchMeta: wrap(async (req, res) => {
+      if (!idOk(req, res)) return;
+      const userId = userOf(req);
+      const meta = await checkLibraryMeta(req.body || {}, async (cid) => !!(categoryStore && await categoryStore.get(cid, userId)));
+      if (meta.errors) return res.status(400).json({ message: 'Invalid design details', errors: meta.errors });
+      const updated = await store.setFields(req.params.id, userId, meta.set);
+      if (!updated) return res.status(404).json({ message: 'Layout not found' });
+      res.json(toSummary(updated));
     }),
 
     setLock: (locked) => wrap(async (req, res) => {
@@ -377,4 +473,4 @@ function createOverlayLayoutController(store, { themeStore = null, fontStore = n
   };
 }
 
-module.exports = { createOverlayLayoutController, newPublicId, checkDraft, createLayoutWithUniquePublicId, publishLayout, isCollectionLimitError };
+module.exports = { createOverlayLayoutController, draftFields, checkLibraryMeta, newPublicId, checkDraft, createLayoutWithUniquePublicId, publishLayout, isCollectionLimitError };

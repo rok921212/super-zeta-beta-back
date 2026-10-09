@@ -1,5 +1,6 @@
 const { Redis } = require('@upstash/redis');
 const { encodeMsgpack } = require('../utils/msgpackCodec');
+const bwByUser = require('../utils/bwByUser');
 
 let getCache, setCache, deleteCache, invalidateScope, invalidateKeysByPrefix, cacheMiddleware, msgpackCacheMiddleware, invalidateCacheMiddleware;
 
@@ -95,6 +96,9 @@ getCache = async (key) => {
 };
 
 setCache = async (key, value, ttlSeconds = 300, scope = 'anon') => {
+  // The value goes to Upstash as an uncompressed JSON body over HTTPS — egress
+  // that no [bw] line counts.
+  try { bwByUser.addCacheWrite(scope, Buffer.byteLength(JSON.stringify(value))); } catch { /* unserialisable */ }
   try {
     // Bandwidth: one pipelined REST round-trip instead of three separate
     // Upstash HTTPS requests (SET + SADD + EXPIRE). Every cache MISS on a

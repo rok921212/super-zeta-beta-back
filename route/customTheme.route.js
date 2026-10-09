@@ -8,9 +8,9 @@ const { MAX_PACK_BYTES } = require('../services/themePack.js');
  * Custom themes (Theme9+) -> /api/custom-themes (owner-scoped, JWT required).
  * `themeStore` / `layoutStore` / `fontStore` / `auth` are injectable for tests.
  */
-function createCustomThemeRouter({ themeStore, layoutStore, fontStore = null, auth = requireAuth }) {
+function createCustomThemeRouter({ themeStore, layoutStore, fontStore = null, assetStore = null, auth = requireAuth }) {
   const c = createCustomThemeController({ themeStore, layoutStore });
-  const packs = createThemePackController({ layoutStore, themeStore, fontStore });
+  const packs = createThemePackController({ layoutStore, themeStore, fontStore, assetStore });
   const router = express.Router();
   router.use(auth);
   router.get('/', c.list);

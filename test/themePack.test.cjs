@@ -222,7 +222,7 @@ test('a bad file is a 400 and writes nothing', async () => {
   }
   assert.equal((await importFile(EVE, good, '', 'text/plain')).status, 400, 'wrong content type');
   assert.equal((await importFile(EVE, good, `?name=${'x'.repeat(61)}`)).status, 400, 'name too long');
-  assert.equal((await importFile(EVE, Buffer.alloc(13 * 1024 * 1024, 1))).status, 413, 'over the upload limit');
+  assert.equal((await importFile(EVE, Buffer.alloc(require('../services/themePack.js').MAX_PACK_BYTES + 1024 * 1024, 1))).status, 413, 'over the upload limit');
   assert.deepEqual(await layoutsOf(EVE), []);
   assert.deepEqual(await themesOf(EVE), []);
 
@@ -254,7 +254,7 @@ test('pack helpers: used families, file names, zip-bomb guard', () => {
   assert.deepEqual([...families].sort(), ['big head', 'clan display', 'inter', 'sans-serif']);
   assert.equal(packFileName('Finals: pack / 2026!'), 'Finals-pack-2026.sstheme');
   assert.equal(packFileName('////'), 'theme.sstheme');
-  const bomb = Buffer.concat([Buffer.from('SSTH'), Buffer.from([1]), zlib.gzipSync(Buffer.alloc(41 * 1024 * 1024, 0x20))]);
+  const bomb = Buffer.concat([Buffer.from('SSTH'), Buffer.from([1]), zlib.gzipSync(Buffer.alloc(require('../services/themePack.js').MAX_INFLATED_BYTES + 1024 * 1024, 0x20))]);
   assert.ok(bomb.length < 100 * 1024);
   assert.match(decodePack(bomb).error, /too large/);
 });

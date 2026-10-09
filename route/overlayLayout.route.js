@@ -10,9 +10,9 @@ const { createMongoStore } = require('../services/overlayLayoutStore.js');
  *   render  -> /api/overlay-render     (public, published revisions only)
  * `store` / `auth` are injectable for tests (services/overlayLayoutStore.js).
  */
-function createOverlayLayoutRouters({ store = createMongoStore(), auth = requireAuth, themeStore = null, fontStore = null } = {}) {
-  const c = createOverlayLayoutController(store, { themeStore, fontStore });
-  const packs = createThemePackController({ layoutStore: store, themeStore, fontStore });
+function createOverlayLayoutRouters({ store = createMongoStore(), auth = requireAuth, themeStore = null, fontStore = null, assetStore = null, categoryStore = null } = {}) {
+  const c = createOverlayLayoutController(store, { themeStore, fontStore, assetStore, categoryStore });
+  const packs = createThemePackController({ layoutStore: store, themeStore, fontStore, assetStore });
 
   const layouts = express.Router();
   layouts.use(auth);
@@ -20,6 +20,7 @@ function createOverlayLayoutRouters({ store = createMongoStore(), auth = require
   layouts.post('/', c.create);
   layouts.get('/:id', c.get);
   layouts.put('/:id', c.update);
+  layouts.patch('/:id/meta', c.patchMeta);
   layouts.delete('/:id', c.remove);
   layouts.post('/:id/publish', c.publish);
   layouts.get('/:id/revisions', c.revisions);

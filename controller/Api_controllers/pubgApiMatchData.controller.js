@@ -1141,7 +1141,7 @@ function startLiveMatchUpdater() {
   }
 
   socket.data.userId = key;
-  wsAccounting.markKind(socket.id, 'fetcher');
+  wsAccounting.markKind(socket.id, 'fetcher', key);
   socketIdToUserId.set(socket.id, key);
   socket.join(`user:${key}`);
 
@@ -1492,7 +1492,7 @@ socket.on('relayPing', (cb) => {
       if (joinOverall) socket.join(overallRoom);
 
       console.log(`[bw][room] socket ${socket.id} joinRoundRoom view=${view ?? '(none)'} tiers=${explicitTiers ? [...explicitTiers].join('+') : '(none)'} wireFormat=${wireFormat ?? 'msgpack'} -> matchData=${joinMatchData} matchDataPositional=${joinMatchDataPositional} overall=${joinOverall}`);
-      wsAccounting.setView(socket.id, view ?? (explicitTiers ? [...explicitTiers].join('+') : null));
+      wsAccounting.setView(socket.id, view ?? (explicitTiers ? [...explicitTiers].join('+') : null), tournamentId);
 
       // Instant hydration: without this, a socket that just joined gets
       // nothing until the NEXT live tick from the desktop relay — could be

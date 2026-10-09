@@ -20,6 +20,8 @@
 // to `fetcher` via markKind(). Old builds that send nothing are `unknown`
 // (JWT-bearing -> `unknown-auth`).
 
+const bwByUser = require('./bwByUser');
+
 const WINDOW_MS = 60000;
 const TOP_N = 8;
 
@@ -81,6 +83,9 @@ function track(socket) {
     id: socket.id,
     kind,
     view: null,
+    // Account the bytes belong to: a userId, or `t:<tournamentId>` for an
+    // anonymous round-room socket (see utils/bwByUser.js). Set once.
+    owner: null,
     connectedAt: Date.now(),
     recovered: !!socket.recovered,
     transport: socket.conn?.transport?.name,
@@ -94,6 +99,8 @@ function track(socket) {
   sockets.set(socket.id, entry);
   bump(windowTotals.connects, kind);
   bump(sinceBoot.connects, kind);
+  const sessionUserId = socket.request?.session?.userId;
+  if (sessionUserId) setOwner(entry, String(sessionUserId));
 
   socket.conn.on('packetCreate', (packet) => {
     let name;
@@ -149,16 +156,27 @@ function sampleWire(entry) {
   sinceBoot.wire += d;
   bump(windowTotals.byKind, entry.kind, d);
   bump(sinceBoot.byKind, entry.kind, d);
+  bwByUser.addWs(entry.owner, entry.kind, d);
 }
 
-function markKind(socketId, kind) {
-  const e = sockets.get(socketId);
-  if (e) e.kind = kind;
+function setOwner(entry, owner) {
+  if (entry.owner || !owner) return;
+  entry.owner = owner;
+  bwByUser.addWsConnect(owner, entry.kind);
 }
 
-function setView(socketId, view) {
+function markKind(socketId, kind, userId) {
   const e = sockets.get(socketId);
-  if (e) e.view = view;
+  if (!e) return;
+  e.kind = kind;
+  if (userId) setOwner(e, String(userId));
+}
+
+function setView(socketId, view, tournamentId) {
+  const e = sockets.get(socketId);
+  if (!e) return;
+  e.view = view;
+  if (tournamentId) setOwner(e, `t:${String(tournamentId).toLowerCase()}`);
 }
 
 function eventTable(map, limit) {
@@ -166,6 +184,16 @@ function eventTable(map, limit) {
     .map(([key, v]) => { const [kind, event] = key.split('|'); return { kind, event, ...v, avg: Math.round(v.bytes / v.count) }; })
     .sort((a, b) => b.bytes - a.bytes)
     .slice(0, limit);
+}
+
+// owner key -> { kind: open socket count }
+function activeByOwner() {
+  const out = {};
+  for (const e of sockets.values()) {
+    const o = (out[e.owner || 'anon'] ||= {});
+    o[e.kind] = (o[e.kind] || 0) + 1;
+  }
+  return out;
 }
 
 function activeByKind() {
@@ -198,8 +226,13 @@ setInterval(() => {
   windowTotals = zeroTotals();
 }, WINDOW_MS).unref();
 
-function report() {
+// Flush every open socket's unsampled bytes into the counters.
+function sampleAll() {
   for (const e of sockets.values()) sampleWire(e);
+}
+
+function report() {
+  sampleAll();
   return {
     since: new Date(bootedAt).toISOString(),
     uptimeSec: Math.round((Date.now() - bootedAt) / 1000),
@@ -218,4 +251,4 @@ function report() {
   };
 }
 
-module.exports = { track, markKind, setView, report };
+module.exports = { track, markKind, setView, report, sampleAll, activeByOwner };

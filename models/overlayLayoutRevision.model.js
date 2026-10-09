@@ -13,6 +13,9 @@ const overlayLayoutRevisionSchema = new mongoose.Schema({
   // The owner's uploaded fonts at publish time, so the public runtime can
   // register them (bytes: GET /api/overlay-fonts/file/:id).
   fonts: { type: [{ _id: false, id: { type: String, required: true }, family: { type: String, required: true } }], default: [] },
+  // Uploaded images this revision uses (ids): while a revision lists one, it cannot be deleted.
+  // Not indexed on purpose (see overlayLayout.model.js): lookups go through the layoutId index.
+  assets: { type: [String], default: [] },
 }, { timestamps: { createdAt: true, updatedAt: false }, minimize: false });
 
 overlayLayoutRevisionSchema.index({ layoutId: 1, rev: 1 }, { unique: true });

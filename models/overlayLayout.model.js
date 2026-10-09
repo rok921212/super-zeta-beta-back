@@ -31,6 +31,19 @@ const overlayLayoutSchema = new mongoose.Schema({
   },
   // Resolves root-relative assets (/def_logo.avif) when the page is hosted elsewhere.
   assetBase: { type: String, default: '' },
+  // ── library metadata (the dashboard): never part of the document, never bumps draftRev ──
+  description: { type: String, default: '', maxlength: 500 },
+  // A built-in category id (DESIGN_CATEGORIES) or the _id of one of the owner's own categories.
+  categoryId: { type: String, default: null },
+  tags: { type: [String], default: [] },
+  archivedAt: { type: Date, default: null },
+  // Shown under "Custom templates" in the gallery: a starting point, copied when used.
+  isTemplate: { type: Boolean, default: false },
+  // Derived from the draft on every save: the canvas size (for the library card) and
+  // the uploaded images it uses (so an image in use is not deleted).
+  stage: { width: { type: Number, default: null }, height: { type: Number, default: null } },
+  // Not indexed on purpose: adding an index would alter a collection that already exists.
+  assetIds: { type: [String], default: [] },
 }, { timestamps: true, minimize: false });
 
 // Bound per connection: overlays live on their own cluster (db/overlayConnection.js).

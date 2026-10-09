@@ -16,7 +16,10 @@
 
 const schema = require('../utils/layoutSchema.generated.cjs');
 const pack = require('../services/themePack.js');
-const { checkDraft, createLayoutWithUniquePublicId, publishLayout, isCollectionLimitError } = require('./overlayLayout.controller.js');
+const crypto = require('crypto');
+const { checkDraft, createLayoutWithUniquePublicId, publishLayout, isCollectionLimitError, draftFields } = require('./overlayLayout.controller.js');
+const { cleanName, MAX_ASSET_BYTES, MAX_ASSET_SIDE, MAX_ASSETS_PER_USER, MAX_ACCOUNT_BYTES } = require('./overlayAsset.controller.js');
+const { imageInfo } = require('../utils/imageInfo.js');
 const { VIEW_KEYS, FIRST_NUMBER, isViewKey, resolveTheme } = require('./customTheme.controller.js');
 const { isWoff2, MAX_FONT_BYTES, MAX_FONTS_PER_USER, FAMILY_RE, RESERVED_FAMILIES } = require('./overlayFont.controller.js');
 
@@ -77,7 +80,16 @@ function planFonts(fonts, existing, existingCount) {
   return { add, warnings };
 }
 
-function createThemePackController({ layoutStore, themeStore, fontStore }) {
+/** Thrown by buildPack when a design's uploaded images are too big to travel in one file. */
+class PackTooLargeError extends Error {}
+
+/** Every `asset:<old id>` in a draft swapped for the importing account's own copy. */
+function remapAssets(doc, idMap) {
+  if (!idMap.size) return doc;
+  return JSON.parse(JSON.stringify(doc).replace(/asset:([a-f0-9]{24})/g, (m, id) => (idMap.has(id) ? `asset:${idMap.get(id)}` : m)));
+}
+
+function createThemePackController({ layoutStore, themeStore, fontStore, assetStore = null }) {
   const userOf = (req) => String(req.session.userId);
 
   const wrap = (fn) => async (req, res) => {
@@ -89,6 +101,7 @@ function createThemePackController({ layoutStore, themeStore, fontStore }) {
         name: err && err.name, code: err && err.code, message: err && err.message,
       });
       if (res.headersSent) return;
+      if (err instanceof PackTooLargeError) return res.status(413).json({ message: err.message });
       if (isCollectionLimitError(err)) {
         return res.status(507).json({ message: 'Database collection limit reached — contact the administrator', code: 'COLLECTION_LIMIT' });
       }
@@ -100,9 +113,11 @@ function createThemePackController({ layoutStore, themeStore, fontStore }) {
   async function buildPack(ownerId, name, entries) {
     const layouts = [];
     const families = new Set();
+    const assetIds = new Set();
     for (const { layout, viewKey } of entries) {
       const draft = schema.normalizeLayout(layout.draft);
       pack.usedFamilies(draft, families);
+      for (const a of schema.extractAssetIds(draft)) assetIds.add(a);
       layouts.push({
         name: layout.name,
         viewKey: viewKey || null,
@@ -119,7 +134,23 @@ function createThemePackController({ layoutStore, themeStore, fontStore }) {
         if (file) fonts.push({ family: f.family, data: file.data });
       }
     }
-    return pack.encodePack({ name: name.slice(0, 60), schemaVersion: schema.SCHEMA_VERSION, layouts, fonts });
+    // Uploaded images travel as bytes: the importing account gets its own copies.
+    const assets = [];
+    if (assetStore && assetIds.size) {
+      const owned = new Map((await assetStore.list(ownerId)).map((a) => [String(a._id), a]));
+      let bytes = 0;
+      for (const id of assetIds) {
+        const meta = owned.get(id);
+        if (!meta) continue; // already gone from the library: nothing to carry
+        bytes += meta.size;
+        if (assets.length >= pack.MAX_PACK_ASSETS || bytes > pack.MAX_PACK_ASSET_BYTES) {
+          throw new PackTooLargeError(`This export uses more uploaded images than one theme file can carry (${Math.round(pack.MAX_PACK_ASSET_BYTES / 1048576)} MB, ${pack.MAX_PACK_ASSETS} images). Export its designs one at a time.`);
+        }
+        const file = await assetStore.getFile(id);
+        if (file) assets.push({ id, name: meta.name, data: file.data });
+      }
+    }
+    return pack.encodePack({ name: name.slice(0, 60), schemaVersion: schema.SCHEMA_VERSION, layouts, fonts, assets });
   }
 
   function sendPack(res, name, bytes) {
@@ -194,11 +225,38 @@ function createThemePackController({ layoutStore, themeStore, fontStore }) {
       const fontPlan = fontStore
         ? planFonts(file.fonts, owned.map((f) => f.family.toLowerCase()), owned.length)
         : { add: [], warnings: file.fonts.length ? ['Fonts in the file were skipped.'] : [] };
+      // Which of the file's images this account can take (same checks as an upload).
+      const assetPlan = { add: [], warnings: [] };
+      const packAssets = file.assets || [];
+      if (packAssets.length && !assetStore) assetPlan.warnings.push('Images in the file were skipped: the image library is not available on this server.');
+      else if (packAssets.length) {
+        const usage = await assetStore.usage(ownerId);
+        let count = usage.count;
+        let bytes = usage.bytes;
+        for (const a of packAssets) {
+          const info = imageInfo(a.data);
+          if (!info || info.problem || a.data.length > MAX_ASSET_BYTES || info.width > MAX_ASSET_SIDE || info.height > MAX_ASSET_SIDE) {
+            assetPlan.warnings.push(`Image "${a.name}" in the file is not usable and was skipped.`);
+            continue;
+          }
+          const hash = crypto.createHash('sha256').update(a.data).digest('hex');
+          const existing = await assetStore.findByHash(ownerId, hash);
+          if (existing) { assetPlan.add.push({ ...a, info, hash, existingId: String(existing._id) }); continue; }
+          if (count >= MAX_ASSETS_PER_USER || bytes + a.data.length > MAX_ACCOUNT_BYTES) {
+            assetPlan.warnings.push(`Image "${a.name}" was skipped: your image library is full.`);
+            continue;
+          }
+          count++;
+          bytes += a.data.length;
+          assetPlan.add.push({ ...a, info, hash, existingId: null });
+        }
+      }
       const summary = {
         name: file.name || file.layouts[0].name.slice(0, 60),
         layouts: file.layouts.map((l, i) => ({ name: l.name, viewKey: viewKeys[i] })),
         fonts: file.fonts.map((f) => f.family),
-        warnings: fontPlan.warnings,
+        images: packAssets.length,
+        warnings: [...fontPlan.warnings, ...assetPlan.warnings],
       };
       if (req.query.dryRun === '1' || req.query.dryRun === 'true') return res.json(summary);
 
@@ -216,6 +274,20 @@ function createThemePackController({ layoutStore, themeStore, fontStore }) {
             if (!(err && err.code === 11000)) throw err; // another tab just added that family: use it
           }
         }
+        // Images next: each draft is rewritten to point at this account's copies.
+        const idMap = new Map();
+        for (const a of assetPlan.add) {
+          if (a.existingId) { idMap.set(a.id, a.existingId); continue; }
+          try {
+            const made = await assetStore.create({ ownerId, name: cleanName(a.name), mime: a.info.mime, size: a.data.length, width: a.info.width, height: a.info.height, hash: a.hash, data: a.data });
+            idMap.set(a.id, String(made._id));
+          } catch (err) {
+            if (!(err && err.code === 11000)) throw err;
+            const again = await assetStore.findByHash(ownerId, a.hash); // another tab just uploaded the same file
+            if (again) idMap.set(a.id, String(again._id));
+          }
+        }
+        for (let i = 0; i < docs.length; i++) docs[i] = remapAssets(docs[i], idMap);
         for (let i = 0; i < file.layouts.length; i++) {
           const l = file.layouts[i];
           const assetBase = /^https:\/\//.test(l.assetBase) && schema.isSafeUrl(l.assetBase) ? l.assetBase.replace(/\/+$/, '') : '';
@@ -224,6 +296,7 @@ function createThemePackController({ layoutStore, themeStore, fontStore }) {
             schemaVersion: schema.SCHEMA_VERSION,
             name: l.name,
             draft: docs[i],
+            ...draftFields(docs[i]),
             defaults: { tournamentId: null, roundId: null, matchMode: MATCH_MODES.includes(l.matchMode) ? l.matchMode : 'selectedMatch' },
             assetBase,
           });
@@ -246,7 +319,7 @@ function createThemePackController({ layoutStore, themeStore, fontStore }) {
           if (!current) throw new Error('theme vanished during import');
         }
         log('imported', { themeId: String(theme._id), userId: ownerId, layouts: created.length, fonts: fontPlan.add.length, bytes: req.body.length });
-        res.status(201).json({ theme: await resolveTheme(layoutStore, current, ownerId), warnings: fontPlan.warnings });
+        res.status(201).json({ theme: await resolveTheme(layoutStore, current, ownerId), warnings: summary.warnings });
       } catch (err) {
         // Leave nothing half-imported behind (fonts stay: they are harmless and reusable).
         for (const l of created) {
@@ -267,4 +340,4 @@ function importErrorHandler(err, req, res, next) {
   next(err);
 }
 
-module.exports = { createThemePackController, importErrorHandler, assignViewKeys, planFonts };
+module.exports = { createThemePackController, importErrorHandler, assignViewKeys, planFonts, remapAssets, PackTooLargeError };

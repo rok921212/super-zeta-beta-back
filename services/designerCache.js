@@ -218,6 +218,13 @@ function withLayoutCache(store, { backend = redis } = {}) {
       return removed;
     },
 
+    /** Uncategorise every design of a deleted category, then drop what that made stale. */
+    async clearCategory(ownerId, categoryId) {
+      const ids = await store.clearCategory(ownerId, categoryId);
+      await Promise.all(ids.map((id) => invalidate(id, ownerId)));
+      return ids;
+    },
+
     _cache: { revisions, publicMemo },
   };
 }
@@ -272,6 +279,59 @@ function withFontCache(store, { backend = redis } = {}) {
   };
 }
 
+// ── uploaded images ─────────────────────────────────────────────────────────
+
+function withAssetCache(store, { backend = redis } = {}) {
+  // Image bytes never change (a new upload is a new id): serve repeats from memory, up to 64 MB.
+  const files = createLru({ maxEntries: 200, maxBytes: 64 * 1024 * 1024, ttlMs: 6 * 60 * 60 * 1000 });
+  const thumbs = createLru({ maxEntries: 600, maxBytes: 16 * 1024 * 1024, ttlMs: 6 * 60 * 60 * 1000 });
+  const clear = (ownerId) => { stats.invalidations++; return backend.invalidateScope(ownerScope(ownerId)); };
+  return {
+    ...store,
+    list: (ownerId) => cached(backend, `dz:assets:${ownerId}`, ownerScope(ownerId), TTL.owner, () => store.list(ownerId)),
+    async getFile(id) {
+      const memo = files.get(String(id));
+      if (memo) { stats.memoryHits++; return memo; }
+      const found = await store.getFile(id);
+      if (found) files.set(String(id), found, found.data.length);
+      return found;
+    },
+    async getThumb(id) {
+      const memo = thumbs.get(String(id));
+      if (memo) { stats.memoryHits++; return memo; }
+      const found = await store.getThumb(id);
+      if (found) thumbs.set(String(id), found, found.data.length);
+      return found;
+    },
+    async create(fields) { const created = await store.create(fields); await clear(fields.ownerId); return created; },
+    async setThumb(id, ownerId, data, mime) {
+      const updated = await store.setThumb(id, ownerId, data, mime);
+      if (updated) { thumbs.delete(String(id)); await clear(ownerId); }
+      return updated;
+    },
+    async rename(id, ownerId, name) { const updated = await store.rename(id, ownerId, name); if (updated) await clear(ownerId); return updated; },
+    async remove(id, ownerId) {
+      const removed = await store.remove(id, ownerId);
+      if (removed) { files.delete(String(id)); thumbs.delete(String(id)); await clear(ownerId); }
+      return removed;
+    },
+    _cache: { files, thumbs },
+  };
+}
+
+// ── design categories ───────────────────────────────────────────────────────
+
+function withCategoryCache(store, { backend = redis } = {}) {
+  const clear = (ownerId) => { stats.invalidations++; return backend.invalidateScope(ownerScope(ownerId)); };
+  return {
+    ...store,
+    list: (ownerId) => cached(backend, `dz:cats:${ownerId}`, ownerScope(ownerId), TTL.owner, () => store.list(ownerId)),
+    async create(fields) { const created = await store.create(fields); await clear(fields.ownerId); return created; },
+    async rename(id, ownerId, name, nameKey) { const updated = await store.rename(id, ownerId, name, nameKey); if (updated) await clear(ownerId); return updated; },
+    async remove(id, ownerId) { const removed = await store.remove(id, ownerId); if (removed) await clear(ownerId); return removed; },
+  };
+}
+
 /** An isolated in-memory stand-in for the Redis helpers (tests; also what a Redis outage degrades to). */
 function createMemoryBackend() {
   const values = new Map();
@@ -296,4 +356,4 @@ function createMemoryBackend() {
   };
 }
 
-module.exports = { withLayoutCache, withThemeCache, withFontCache, createLru, createMemoryBackend, designerCacheStats: stats, TTL };
+module.exports = { withLayoutCache, withThemeCache, withFontCache, withAssetCache, withCategoryCache, createLru, createMemoryBackend, designerCacheStats: stats, TTL };

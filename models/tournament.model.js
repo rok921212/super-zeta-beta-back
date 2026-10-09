@@ -12,4 +12,7 @@ const tournamentSchema = new mongoose.Schema({
 
 });
 
+// The per-user list, newest first (getTournaments).
+tournamentSchema.index({ userId: 1, _id: -1 });
+
 module.exports = mongoose.model('Tournament', tournamentSchema);

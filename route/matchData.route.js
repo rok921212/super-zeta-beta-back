@@ -92,4 +92,13 @@ router.post(
   matchDataController.copyRosterFromPreviousMatch
 );
 
+// CSV import (rows parsed client-side): overwrite players already in the
+// match by UID, add the ones that aren't, and write new players to the
+// Teams catalog too.
+router.post(
+  '/matchdata/:matchDataId/import-csv',
+  requireAuth,
+  matchDataController.importMatchDataCsv
+);
+
 module.exports = router;

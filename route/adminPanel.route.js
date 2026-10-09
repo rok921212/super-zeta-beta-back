@@ -29,8 +29,17 @@ router.get('/me', adminPanel.me);
 // Per-socket / per-event WebSocket egress since boot (utils/wsAccounting.js).
 router.get('/ws-bandwidth', (req, res) => res.json(require('../utils/wsAccounting').report()));
 
+// Egress per account since the last reset (utils/bwByUser.js): HTTP, WebSocket and cache writes.
+router.get('/bandwidth', adminPanel.bandwidth);
+router.post('/bandwidth/reset', adminPanel.bandwidthReset);
+
 // MongoDB storage used / left per cluster (services/dbStorage.js). ?fresh=1 skips the 60s memo.
 router.get('/storage', adminPanel.storage);
+
+// ── Default team logo / player photo / team flag ───────────────────────
+router.get('/team-defaults', adminPanel.getTeamDefaults);
+router.put('/team-defaults', adminPanel.updateTeamDefaults);
+router.post('/team-defaults/apply', invalidateCacheMiddleware(['cache:/api/teams', 'cache:/api/matches', 'cache:/api/groups']), adminPanel.applyTeamDefaults);
 
 // ── Cross-user overview (read-only) ────────────────────────────────────
 router.get('/overview', adminPanel.overview);                        // every user + totals + last login + active API round

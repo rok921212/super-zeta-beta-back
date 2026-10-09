@@ -10,8 +10,15 @@ const { createOverlayLayoutRouters } = require('../../route/overlayLayout.route.
 const { createCustomThemeRouter } = require('../../route/customTheme.route.js');
 const { createOverlayFontRouter } = require('../../route/overlayFont.route.js');
 const { createMemoryFontStore } = require('../../services/overlayFontStore.js');
+const { createOverlayAssetRouter } = require('../../route/overlayAsset.route.js');
+const { createMemoryAssetStore } = require('../../services/overlayAssetStore.js');
+const { createOverlayCategoryRouter } = require('../../route/overlayCategory.route.js');
+const { createMemoryCategoryStore } = require('../../services/overlayCategoryStore.js');
 
-async function startDesignerApp({ layoutStore, themeStore, fontStore = createMemoryFontStore() }) {
+async function startDesignerApp({
+  layoutStore, themeStore, fontStore = createMemoryFontStore(),
+  assetStore = createMemoryAssetStore(), categoryStore = createMemoryCategoryStore(), overlayAvailable = () => true,
+}) {
   const app = express();
   app.use(express.json({ limit: '15mb' }));
   app.use((req, res, next) => {
@@ -19,11 +26,13 @@ async function startDesignerApp({ layoutStore, themeStore, fontStore = createMem
     if (req.headers['x-test-user']) req.session.userId = req.headers['x-test-user'];
     next();
   });
-  const routers = createOverlayLayoutRouters({ store: layoutStore, auth: requireAuth, themeStore, fontStore });
+  const routers = createOverlayLayoutRouters({ store: layoutStore, auth: requireAuth, themeStore, fontStore, assetStore, categoryStore });
+  app.use('/api/overlay-assets', createOverlayAssetRouter({ assetStore, layoutStore, auth: requireAuth, available: overlayAvailable }));
+  app.use('/api/overlay-categories', createOverlayCategoryRouter({ categoryStore, layoutStore, auth: requireAuth, available: overlayAvailable }));
   app.use('/api/overlay-layouts', routers.layouts);
   app.use('/api/overlay-render', routers.render);
   app.use('/api/overlay-fonts', createOverlayFontRouter({ fontStore, auth: requireAuth }));
-  app.use('/api/custom-themes', createCustomThemeRouter({ themeStore, layoutStore, fontStore, auth: requireAuth }));
+  app.use('/api/custom-themes', createCustomThemeRouter({ themeStore, layoutStore, fontStore, assetStore, auth: requireAuth }));
   const server = http.createServer(app);
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}`;

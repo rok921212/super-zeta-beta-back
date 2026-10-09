@@ -4,11 +4,8 @@ const User = require('../models/User.model.js');
 const Group = require('../models/group.model.js');
 const { syncMatchDataTeamsForGroup } = require('./matchData.controller.js');
 const mongoose = require('mongoose');
-
-// Default assets
-const DEFAULT_TEAM_LOGO = '/def_logo.avif';
-const DEFAULT_PLAYER_PHOTO = '/def_char.avif';
-const DEFAULT_TEAM_FLAG = '/def_flag.avif';
+// Default assets — built-in unless an admin set their own (admin panel).
+const { getTeamDefaults } = require('../services/teamDefaults.js');
 
 const MAX_PLAYERS = 100; // sanity cap — adjust to your real roster limit
 
@@ -70,7 +67,9 @@ function buildVisibilityConditions(userId, isAdmin) {
   return conditions;
 }
 
-function normalizePlayers(players) {
+const hasText = (v) => typeof v === 'string' && !!v.trim();
+
+function normalizePlayers(players, defaultPhoto) {
   if (!Array.isArray(players)) return [];
   return players
     .slice(0, MAX_PLAYERS)
@@ -78,7 +77,7 @@ function normalizePlayers(players) {
     .map(p => ({
       playerName: p.playerName,
       playerId: p.playerId,
-      photo: (typeof p.photo === 'string' && p.photo.trim()) ? p.photo : DEFAULT_PLAYER_PHOTO,
+      photo: hasText(p.photo) ? p.photo : defaultPhoto,
     }));
 }
 
@@ -144,9 +143,10 @@ const createTeam = async (req, res) => {
       if (!validation.ok) return res.status(400).json({ error: validation.error });
     }
 
-    const finalLogo = (typeof logo === 'string' && logo.trim()) ? logo : DEFAULT_TEAM_LOGO;
-    const finalFlag = (typeof teamFlag === 'string' && teamFlag.trim()) ? teamFlag : DEFAULT_TEAM_FLAG;
-    const normalizedPlayers = normalizePlayers(players);
+    const defaults = await getTeamDefaults();
+    const finalLogo = hasText(logo) ? logo : defaults.defaultTeamLogo;
+    const finalFlag = hasText(teamFlag) ? teamFlag : defaults.defaultTeamFlag;
+    const normalizedPlayers = normalizePlayers(players, defaults.defaultPlayerPhoto);
 
     const team = new Team({
       teamFullName,
@@ -168,9 +168,50 @@ const createTeam = async (req, res) => {
   }
 };
 
-// ─── Bulk-create teams (CSV import) ─────────────────────────────────────
+// Applies one CSV team onto a team that already exists (same tag). The CSV
+// only adds and edits — it never removes:
+//   - team name replaced when different; logo/flag replaced only when the
+//     CSV gives one (a blank cell keeps the current image)
+//   - a player whose playerId (UID) is already on the roster gets the CSV
+//     name, and the CSV photo when given; a new UID is added
+//   - roster players not in the CSV are left alone
+// Mutates the hydrated doc in place so player _id / hiddenBy survive.
+// Returns whether anything changed; throws if the roster would overflow.
+function applyCsvUpdate(team, raw, defaults) {
+  const { teamFullName, logo, teamFlag, players } = raw;
+  let changed = false;
+
+  if (team.teamFullName !== teamFullName) { team.teamFullName = teamFullName; changed = true; }
+  if (hasText(logo) && team.logo !== logo) { team.logo = logo; changed = true; }
+  if (hasText(teamFlag) && team.teamFlag !== teamFlag) { team.teamFlag = teamFlag; changed = true; }
+
+  const byUid = new Map();
+  for (const p of team.players) {
+    const uid = typeof p.playerId === 'string' ? p.playerId.trim() : '';
+    if (uid && !byUid.has(uid)) byUid.set(uid, p);
+  }
+
+  for (const p of normalizePlayers(players, '')) {
+    const uid = p.playerId.trim();
+    const current = byUid.get(uid);
+    if (current) {
+      if (current.playerName !== p.playerName) { current.playerName = p.playerName; changed = true; }
+      if (p.photo && current.photo !== p.photo) { current.photo = p.photo; changed = true; }
+    } else {
+      if (team.players.length >= MAX_PLAYERS) throw new Error(`players cannot exceed ${MAX_PLAYERS}`);
+      team.players.push({ playerName: p.playerName, playerId: uid, photo: p.photo || defaults.defaultPlayerPhoto });
+      byUid.set(uid, team.players[team.players.length - 1]);
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
+// ─── Bulk-create / update teams (CSV import) ────────────────────────────
 // Same per-team rules as createTeam, run in a loop so one bad row (a stale
 // tag, a malformed player UID) can't sink the rest of a 100+-team import.
+// A tag that already exists updates that team (applyCsvUpdate) instead.
 // Sequential, not Promise.all: keeps unique-tag (E11000) errors attributable
 // to the exact team that caused them and avoids hammering the connection
 // pool with a huge batch of concurrent writes.
@@ -187,8 +228,20 @@ const bulkImportTeams = async (req, res) => {
     }
 
     const created = [];
+    const updated = [];
     const failed = [];
+    let unchangedCount = 0;
     const tagsInThisBatch = new Set();
+    const defaults = await getTeamDefaults();
+
+    // Teams that already exist under one of these tags get updated instead
+    // of failing on the unique-tag index. One read for the whole batch.
+    const tags = [...new Set(teams.map(t => t?.teamTag).filter(t => typeof t === 'string' && t))];
+    const existingByTag = new Map(
+      (await Team.find({ teamTag: { $in: tags } })).map(t => [t.teamTag, t])
+    );
+    const isAdmin = existingByTag.size ? await isRequesterAdmin(req) : false;
+    const changedTeamIds = [];
 
     for (const raw of teams) {
       const { teamFullName, teamTag, logo, teamFlag, players } = raw || {};
@@ -211,9 +264,23 @@ const bulkImportTeams = async (req, res) => {
           if (!validation.ok) throw new Error(validation.error);
         }
 
-        const finalLogo = (typeof logo === 'string' && logo.trim()) ? logo : DEFAULT_TEAM_LOGO;
-        const finalFlag = (typeof teamFlag === 'string' && teamFlag.trim()) ? teamFlag : DEFAULT_TEAM_FLAG;
-        const normalizedPlayers = normalizePlayers(players);
+        const existing = existingByTag.get(teamTag);
+        if (existing) {
+          if (!isAdmin && existing.createdBy && String(existing.createdBy) !== String(req.session.userId)) {
+            throw new Error('A team with that tag already exists and belongs to another account');
+          }
+          const changed = applyCsvUpdate(existing, raw, defaults);
+          tagsInThisBatch.add(teamTag);
+          if (!changed) { unchangedCount++; continue; }
+          const savedTeam = await existing.save();
+          changedTeamIds.push(savedTeam._id);
+          updated.push(sanitizeTeam(savedTeam.toObject(), req.session?.userId));
+          continue;
+        }
+
+        const finalLogo = hasText(logo) ? logo : defaults.defaultTeamLogo;
+        const finalFlag = hasText(teamFlag) ? teamFlag : defaults.defaultTeamFlag;
+        const normalizedPlayers = normalizePlayers(players, defaults.defaultPlayerPhoto);
 
         const team = new Team({
           teamFullName,
@@ -232,11 +299,23 @@ const bulkImportTeams = async (req, res) => {
       }
     }
 
-    console.log(`[TEAMS] bulk-import created=${created.length} failed=${failed.length}`);
-    res.status(created.length ? 201 : 400).json({
+    // Already-created matches snapshot team/player display fields into
+    // MatchData — same reconciliation updateTeam triggers after an edit.
+    if (changedTeamIds.length) {
+      Group.find({ 'slots.team': { $in: changedTeamIds } }).select('_id').lean()
+        .then(async (groups) => { for (const g of groups) await syncMatchDataTeamsForGroup(g._id); })
+        .catch(err => console.error('[TEAMS] Failed to sync MatchData after bulk-import update:', err.message));
+    }
+
+    console.log(`[TEAMS] bulk-import created=${created.length} updated=${updated.length} unchanged=${unchangedCount} failed=${failed.length}`);
+    const anyOk = created.length || updated.length || unchangedCount;
+    res.status(created.length ? 201 : anyOk ? 200 : 400).json({
       createdCount: created.length,
+      updatedCount: updated.length,
+      unchangedCount,
       failedCount: failed.length,
       created,
+      updated,
       failed,
     });
   } catch (err) {
@@ -420,7 +499,7 @@ const updateTeam = async (req, res) => {
     if (teamTag) setOps.teamTag = teamTag;
     if (logo !== undefined) setOps.logo = logo;
     if (teamFlag !== undefined) setOps.teamFlag = teamFlag;
-    if (players) setOps.players = normalizePlayers(players);
+    if (players) setOps.players = normalizePlayers(players, (await getTeamDefaults()).defaultPlayerPhoto);
 
     if (Object.keys(setOps).length === 0) {
       return res.status(400).json({ error: 'No valid fields to update' });
@@ -502,7 +581,7 @@ const addPlayerToTeam = async (req, res) => {
       return res.status(400).json({ error: 'playerId (PUBG ID) is required' });
     }
 
-    const finalPhoto = (typeof photo === 'string' && photo.trim()) ? photo : DEFAULT_PLAYER_PHOTO;
+    const finalPhoto = hasText(photo) ? photo : (await getTeamDefaults()).defaultPlayerPhoto;
 
     const existing = await Team.findById(id).select('createdBy').lean();
     if (!existing) return res.status(404).json({ error: 'Team not found' });

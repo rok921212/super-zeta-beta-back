@@ -18,10 +18,12 @@
 //   markPublished(id, ownerId, fromRev, toRev, revisionId) -> layout | null (needs publishedRev === fromRev and !locked)
 //   listRevisions(layoutId)                      -> [{rev, createdAt, publishedBy}] newest first
 //   getRevision(layoutId, rev)                   -> revision | null
+//   assetUsage(ownerId, assetId)                 -> { drafts, published }   (how many designs / revisions use an image)
+//   clearCategory(ownerId, categoryId)           -> [layoutId]              (those designs become uncategorised)
 
 const mongoose = require('mongoose');
 
-const SUMMARY_FIELDS = 'name publicId schemaVersion draftRev publishedRev publishedAt productionLocked defaults assetBase createdAt updatedAt ownerId';
+const SUMMARY_FIELDS = 'name publicId schemaVersion draftRev publishedRev publishedAt productionLocked defaults assetBase createdAt updatedAt ownerId description categoryId tags archivedAt isTemplate stage';
 
 function createMongoStore({ connection } = {}) {
   const OverlayLayout = require('../models/overlayLayout.model.js').modelFor(connection || mongoose.connection);
@@ -57,6 +59,19 @@ function createMongoStore({ connection } = {}) {
     ),
     listRevisions: (layoutId) => OverlayLayoutRevision.find({ layoutId }).select('rev createdAt publishedBy').sort({ rev: -1 }).lean(),
     getRevision: (layoutId, rev) => OverlayLayoutRevision.findOne({ layoutId, rev }).lean(),
+    assetUsage: async (ownerId, assetId) => {
+      const [drafts, mine] = await Promise.all([
+        OverlayLayout.countDocuments({ ownerId, assetIds: assetId }),
+        OverlayLayout.find({ ownerId }).select('_id').lean(),
+      ]);
+      const published = mine.length ? await OverlayLayoutRevision.countDocuments({ layoutId: { $in: mine.map((l) => l._id) }, assets: assetId }) : 0;
+      return { drafts, published };
+    },
+    clearCategory: async (ownerId, categoryId) => {
+      const hit = await OverlayLayout.find({ ownerId, categoryId }).select('_id').lean();
+      if (hit.length) await OverlayLayout.updateMany({ ownerId, categoryId }, { $set: { categoryId: null } });
+      return hit.map((l) => String(l._id));
+    },
   };
 }
 
@@ -87,7 +102,8 @@ function createMemoryStore() {
         _id: new mongoose.Types.ObjectId().toString(),
         organizationId: null, schemaVersion: 1, draftRev: 1, publishedRev: 0, publishedRevisionId: null,
         publishedAt: null, productionLocked: false, defaults: { tournamentId: null, roundId: null, matchMode: 'selectedMatch' },
-        assetBase: '', ...clone(fields), createdAt: now, updatedAt: now,
+        assetBase: '', description: '', categoryId: null, tags: [], archivedAt: null, isTemplate: false,
+        stage: { width: null, height: null }, assetIds: [], ...clone(fields), createdAt: now, updatedAt: now,
       };
       layouts.set(l._id, l);
       return clone(l);
@@ -138,6 +154,19 @@ function createMemoryStore() {
     },
     async getRevision(layoutId, rev) {
       return clone(revisions.find((r) => same(r.layoutId, layoutId) && r.rev === rev) || null);
+    },
+    async assetUsage(ownerId, assetId) {
+      const mine = [...layouts.values()].filter((l) => same(l.ownerId, ownerId));
+      const ids = new Set(mine.map((l) => String(l._id)));
+      return {
+        drafts: mine.filter((l) => (l.assetIds || []).includes(String(assetId))).length,
+        published: revisions.filter((r) => ids.has(String(r.layoutId)) && (r.assets || []).includes(String(assetId))).length,
+      };
+    },
+    async clearCategory(ownerId, categoryId) {
+      const hit = [...layouts.values()].filter((l) => same(l.ownerId, ownerId) && l.categoryId === String(categoryId));
+      hit.forEach((l) => { l.categoryId = null; touch(l); });
+      return hit.map((l) => String(l._id));
     },
     // test hook
     _revisions: revisions,

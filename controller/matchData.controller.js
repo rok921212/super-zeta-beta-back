@@ -3,6 +3,9 @@ const Match = require('../models/match.model');
 const Round = require('../models/round.model');
 const Tournament = require('../models/tournament.model');
 const Group = require('../models/group.model.js');
+const Team = require('../models/teams.model.js');
+const User = require('../models/User.model.js');
+const { planCsvImport } = require('../utils/matchDataCsvImport');
 const { getSocket } = require('../socket.js');
 const mongoose = require('mongoose');
 const { computeOverallMatchDataForRound } = require('./overall.controller');
@@ -1249,6 +1252,236 @@ const copyRosterFromPreviousMatch = async (req, res) => {
   }
 };
 
+// ─── CSV import ───────────────────────────────────────────────────────────
+// Body: { rows: [{ teamName, teamTag, playerName, playerUid, kills }] } — the
+// website parses the file (team_name,team_tag,playerName,playerUID,
+// player_kills) and posts the rows, same as /teams/bulk-import.
+//
+// The player UID is the key (rules live in utils/matchDataCsvImport.js):
+//  - UID already in this match  -> its name/kills are overwritten.
+//  - UID not in this match      -> added to the row's team, and also written
+//    to that team's roster in the Teams catalog so it can be edited there
+//    later. The MatchData player reuses the catalog player's _id, like every
+//    other roster path (buildFreshPlayer).
+// Teams that aren't in the match are never created — those rows come back in
+// `skipped`.
+const MAX_CSV_IMPORT_ROWS = 500;
+// Same default teams.controller.js gives a roster player with no photo.
+// (Can't require it from there: teams.controller.js requires this file.)
+const DEFAULT_PLAYER_PHOTO = '/def_char.avif';
+
+const importMatchDataCsv = async (req, res) => {
+  const { matchDataId } = req.params;
+  if (!req.session || !req.session.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  if (!mongoose.Types.ObjectId.isValid(matchDataId)) {
+    return res.status(400).json({ error: 'Invalid ObjectId format for matchDataId' });
+  }
+  const { rows } = req.body || {};
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ error: 'rows must be a non-empty array' });
+  }
+  if (rows.length > MAX_CSV_IMPORT_ROWS) {
+    return res.status(400).json({ error: `Cannot import more than ${MAX_CSV_IMPORT_ROWS} rows in one request` });
+  }
+
+  const lockKey = `${matchDataId}-import`;
+  if (!acquireLock(lockKey)) {
+    return res.status(429).json({ error: 'Import already in progress, please wait' });
+  }
+
+  try {
+    const userId = req.session.userId;
+    const matchData = await MatchData.findOne({ _id: matchDataId, userId });
+    if (!matchData) return res.status(404).json({ error: 'MatchData not found or not yours' });
+
+    const plan = planCsvImport(matchData.toObject().teams, rows);
+    const { updates, adds, skipped, notes } = plan;
+
+    // ── Teams catalog: make sure every new player exists on its team ──────
+    // Includes adds that found no seat in the match (team_full) — they're
+    // still wanted in the catalog so the operator can swap them in by hand.
+    const catalogSkipped = [];
+    let catalogAddedCount = 0;
+    const addTeamIds = [...new Set(adds.map(a => a.teamId))];
+    if (addTeamIds.length) {
+      const catalogTeams = await Team.find({ _id: { $in: addTeamIds } })
+        .select('createdBy players._id players.playerName players.playerId players.photo')
+        .lean();
+      const catalogById = new Map(catalogTeams.map(t => [String(t._id), t]));
+      let isAdmin = null; // looked up at most once, only if a foreign team shows up
+
+      for (const teamId of addTeamIds) {
+        const catalogTeam = catalogById.get(teamId);
+        const teamAdds = adds.filter(a => a.teamId === teamId);
+        const toPush = [];
+
+        // Same rule as canMutateTeam in teams.controller.js.
+        let canMutate = !!catalogTeam &&
+          (!catalogTeam.createdBy || String(catalogTeam.createdBy) === String(userId));
+        if (catalogTeam && !canMutate) {
+          if (isAdmin === null) {
+            const requester = await User.findById(userId).select('isAdmin').lean();
+            isAdmin = !!requester?.isAdmin;
+          }
+          canMutate = isAdmin;
+        }
+
+        for (const add of teamAdds) {
+          const existing = (catalogTeam?.players || [])
+            .find(p => String(p.playerId || '').trim() === add.playerUid);
+          if (existing) {
+            add.catalogPlayer = existing;
+            continue;
+          }
+          const fresh = {
+            _id: new mongoose.Types.ObjectId(),
+            playerName: add.playerName,
+            playerId: add.playerUid,
+            photo: DEFAULT_PLAYER_PHOTO,
+          };
+          add.catalogPlayer = fresh;
+          if (canMutate) {
+            toPush.push(fresh);
+          } else {
+            catalogSkipped.push({
+              row: add.row,
+              playerUid: add.playerUid,
+              playerName: add.playerName,
+              message: catalogTeam ? "team belongs to another account — player not added to the team's roster" : 'team no longer exists in the teams list',
+            });
+          }
+        }
+
+        if (toPush.length) {
+          await Team.updateOne({ _id: teamId }, { $push: { players: { $each: toPush } } });
+          catalogAddedCount += toPush.length;
+        }
+      }
+    }
+
+    // ── Apply to the match ─────────────────────────────────────────────────
+    const changedTeamIds = new Set();
+    let updatedCount = 0;
+    let addedCount = 0;
+    let replacedCount = 0;
+
+    for (const u of updates) {
+      const team = matchData.teams.id(u.teamSubId);
+      const player = team?.players.id(u.playerSubId);
+      if (!player) continue;
+      if (u.playerName) player.playerName = u.playerName;
+      if (u.kills !== null) player.killNum = u.kills;
+      updatedCount += 1;
+      changedTeamIds.add(String(team._id));
+    }
+
+    for (const add of adds) {
+      if (!add.seated) continue;
+      const team = matchData.teams.id(add.teamSubId);
+      if (!team) continue;
+      const kills = add.kills === null ? 0 : add.kills;
+
+      // The catalog already knows this UID under a player who is sitting in
+      // this team with a different/blank uId — fix that player instead of
+      // seating a second copy with the same _id.
+      const seatedTwin = team.players.id(add.catalogPlayer._id);
+      if (seatedTwin) {
+        seatedTwin.uId = add.playerUid;
+        seatedTwin.playerName = add.playerName;
+        if (add.kills !== null) seatedTwin.killNum = add.kills;
+        updatedCount += 1;
+        changedTeamIds.add(String(team._id));
+        continue;
+      }
+
+      const fresh = {
+        ...buildFreshPlayer(add.catalogPlayer, team.slot, team.teamName),
+        playerName: add.playerName,
+        killNum: kills,
+      };
+      const replaceIndex = add.replacePlayerSubId
+        ? team.players.findIndex(p => String(p._id) === add.replacePlayerSubId)
+        : -1;
+      if (replaceIndex !== -1) {
+        team.players.set(replaceIndex, fresh);
+        replacedCount += 1;
+      } else if (team.players.length < 4) {
+        team.players.push(fresh);
+      } else {
+        skipped.push({
+          row: add.row,
+          teamTag: team.teamTag,
+          playerName: add.playerName,
+          playerUid: add.playerUid,
+          reason: 'team_full',
+          message: `team "${team.teamTag || team.teamName}" has no free seat`,
+        });
+        continue;
+      }
+      addedCount += 1;
+      changedTeamIds.add(String(team._id));
+    }
+
+    const changedTeams = [];
+    if (changedTeamIds.size > 0) {
+      matchData.markModified('teams');
+      await matchData.save();
+
+      const match = await Match.findById(matchData.matchId).select('tournamentId roundId').lean();
+      const io = getSocket();
+      for (const team of matchData.teams) {
+        if (!changedTeamIds.has(String(team._id))) continue;
+        const players = team.toObject().players;
+        changedTeams.push({ teamId: team.teamId, teamName: team.teamName, players });
+        console.log(`[socket] matchDataUpdated -> user:${userId} team=${team.teamId} csv-import`);
+        io.to(`user:${userId}`).emit('matchDataUpdated', {
+          matchDataId,
+          teamId: team.teamId,
+          changes: { players },
+        });
+      }
+      emitOverallUpdateAsync(io, matchData.matchId, userId, matchData.toObject());
+      if (match) {
+        bumpRound(io, {
+          tournamentId: match.tournamentId,
+          roundId: match.roundId,
+          matchId: matchData.matchId,
+          reason: 'importCsv',
+          scope: 'round',
+        });
+      }
+    }
+
+    // While the live updater holds this match in memory, its next tick /
+    // SAVE DATA writes the live snapshot over what was just imported — the
+    // UI warns about it rather than the import being refused.
+    const { getLiveMatchData } = require('./Api_controllers/pubgApiMatchData.controller.js');
+    const liveActive = !!getLiveMatchData(matchData.matchId);
+
+    console.log(`[MATCHDATA] csv-import matchData=${matchDataId} rows=${rows.length} updated=${updatedCount} added=${addedCount} replaced=${replacedCount} catalogAdded=${catalogAddedCount} skipped=${skipped.length}`);
+    return res.json({
+      message: 'CSV import finished',
+      matchDataId,
+      updatedCount,
+      addedCount,
+      replacedCount,
+      catalogAddedCount,
+      skipped: skipped.sort((a, b) => a.row - b.row),
+      catalogSkipped,
+      notes,
+      teams: changedTeams,
+      liveActive,
+    });
+  } catch (error) {
+    console.error('Error importing CSV into MatchData:', error);
+    return res.status(500).json({ error: error.message });
+  } finally {
+    releaseLock(lockKey);
+  }
+};
+
 // Surfaces which live players in this match currently have no roster match
 // (see markUnmatched/getUnmatchedPlayers in pubgApiMatchData.controller.js)
 // so an operator can fix a bad UID instead of it silently never working —
@@ -1287,6 +1520,7 @@ module.exports = {
   addPlayersToTeamInMatchData,
   removePlayersFromTeamInMatchData,
   copyRosterFromPreviousMatch,
+  importMatchDataCsv,
   updateTeamPlayersBulkStats,
   getUnmatchedPlayersForMatch,
 };

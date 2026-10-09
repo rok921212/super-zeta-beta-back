@@ -6,11 +6,13 @@
 //   rest       gzip of minified JSON:
 //     { v, name, schemaVersion,
 //       layouts: [{ name, viewKey|null, matchMode, assetBase, draft }],
-//       fonts:   [{ family, data: <base64 woff2> }] }
+//       fonts:   [{ family, data: <base64 woff2> }],
+//       assets:  [{ id, name, data: <base64 image> }] }     (optional)
 //
 // Nothing account-bound is in the file: no owner / layout / public ids, no
-// revisions, no tournament or round defaults. Images are URLs inside the draft
-// and travel as-is.
+// revisions, no tournament or round defaults. Image URLs inside the draft
+// travel as-is; an uploaded image (`asset:<id>`) travels as its bytes, and the
+// importing account gets its own copy with a new id.
 //
 // Pure functions only — no Express, no stores (controller/themePack.controller.js).
 
@@ -21,22 +23,27 @@ const PACK_VERSION = 1;
 const HEADER_BYTES = MAGIC.length + 1;
 const FILE_EXTENSION = '.sstheme';
 /** Upload limit for an import (the compressed file). */
-const MAX_PACK_BYTES = 12 * 1024 * 1024;
+const MAX_PACK_BYTES = 24 * 1024 * 1024;
 /** Inflate limit: a small file may not expand past this (zip-bomb guard). */
-const MAX_INFLATED_BYTES = 40 * 1024 * 1024;
+const MAX_INFLATED_BYTES = 64 * 1024 * 1024;
 const MAX_PACK_LAYOUTS = 40;
 const MAX_PACK_FONTS = 30;
+const MAX_PACK_ASSETS = 80;
+/** Uploaded images one pack may carry, before base64 (so the file stays importable). */
+const MAX_PACK_ASSET_BYTES = 16 * 1024 * 1024;
+const ASSET_ID_RE = /^[a-f0-9]{24}$/;
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 /** { name, schemaVersion, layouts, fonts: [{ family, data: Buffer }] } -> file bytes. */
-function encodePack({ name, schemaVersion, layouts, fonts = [] }) {
+function encodePack({ name, schemaVersion, layouts, fonts = [], assets = [] }) {
   const json = JSON.stringify({
     v: PACK_VERSION,
     name,
     schemaVersion,
     layouts,
     fonts: fonts.map((f) => ({ family: f.family, data: Buffer.from(f.data).toString('base64') })),
+    ...(assets.length ? { assets: assets.map((a) => ({ id: a.id, name: a.name, data: Buffer.from(a.data).toString('base64') })) } : {}),
   });
   return Buffer.concat([MAGIC, Buffer.from([PACK_VERSION]), zlib.gzipSync(json, { level: 9 })]);
 }
@@ -80,12 +87,20 @@ function decodePack(buf) {
     if (!isPlainObject(f) || typeof f.family !== 'string' || typeof f.data !== 'string') return { error: 'Theme file is damaged or incomplete' };
     fonts.push({ family: f.family.trim().replace(/\s+/g, ' '), data: Buffer.from(f.data, 'base64') });
   }
+  const rawAssets = raw.assets === undefined ? [] : raw.assets;
+  if (!Array.isArray(rawAssets) || rawAssets.length > MAX_PACK_ASSETS) return { error: 'Theme file is damaged or incomplete' };
+  const assets = [];
+  for (const a of rawAssets) {
+    if (!isPlainObject(a) || typeof a.id !== 'string' || !ASSET_ID_RE.test(a.id) || typeof a.data !== 'string') return { error: 'Theme file is damaged or incomplete' };
+    assets.push({ id: a.id, name: typeof a.name === 'string' ? a.name.slice(0, 120) : 'Image', data: Buffer.from(a.data, 'base64') });
+  }
   return {
     pack: {
       name: typeof raw.name === 'string' ? raw.name.trim().slice(0, 60) : '',
       schemaVersion: raw.schemaVersion,
       layouts,
       fonts,
+      assets,
     },
   };
 }
@@ -122,5 +137,5 @@ function packFileName(name) {
 
 module.exports = {
   encodePack, decodePack, usedFamilies, packFileName,
-  PACK_VERSION, FILE_EXTENSION, MAX_PACK_BYTES, MAX_INFLATED_BYTES, MAX_PACK_LAYOUTS, MAX_PACK_FONTS,
+  PACK_VERSION, FILE_EXTENSION, MAX_PACK_BYTES, MAX_INFLATED_BYTES, MAX_PACK_LAYOUTS, MAX_PACK_FONTS, MAX_PACK_ASSETS, MAX_PACK_ASSET_BYTES,
 };

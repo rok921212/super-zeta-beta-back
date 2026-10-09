@@ -7,7 +7,8 @@ const { cacheMiddleware, invalidateCacheMiddleware } = require('../middleware/ca
 // Specific routes first
 // Put '/' route BEFORE '/:id'
 router.get('/', requireAuth, cacheMiddleware(), tournamentController.getTournaments);
-router.post('/', requireAuth, tournamentController.createTournament);
+// Clears every cached list variant (?search=…, ?limit=…) so a new tournament is findable straight away.
+router.post('/', requireAuth, invalidateCacheMiddleware(() => ['cache:/api/tournaments']), tournamentController.createTournament);
 router.get('/name/:name', requireAuth, cacheMiddleware(), tournamentController.getTournamentByName);
 router.get('/rounds/:tournamentId', requireAuth, cacheMiddleware(), tournamentController.getRoundsByTournamentId);
 router.get('/:id', requireAuth, cacheMiddleware(), tournamentController.getTournamentById);

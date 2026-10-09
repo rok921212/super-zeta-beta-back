@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Tournament = require('../models/tournament.model.js');
 const Round = require('../models/round.model');
 const Team = require('../models/teams.model');
@@ -24,10 +25,51 @@ const createTournament = async (req, res) => {
 };
 
 // --- GET ALL TOURNAMENTS (current user only) ---
+// Two shapes, by query:
+//  - no query params  -> the full array, as always (desktop app, Designer
+//    inspector, admin panel).
+//  - search/limit/page/ids -> { tournaments, total, page, pages }, newest
+//    first, same contract as getAllTeams. The website dashboard and Display
+//    HUD load the latest 20 this way and search for anything older, instead
+//    of pulling the user's whole history on every visit.
+//    `ids` (comma list) fetches specific tournaments regardless of age — the
+//    HUD uses it to name a selected/API-live tournament outside the latest 20.
+const TOURNAMENT_LIST_DEFAULT_LIMIT = 20;
+const TOURNAMENT_LIST_MAX_LIMIT = 100;
+const TOURNAMENT_LIST_MAX_IDS = 50;
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 const getTournaments = async (req, res) => {
   try {
-    const tournaments = await Tournament.find({ userId: req.session.userId }).lean();
-    res.json(tournaments);
+    const { search, limit, page, ids } = req.query;
+    const userId = req.session.userId;
+
+    if (search === undefined && limit === undefined && page === undefined && ids === undefined) {
+      const tournaments = await Tournament.find({ userId }).lean();
+      return res.json(tournaments);
+    }
+
+    const filter = { userId };
+    const term = typeof search === 'string' ? search.trim() : '';
+    if (term) filter.tournamentName = { $regex: escapeRegex(term), $options: 'i' };
+    if (typeof ids === 'string') {
+      filter._id = {
+        $in: ids.split(',')
+          .map(id => id.trim())
+          .filter(id => mongoose.Types.ObjectId.isValid(id))
+          .slice(0, TOURNAMENT_LIST_MAX_IDS),
+      };
+    }
+
+    const pageNum = Math.max(parseInt(page) || 1, 1);
+    const limitNum = Math.min(Math.max(parseInt(limit) || TOURNAMENT_LIST_DEFAULT_LIMIT, 1), TOURNAMENT_LIST_MAX_LIMIT);
+
+    // No timestamps on the model — _id order is creation order.
+    const [tournaments, total] = await Promise.all([
+      Tournament.find(filter).sort({ _id: -1 }).skip((pageNum - 1) * limitNum).limit(limitNum).lean(),
+      Tournament.countDocuments(filter),
+    ]);
+    res.json({ tournaments, total, page: pageNum, pages: Math.ceil(total / limitNum) });
   } catch (err) {
     console.error('getTournaments error:', err);
     res.status(500).json({ error: err.message });
