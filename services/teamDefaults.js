@@ -20,12 +20,21 @@ const MEMO_MS = 60 * 1000;
 
 let memo = null; // { at, doc }
 
+// Every flag value that counts as "no real flag" (built-in + current admin
+// default + retired defaults). Refreshed on each settings read so the
+// synchronous realTeamFlag() below can be used from MatchData copy code.
+let defaultFlags = new Set([BUILT_IN.defaultTeamFlag]);
+const rememberDefaultFlags = (doc) => {
+  defaultFlags = new Set([BUILT_IN.defaultTeamFlag, effective(doc).defaultTeamFlag, ...(doc?.retired?.flag || [])].filter(Boolean));
+};
+
 const AppSettings = () => modelFor(getOverlayConnection());
 
 async function loadDoc() {
   if (memo && Date.now() - memo.at < MEMO_MS) return memo.doc;
   const doc = await AppSettings().findOne({ key: SETTINGS_KEY }).lean().maxTimeMS(5000);
   memo = { at: Date.now(), doc: doc || null };
+  rememberDefaultFlags(memo.doc);
   return memo.doc;
 }
 
@@ -70,6 +79,7 @@ async function setTeamDefaults(patch) {
   ).lean();
 
   memo = { at: Date.now(), doc };
+  rememberDefaultFlags(doc);
   return effective(doc);
 }
 
@@ -87,4 +97,12 @@ async function getDefaultsWithRetired() {
   return { current, old };
 }
 
-module.exports = { BUILT_IN, FIELDS, getTeamDefaults, setTeamDefaults, getDefaultsWithRetired };
+// A team's flag as overlays should see it: '' when it is only a default
+// placeholder, so the logo/flag switcher stays on the logo. Await
+// getTeamDefaults() earlier in the same flow to keep the default set warm.
+function realTeamFlag(flag) {
+  const v = typeof flag === 'string' ? flag.trim() : '';
+  return v && !defaultFlags.has(v) ? v : '';
+}
+
+module.exports = { BUILT_IN, FIELDS, getTeamDefaults, setTeamDefaults, getDefaultsWithRetired, realTeamFlag };

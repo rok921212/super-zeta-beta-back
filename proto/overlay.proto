@@ -134,6 +134,7 @@ message Team {
   int32 wwcd = 9;            // overall-tier only
   int32 matchesPlayed = 10;  // overall-tier only
   repeated Player players = 11;
+  optional string teamFlag = 12; // real flag only ('' = none) — logo/flag switcher
 }
 
 // liveMatchUpdate payload. Deliberately has NO deadTeamList field — verified

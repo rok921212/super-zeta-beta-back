@@ -37,6 +37,15 @@ test('themes are numbered 9, 10, 11 per owner; names default to "Theme N"', asyn
   assert.deepEqual(list.json.map((t) => t.number), [9, 10]);
 });
 
+test('a new theme never takes a name another theme already has', async () => {
+  const CAROL = '65f0000000000000000000d4';
+  const a = (await app.call('POST', '/api/custom-themes', { user: CAROL, body: { name: 'Theme 9' } })).json;
+  const b = (await app.call('POST', '/api/custom-themes', { user: CAROL, body: { name: 'theme 9' } })).json;
+  const c = (await app.call('POST', '/api/custom-themes', { user: CAROL, body: {} })).json; // default "Theme 11"
+  assert.deepEqual([a.name, b.name, c.name], ['Theme 9', 'theme 9 (2)', 'Theme 11']);
+  assert.deepEqual([a.number, b.number, c.number], [9, 10, 11]);
+});
+
 test('slots: set, move between themes, replace, clear; validation + ownership', async () => {
   const t1 = (await app.call('POST', '/api/custom-themes', { user: ALICE, body: { name: 'S1' } })).json;
   const t2 = (await app.call('POST', '/api/custom-themes', { user: ALICE, body: { name: 'S2' } })).json;

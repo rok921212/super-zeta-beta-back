@@ -10,6 +10,7 @@
 
 const mongoose = require('mongoose');
 const config = require('../config');
+const { meterMongoCommands } = require('../utils/bwCounters');
 
 const CONNECT_OPTS = {
   serverSelectionTimeoutMS: 10000,
@@ -17,6 +18,9 @@ const CONNECT_OPTS = {
   socketTimeoutMS: 45000,
   bufferTimeoutMS: 30000,
   family: 4,
+  // Render bills Atlas traffic as service-initiated bandwidth.
+  compressors: ['zlib'],
+  monitorCommands: true,
 };
 
 let conn = null;
@@ -43,6 +47,7 @@ async function connectOverlayDb() {
   }
   try {
     await getOverlayConnection().asPromise();
+    meterMongoCommands(getOverlayConnection().getClient());
     console.log(`✅ Overlay MongoDB connected (db ${config.OVERLAY_MONGODB_DB})`);
     return true;
   } catch (err) {

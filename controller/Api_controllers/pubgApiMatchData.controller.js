@@ -22,6 +22,8 @@ const { computeChangedTeams, TRACKED_FIELDS, stripPositionalFields } = require('
 const { getRoundStructureVersion } = require('../../utils/roundStructure');
 const { getPublicRev, bumpRound } = require('../../utils/publicRevision');
 const MatchModel = require('../../models/match.model');
+const { matchDataEpoch, matchSelectionEpoch, rosterEpoch } = require('../../utils/writeEpoch');
+const { monitorEventLoopDelay } = require('perf_hooks');
 
 // ─── In-Memory Live Match Cache ───────────────────────────────────────────────
 const liveMatchCache = new Map();
@@ -65,8 +67,11 @@ function getLiveMatchData(matchId) {
 // forever — no roster photo/name fallback ever available for that team's
 // players, even though the roster data was correct. Fetching every group
 // and merging their slots (see groupSlotByTeamId below) fixes that.
-const GROUP_CACHE_TTL_MS = 5000;
-const groupCache = new Map(); // `${tournamentId}:${userId}` -> { groups, expiresAt }
+// 30s, not 5s: Group/Team writes now invalidate this cache directly through
+// the rosterEpoch model hooks (utils/writeEpoch.js), so the TTL is only a
+// safety net — and every refresh is a populate() round trip per account.
+const GROUP_CACHE_TTL_MS = 30000;
+const groupCache = new Map(); // `${tournamentId}:${userId}` -> { groups, expiresAt, epoch }
 const groupRefreshInFlight = new Set(); // keys currently being refreshed in the background
 
 async function fetchGroups(tournamentId, userId) {
@@ -76,9 +81,10 @@ async function fetchGroups(tournamentId, userId) {
 function refreshGroupInBackground(key, tournamentId, userId) {
   if (groupRefreshInFlight.has(key)) return;
   groupRefreshInFlight.add(key);
+  const epoch = rosterEpoch.snapshot(String(tournamentId));
   fetchGroups(tournamentId, userId)
     .then(groups => {
-      groupCache.set(key, { groups, expiresAt: Date.now() + GROUP_CACHE_TTL_MS });
+      groupCache.set(key, { groups, expiresAt: Date.now() + GROUP_CACHE_TTL_MS, epoch });
     })
     .catch(err => {
       console.warn(`[getGroupsCached] background refresh failed for ${key}:`, err.message);
@@ -92,14 +98,17 @@ async function getGroupsCached(tournamentId, userId) {
   const key = `${tournamentId}:${userId}`;
   const cached = groupCache.get(key);
   if (cached) {
-    if (cached.expiresAt <= Date.now()) {
+    // A roster write since this entry was read refreshes it the same way an
+    // expiry does (stale served once, refetched in the background).
+    if (cached.expiresAt <= Date.now() || !rosterEpoch.isCurrent(String(tournamentId), cached.epoch)) {
       refreshGroupInBackground(key, tournamentId, userId);
     }
     return cached.groups;
   }
   // First call ever for this key — nothing stale to serve, must block.
+  const epoch = rosterEpoch.snapshot(String(tournamentId));
   const groups = await fetchGroups(tournamentId, userId);
-  groupCache.set(key, { groups, expiresAt: Date.now() + GROUP_CACHE_TTL_MS });
+  groupCache.set(key, { groups, expiresAt: Date.now() + GROUP_CACHE_TTL_MS, epoch });
   return groups;
 }
 
@@ -201,6 +210,11 @@ const LIVE_AUTOSAVE_ENABLED = process.env.LIVE_AUTOSAVE === 'true';
 // liveMatchCache as usual).
 const CLOUD_LIVE_DATA_ENABLED = process.env.CLOUD_LIVE_DATA_ENABLED !== 'false';
 
+// Relay-only overlays (see io.on('connection')): refuse direct cloud sockets
+// from overlay pages. Default ON; 'false' lets them connect again.
+const CLOUD_OVERLAY_ENFORCE = process.env.CLOUD_OVERLAY_ENFORCE !== 'false';
+let cloudOverlayRefusedTotal = 0;
+
 // ─── Live-emit observability (Stage 0) ───────────────────────────────────────
 // emitUpdates runs whenever a user is in activeUserKeys (a pure DB
 // condition). These counters make visible how much of that work is spent
@@ -213,18 +227,98 @@ let cloudLiveTicksTotal = 0;
 let cloudLiveTicksSkippedNoConsumers = 0;
 let overallScansTotal = 0;
 let overallScansSkippedNoSubscribers = 0;
+
+// ─── Per-account tick stats (two-account bandwidth investigation) ───────────
+// Spikes only show up with 2+ accounts live at once. These answer "which
+// mechanism scales with the second account": tick duration, how many
+// accounts' ticks overlap, cache hit rates, and how many full snapshots /
+// hydrations / relay resyncs / seq gaps each account caused. Logged as
+// [bw][tick] every 60s and returned by getLiveTickStats() for the admin panel.
+const tickStats = {
+  windowStartedAt: Date.now(),
+  inFlight: 0,
+  maxInFlight: 0,
+  byUser: new Map(), // userId -> counters
+};
+const loopDelay = monitorEventLoopDelay({ resolution: 20 });
+loopDelay.enable();
+function userTickStats(userId) {
+  const key = String(userId);
+  let row = tickStats.byUser.get(key);
+  if (!row) {
+    row = {
+      ticks: 0, durations: [], matchDataHits: 0, matchDataMisses: 0,
+      selectionHits: 0, selectionMisses: 0,
+      snapshotsServed: 0, hydrations: 0, fullSnapshotRequests: 0, relayGaps: 0,
+    };
+    tickStats.byUser.set(key, row);
+  }
+  return row;
+}
+function bumpTickStat(userId, field, n = 1) {
+  if (userId == null) return;
+  userTickStats(userId)[field] += n;
+}
+function percentile(sorted, p) {
+  if (!sorted.length) return 0;
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
+}
+function summarizeTickStats() {
+  const users = {};
+  for (const [uid, r] of tickStats.byUser) {
+    const d = [...r.durations].sort((a, b) => a - b);
+    users[uid] = {
+      ticks: r.ticks, p50ms: percentile(d, 0.5), p95ms: percentile(d, 0.95),
+      matchDataHits: r.matchDataHits, matchDataMisses: r.matchDataMisses,
+      selectionHits: r.selectionHits, selectionMisses: r.selectionMisses,
+      snapshotsServed: r.snapshotsServed, hydrations: r.hydrations,
+      fullSnapshotRequests: r.fullSnapshotRequests, relayGaps: r.relayGaps,
+    };
+  }
+  return {
+    windowStartedAt: new Date(tickStats.windowStartedAt).toISOString(),
+    maxConcurrentTicks: tickStats.maxInFlight,
+    eventLoopDelayP99ms: Math.round(loopDelay.percentile(99) / 1e6),
+    users,
+  };
+}
+let lastTickSummary = null;
+function getLiveTickStats() {
+  return { current: summarizeTickStats(), previousWindow: lastTickSummary };
+}
+
 setInterval(() => {
-  if (!cloudLiveTicksTotal && !overallScansTotal) return;
-  console.log(
-    `[bw][cloud-live] window=60s ticks=${cloudLiveTicksTotal} ` +
-    `skipped_no_consumers=${cloudLiveTicksSkippedNoConsumers} ` +
-    `overall_scans=${overallScansTotal} overall_skipped_no_subs=${overallScansSkippedNoSubscribers} ` +
-    `emit_enabled=${CLOUD_LIVE_DATA_ENABLED}`
-  );
+  if (cloudLiveTicksTotal || overallScansTotal) {
+    console.log(
+      `[bw][cloud-live] window=60s ticks=${cloudLiveTicksTotal} ` +
+      `skipped_no_consumers=${cloudLiveTicksSkippedNoConsumers} ` +
+      `overall_scans=${overallScansTotal} overall_skipped_no_subs=${overallScansSkippedNoSubscribers} ` +
+      `emit_enabled=${CLOUD_LIVE_DATA_ENABLED}`
+    );
+  }
   cloudLiveTicksTotal = 0;
   cloudLiveTicksSkippedNoConsumers = 0;
   overallScansTotal = 0;
   overallScansSkippedNoSubscribers = 0;
+
+  if (tickStats.byUser.size) {
+    const sum = summarizeTickStats();
+    const perUser = Object.entries(sum.users).map(([uid, u]) =>
+      `${uid.slice(-6)}:ticks=${u.ticks},p50=${u.p50ms},p95=${u.p95ms},` +
+      `md=${u.matchDataHits}/${u.matchDataMisses},sel=${u.selectionHits}/${u.selectionMisses},` +
+      `snap=${u.snapshotsServed},hyd=${u.hydrations},fullReq=${u.fullSnapshotRequests},gaps=${u.relayGaps}`
+    ).join(' ');
+    console.log(`[bw][tick] window=60s accounts=${tickStats.byUser.size} maxConcurrent=${sum.maxConcurrentTicks} loopP99=${sum.eventLoopDelayP99ms}ms ${perUser}`);
+    lastTickSummary = sum;
+  }
+  if (cloudOverlayRefusedTotal) {
+    console.log(`[bw][relay-only] window=60s refused_cloud_overlay_sockets=${cloudOverlayRefusedTotal} (old cached overlay builds)`);
+    cloudOverlayRefusedTotal = 0;
+  }
+  tickStats.byUser.clear();
+  tickStats.maxInFlight = tickStats.inFlight;
+  tickStats.windowStartedAt = Date.now();
+  loopDelay.reset();
 }, 60000).unref();
 
 async function processSaveQueue() {
@@ -243,6 +337,8 @@ async function processSaveQueue() {
       })),
       { ordered: false }
     );
+    // bulkWrite fires no per-op schema hooks — invalidate the tick cache here.
+    for (const job of batch) matchDataEpoch.bump(String(job.matchId));
     console.log(c('green', `💾 Bulk-saved ${batch.length} job(s)`));
 
     // Persisted teams changed -> the public bulk body for each affected round
@@ -517,6 +613,15 @@ const relayStateByUser = new Map(); // userId -> { socketId, lastReceivedSeq, pl
 // liveMatchCache entry, cleared on authoritative-socket disconnect.
 // Independent of LIVE_AUTOSAVE_ENABLED.
 const relayReconnectArmed = new Set(); // Set<String(user._id)>
+
+// Last one-shot reconnect save per cacheKey: { hash, at }. A flapping relay
+// re-arms on every reconnect; each save uploads the full teams array to Atlas
+// and bumpRound rebuilds every overlay's /bulk — both billed by Render as
+// service-initiated bandwidth. Skip when the teams are unchanged since the
+// last reconnect save, or that save was under RECONNECT_SAVE_MIN_GAP_MS ago.
+// The manual SAVE DATA button is not affected.
+const lastReconnectSaveByUserMatch = new Map();
+const RECONNECT_SAVE_MIN_GAP_MS = 30000;
 
 // Mirrors fetcher.rs's player_key(): prefer uId, fall back to playerName.
 function playerKeyOf(p) {
@@ -823,6 +928,7 @@ async function hydrateRoundSocket(io, socket, tournamentId, roundId, { positiona
       return;
     }
     socket.data.hydratedMatches.add(hydrateKey);
+    bumpTickStat(selection.userId, force ? 'snapshotsServed' : 'hydrations');
 
     const seq = currentLiveSeq(cacheKey);
     if (asSnapshot) {
@@ -880,6 +986,7 @@ function evictLiveMatchKey(cacheKey) {
   liveSeqByUserMatch.delete(cacheKey);
   lastKeyframeAtByUserMatch.delete(cacheKey);
   lastKeyframeHashByUserMatch.delete(cacheKey);
+  lastReconnectSaveByUserMatch.delete(cacheKey);
 }
 
 // socket.id -> userId, so disconnect can clean up the right entries
@@ -926,6 +1033,19 @@ function startLiveMatchUpdater() {
   // ── Receive live player data pushed from each user's local relay ───────────
   io.on('connection', (socket) => {
     wsAccounting.track(socket);
+
+    // Relay-only overlays: a current overlay page never connects here — it
+    // goes through the desktop app's local relay (client=relay), which holds
+    // the one upstream socket. A `client=overlay` socket is an old cached
+    // overlay build that fell back to the cloud (one full feed per OBS
+    // source). Refused before any room join or hydration.
+    // CLOUD_OVERLAY_ENFORCE=false restores the old behaviour.
+    if (CLOUD_OVERLAY_ENFORCE && socket.handshake.query?.client === 'overlay') {
+      cloudOverlayRefusedTotal++;
+      socket.emit('cloudOverlayRefused', { reason: 'relayOnly' });
+      socket.disconnect(true);
+      return;
+    }
     console.log(c('dim', `[socket] client connected: ${socket.id} transport=${socket.conn.transport.name}${socket.recovered ? ' (recovered)' : ''}`));
 
     // connectionStateRecovery (socket.js): on a resumed session, rooms and
@@ -1008,7 +1128,7 @@ function startLiveMatchUpdater() {
       // when `notVolatile`), and every liveMatchUpdate delta on this room is
       // volatile — so a recovered socket has silently lost every delta sent
       // while it was down and needs this full baseline just as much.
-      {
+      const replayUserHydration = () => {
         const uidStr = String(sessionUserId);
         const now = Date.now();
         for (const [cacheKey, fullMatch] of liveMatchCache) {
@@ -1022,7 +1142,22 @@ function startLiveMatchUpdater() {
           socket.emit('liveMatchUpdate', encodeMsgpack({ ...fullMatch, teams: stripPositionalFields(fullMatch.teams), matchId: hydratedMatchId, seq: currentLiveSeq(cacheKey) }));
           console.log(c('dim', `[socket] user-room hydration -> ${socket.id} cacheKey=${cacheKey}`));
         }
-      }
+      };
+      replayUserHydration();
+
+      // Dashboard feed gate: a dashboard tab only needs the user:<id>
+      // liveMatchUpdate stream while the match-data page is open and visible
+      // (front socketManager.tsx acquireUserFeed). `setUserFeed {on:false}`
+      // drops this socket from that stream (dataHeartbeat still flows);
+      // turning it back on replays the full baseline above so the page
+      // resumes from correct data. A client that never sends it (old
+      // builds, the desktop hub) keeps receiving the feed as before.
+      socket.on('setUserFeed', ({ on } = {}) => {
+        const wasOn = socket.data.userFeed !== false;
+        socket.data.userFeed = on !== false;
+        if (socket.data.userFeed && !wasOn) replayUserHydration();
+        console.log(c('dim', `[socket] user feed ${socket.data.userFeed ? 'ON' : 'OFF'} for ${socket.id}`));
+      });
     }
 
     // Each relay identifies which user it belongs to before pushing data.
@@ -1338,6 +1473,8 @@ socket.on('relayPing', (cb) => {
           console.warn(
             c('yellow', `[socket] totalPlayerList GAP user=${userId}: expected wireSeq ${expected}, got ${wireSeq} — requesting resync`)
           );
+          bumpTickStat(userId, 'relayGaps');
+          bumpTickStat(userId, 'fullSnapshotRequests');
           socket.emit('requestFullSnapshot');
           // Still merge what DID arrive below — don't discard useful
           // partial data while the resync is in flight.
@@ -1622,32 +1759,84 @@ socket.on('relayPing', (cb) => {
       return;
     }
     userProcessing.set(userId, false);
+    tickStats.inFlight++;
+    if (tickStats.inFlight > tickStats.maxInFlight) tickStats.maxInFlight = tickStats.inFlight;
     try {
       do {
         userProcessing.set(userId, false);
         const startedAt = Date.now();
         const hadChanges = await pollForUser(userId);
         const elapsed = Date.now() - startedAt;
+        const row = userTickStats(userId);
+        row.ticks++;
+        if (row.durations.length < 600) row.durations.push(elapsed);
         console.debug(`[trigger] pollForUser(${userId}) done in ${elapsed}ms hadChanges=${hadChanges}`);
         if (elapsed > SLOW_POLL_THRESHOLD_MS) {
           console.warn(`[perf] pollForUser(${userId}) took ${elapsed}ms`);
         }
       } while (userProcessing.get(userId));
     } finally {
+      tickStats.inFlight--;
       userProcessing.delete(userId);
     }
   }
 
+  // ─── Per-tick MatchData read cache ──────────────────────────────────────────
+  // Every ~2s tick used to re-read the FULL MatchData doc from Atlas, per
+  // account — with LIVE_AUTOSAVE off that doc only changes on SAVE DATA or an
+  // operator edit. The lean doc is now kept in memory and invalidated by the
+  // MatchData schema write hooks (matchDataEpoch, utils/writeEpoch.js), with a
+  // TTL as a safety net. Each tick gets its OWN shallow copy: the code below
+  // mutates team.rank/placePoints/players and identity fields, and
+  // lastMatchDataByUserMatch keeps the previous tick's object as the baseline
+  // for computeChangedTeams — sharing one object would make every diff empty.
+  // MATCHDATA_TICK_CACHE=false restores the per-tick read.
+  const MATCHDATA_TICK_CACHE_ENABLED = process.env.MATCHDATA_TICK_CACHE !== 'false';
+  const MATCHDATA_TICK_CACHE_TTL_MS = 60000;
+  const matchDataBaseCache = new Map(); // `${userId}:${matchId}` -> { doc, epoch, at }
+
+  const cloneMatchDataForTick = (doc) => ({
+    ...doc,
+    teams: (doc.teams || []).map((t) => ({ ...t })),
+  });
+
+  const loadMatchDataForTick = async (matchId, userId) => {
+    const key = `${String(userId)}:${String(matchId)}`;
+    if (MATCHDATA_TICK_CACHE_ENABLED) {
+      const hit = matchDataBaseCache.get(key);
+      if (hit && Date.now() - hit.at < MATCHDATA_TICK_CACHE_TTL_MS &&
+          matchDataEpoch.isCurrent(String(matchId), hit.epoch)) {
+        bumpTickStat(userId, 'matchDataHits');
+        return { doc: cloneMatchDataForTick(hit.doc), base: hit.doc };
+      }
+    }
+    bumpTickStat(userId, 'matchDataMisses');
+    const epoch = matchDataEpoch.snapshot(String(matchId));
+    const doc = await MatchData.findOne({ matchId, userId }).lean();
+    if (!doc) {
+      matchDataBaseCache.delete(key);
+      return { doc: null, base: null };
+    }
+    if (!MATCHDATA_TICK_CACHE_ENABLED) return { doc, base: null };
+    matchDataBaseCache.set(key, { doc, epoch, at: Date.now() });
+    return { doc: cloneMatchDataForTick(doc), base: doc };
+  };
+
   // ─── Core Match Update ──────────────────────────────────────────────────────
-  const updateMatchDataWithLiveStats = async (matchId, userId, apiPlayers, apiPlayersAt) => {
-    // These two queries don't depend on each other — run in parallel.
-    // Both .lean() — matchData is never saved directly here (writes go
+  // `selection` (optional): the MatchSelection row pollForUser already read
+  // for this match — its tournamentId saves a second per-tick query.
+  const updateMatchDataWithLiveStats = async (matchId, userId, apiPlayers, apiPlayersAt, selection = null) => {
+    // These two reads don't depend on each other — run in parallel.
+    // Both lean — matchData is never saved directly here (writes go
     // through the bulkWrite saveQueue below), so the Mongoose document
     // hydration/change-tracking overhead was paid every ~2s tick for
     // nothing; team mutations below just operate on the plain object.
-    const [matchData, selectedMatch] = await Promise.all([
-      MatchData.findOne({ matchId, userId }).lean(),
-      MatchSelection.findOne({ matchId, isSelected: true, userId }).lean(),
+    const [{ doc: matchData, base: matchDataBase }, selectedMatch] = await Promise.all([
+      loadMatchDataForTick(matchId, userId),
+      selection?.tournamentId
+        ? selection
+        // Only tournamentId is read from the selection.
+        : MatchSelection.findOne({ matchId, isSelected: true, userId }, { tournamentId: 1 }).lean(),
     ]);
 
     if (!matchData) {
@@ -1892,6 +2081,9 @@ socket.on('relayPing', (cb) => {
         console.error(`[updateTeamsWithApiPlayers] user ${userId} match ${matchId}:`, err.message)
       );
       matchData.rosterSynced = true;
+      // Also on the cached base: a tick that hits the cache before the
+      // updateOne below lands (and bumps matchDataEpoch) must not re-sync.
+      if (matchDataBase) matchDataBase.rosterSynced = true;
       MatchData.updateOne({ matchId, userId }, { $set: { rosterSynced: true } }).catch(err =>
         console.error(`[rosterSynced] user ${userId} match ${matchId}:`, err.message)
       );
@@ -1940,6 +2132,36 @@ socket.on('relayPing', (cb) => {
     return { data: updatedObject, changed: true, unmatchedChanged: unmatchedSetChanged };
   };
 
+  // ─── Per-tick selection cache ───────────────────────────────────────────────
+  // The account's selected+API-enabled MatchSelections, re-read only when a
+  // MatchSelection write touched this account (matchSelectionEpoch hooks),
+  // the API-enabled round set changed, or the safety TTL ran out. Same
+  // MATCHDATA_TICK_CACHE kill switch as the MatchData cache.
+  const SELECTION_TICK_CACHE_TTL_MS = 15000;
+  const selectionCache = new Map(); // userKey -> { rows, roundSig, epoch, at }
+
+  const loadSelectionsForTick = async (userKey, dbUserId, roundIds) => {
+    const key = String(userKey);
+    const roundSig = roundIds.join(',');
+    if (MATCHDATA_TICK_CACHE_ENABLED) {
+      const hit = selectionCache.get(key);
+      if (hit && hit.roundSig === roundSig && Date.now() - hit.at < SELECTION_TICK_CACHE_TTL_MS &&
+          matchSelectionEpoch.isCurrent(key, hit.epoch)) {
+        bumpTickStat(key, 'selectionHits');
+        return hit.rows;
+      }
+    }
+    bumpTickStat(key, 'selectionMisses');
+    const epoch = matchSelectionEpoch.snapshot(key);
+    const rows = await MatchSelection.find({
+      isSelected: true,
+      userId:     dbUserId,
+      roundId:    { $in: roundIds }
+    }, { matchId: 1, roundId: 1, tournamentId: 1, userId: 1, isPollingActive: 1 }).lean();
+    if (MATCHDATA_TICK_CACHE_ENABLED) selectionCache.set(key, { rows, roundSig, epoch, at: Date.now() });
+    return rows;
+  };
+
   // ─── Per-User Update Pass ───────────────────────────────────────────────────
   const pollForUser = async (userKey) => {
     if (!userKey) return false;
@@ -1958,11 +2180,7 @@ socket.on('relayPing', (cb) => {
         return false;
       }
 
-      const selectedMatches = await MatchSelection.find({
-        isSelected: true,
-        userId:     dbUserId,
-        roundId:    { $in: roundIds }
-      }).lean();
+      const selectedMatches = await loadSelectionsForTick(userKey, dbUserId, roundIds);
 
       if (!selectedMatches.length) {
         console.warn(`[pollForUser] user=${userKey} skipped — no selected+API-enabled MatchSelection found (roundIds=${roundIds.length})`);
@@ -1982,7 +2200,7 @@ socket.on('relayPing', (cb) => {
           return;
         }
 
-        const result = await updateMatchDataWithLiveStats(selected.matchId, selUserId, apiPlayers, apiPlayersAt);
+        const result = await updateMatchDataWithLiveStats(selected.matchId, selUserId, apiPlayers, apiPlayersAt, selected);
         if (!result) return;
 
         const { data: updatedMatchData, changed } = result;
@@ -2012,22 +2230,32 @@ socket.on('relayPing', (cb) => {
         // from double-saving.
         if (relayReconnectArmed.has(String(userKey)) && liveMatchCache.has(cacheKey)) {
           relayReconnectArmed.delete(String(userKey));
-          saveLiveMatchSnapshot({ matchId: selected.matchId, userId: selUserId })
-            .then(r => {
-              console.log(c('cyan', `[relay-reconnect] one-shot save ${cacheKey} -> ${JSON.stringify(r)}`));
-              if (r && r.saved) {
-                let io = null;
-                try { io = getSocket(); } catch { /* socket not ready */ }
-                bumpRound(io, {
-                  tournamentId: selected.tournamentId,
-                  roundId: selected.roundId,
-                  matchId: selected.matchId,
-                  reason: 'relayReconnectSave',
-                  scope: 'round',
-                });
-              }
-            })
-            .catch(err => console.error(`[relay-reconnect] one-shot save ${cacheKey} failed:`, err.message));
+          const teamsHash = crypto.createHash('sha1').update(JSON.stringify(memoryMatch.teams)).digest('base64');
+          const prevSave = lastReconnectSaveByUserMatch.get(cacheKey);
+          if (prevSave && (prevSave.hash === teamsHash || Date.now() - prevSave.at < RECONNECT_SAVE_MIN_GAP_MS)) {
+            console.log(c('cyan', `[relay-reconnect] one-shot save ${cacheKey} skipped (${prevSave.hash === teamsHash ? 'unchanged' : 'recent'})`));
+          } else {
+            lastReconnectSaveByUserMatch.set(cacheKey, { hash: teamsHash, at: Date.now() });
+            saveLiveMatchSnapshot({ matchId: selected.matchId, userId: selUserId })
+              .then(r => {
+                console.log(c('cyan', `[relay-reconnect] one-shot save ${cacheKey} -> ${JSON.stringify(r)}`));
+                if (r && r.saved) {
+                  let io = null;
+                  try { io = getSocket(); } catch { /* socket not ready */ }
+                  bumpRound(io, {
+                    tournamentId: selected.tournamentId,
+                    roundId: selected.roundId,
+                    matchId: selected.matchId,
+                    reason: 'relayReconnectSave',
+                    scope: 'round',
+                  });
+                }
+              })
+              .catch(err => {
+                lastReconnectSaveByUserMatch.delete(cacheKey);
+                console.error(`[relay-reconnect] one-shot save ${cacheKey} failed:`, err.message);
+              });
+          }
         }
 
         const lastData    = lastMatchDataByUserMatch[cacheKey];
@@ -2167,11 +2395,16 @@ socket.on('relayPing', (cb) => {
           // just won't replay the per-tick deltas it wasn't present for.
           const userRoomIds = io.sockets.adapter.rooms.get(userRoom);
           const userTargets = [];
+          // Subset of userTargets that wants the liveMatchUpdate stream —
+          // a dashboard tab that sent setUserFeed {on:false} (match page
+          // closed or tab hidden) only gets the tiny dataHeartbeat.
+          const feedTargets = [];
           if (userRoomIds) {
             for (const id of userRoomIds) {
               const s = io.sockets.sockets.get(id);
               if (!s || s.data?.userId) continue;
               userTargets.push(id);
+              if (s.data?.userFeed !== false) feedTargets.push(id);
             }
           }
           const matchDataSize = roomSize(io, matchDataRoom);
@@ -2209,7 +2442,7 @@ socket.on('relayPing', (cb) => {
               at: Date.now(),
             });
 
-            if (changedTeams.length > 0) {
+            if (changedTeams.length > 0 && feedTargets.length > 0) {
               // location stripped: no user:-room consumer renders player
               // position off THIS feed — ObservingPlayer.tsx and both
               // (desktop + front) matchDataController.tsx read position from
@@ -2217,12 +2450,12 @@ socket.on('relayPing', (cb) => {
               // (no client decode change); clients merge a partial teams[]
               // by id, so an absent field just keeps its last-known value.
               const encoded = encodeMsgpack({ ...memoryMatch, teams: stripPositionalFields(changedTeams), matchId: String(selected.matchId), seq });
-              console.log(`[bw][emit] liveMatchUpdate (delta) -> ${userRoom}: sockets=${userTargets.length} teams=${changedTeams.length}/${memoryMatch.teams.length} bytes=${encoded.length}`);
-              io.to(userTargets).volatile.emit('liveMatchUpdate', encoded);
+              console.log(`[bw][emit] liveMatchUpdate (delta) -> ${userRoom}: sockets=${feedTargets.length}/${userTargets.length} teams=${changedTeams.length}/${memoryMatch.teams.length} bytes=${encoded.length}`);
+              io.to(feedTargets).volatile.emit('liveMatchUpdate', encoded);
               // Count this fan-out into [bw][rollup]'s ws_fanout — this
               // direct emit bypasses emitToRoomSplitByFormat, so it was
               // previously invisible there (a ~10x under-report).
-              addWsFanout(encoded.length * userTargets.length);
+              addWsFanout(encoded.length * feedTargets.length);
             }
           }
 
@@ -2386,6 +2619,14 @@ socket.on('relayPing', (cb) => {
       if (evicted) {
         console.log(`[bw][cache-sweep] evicted ${evicted} stale liveMatchCache entr${evicted === 1 ? 'y' : 'ies'}; ${liveMatchCache.size} remain`);
       }
+      // Tick read caches: drop entries past their TTL (finished matches,
+      // accounts that went idle) so they don't sit in memory.
+      for (const [key, entry] of matchDataBaseCache) {
+        if (now - entry.at >= MATCHDATA_TICK_CACHE_TTL_MS) matchDataBaseCache.delete(key);
+      }
+      for (const [key, entry] of selectionCache) {
+        if (now - entry.at >= SELECTION_TICK_CACHE_TTL_MS) selectionCache.delete(key);
+      }
     } catch (e) {
       console.error('[discovery] Error:', e);
     }
@@ -2410,4 +2651,4 @@ socket.on('relayPing', (cb) => {
   setInterval(discoverAndStartPollingUsers, 60000);
 }
 
-module.exports = { startLiveMatchUpdater, getUnmatchedPlayers, markUserActiveForPolling, markUserInactiveForPolling, saveLiveMatchSnapshot, getLiveMatchData };
+module.exports = { startLiveMatchUpdater, getUnmatchedPlayers, markUserActiveForPolling, markUserInactiveForPolling, saveLiveMatchSnapshot, getLiveMatchData, getLiveTickStats };

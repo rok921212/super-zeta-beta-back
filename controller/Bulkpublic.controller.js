@@ -276,6 +276,7 @@ function slimMatchDataForList(matchData, view) {
       teamName: team.teamName,
       teamTag: team.teamTag,
       teamLogo: team.teamLogo,
+      teamFlag: team.teamFlag,
       slot: team.slot,
       placePoints: team.placePoints,
       players: (team.players || []).map(p => {
@@ -441,6 +442,7 @@ function updateDeadTeamList(matchId, matchData) {
         teamTag: team.teamTag,
         teamName: team.teamName,
         teamLogo: team.teamLogo,
+        teamFlag: team.teamFlag,
         placePoints: team.placePoints,
         rank: state.rankAt.get(teamKey) ?? null,
         totalKills: (team.players || []).reduce((sum, p) => sum + (p.killNum || 0), 0),
@@ -489,10 +491,30 @@ async function getMatchDataBatch(matches) {
   if (!matches.length) return map;
 
   const matchIds = matches.map(m => m._id);
-  const allMatchDatas = await MatchData.find({ matchId: { $in: matchIds } }).lean();
+  // Two steps: ids first, then only the one doc per match that is used.
+  // Many matches have 2-6 MatchData docs for the same {matchId, userId}
+  // (~60 KB each), and the cluster serves ~100 KB/s, so downloading every
+  // candidate made a cold /bulk take 6-13 s. The pick is the same as before:
+  // both queries walk the matchId_userId index in the same order, and the
+  // first candidate is the one the live writers' updateOne({matchId,userId})
+  // keeps updating.
+  const heads = await MatchData.find({ matchId: { $in: matchIds } }).select('_id matchId userId').lean();
+  const headsByMatch = new Map(); // matchId string -> heads[]
+  for (const h of heads) {
+    const key = h.matchId.toString();
+    if (!headsByMatch.has(key)) headsByMatch.set(key, []);
+    headsByMatch.get(key).push(h);
+  }
+  const chosenIds = [];
+  for (const m of matches) {
+    const candidates = headsByMatch.get(m._id.toString()) || [];
+    const pick = candidates.find(h => String(h.userId) === String(m.userId)) || candidates[0];
+    if (pick) chosenIds.push(pick._id);
+  }
+  const chosen = chosenIds.length ? await MatchData.find({ _id: { $in: chosenIds } }).lean() : [];
 
-  const byMatchId = new Map(); // matchId string -> MatchData[]
-  for (const md of allMatchDatas) {
+  const byMatchId = new Map(); // matchId string -> MatchData[] (one each)
+  for (const md of chosen) {
     const key = md.matchId.toString();
     if (!byMatchId.has(key)) byMatchId.set(key, []);
     byMatchId.get(key).push(md);

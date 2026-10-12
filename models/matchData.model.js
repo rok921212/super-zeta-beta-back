@@ -79,6 +79,7 @@ const teamMatchDataSchema = new Schema({
   teamName: { type: String, default: '' },
     teamTag: { type: String, default: '' }, // <-- add this line
     teamLogo: { type: String, default: '' }, // <-- add this line
+    teamFlag: { type: String, default: '' }, // real flag only ('' = default placeholder)
   slot: { type: Number, required: true }, // ✅ slot from Group
   placePoints: { type: Number, default: 0, min: 0 },
   // Real computed placement (1 = winner), persisted alongside placePoints
@@ -125,5 +126,10 @@ const matchDataSchema = new Schema({
   // tracked in memory.
   rosterSynced: { type: Boolean, default: false }
 });
+
+// Invalidates the live tick's in-process MatchData read cache on every write
+// (see utils/writeEpoch.js and pubgApiMatchData.controller.js).
+const { attachWriteEpochHooks, matchDataEpoch } = require("../utils/writeEpoch");
+attachWriteEpochHooks(matchDataSchema, matchDataEpoch, "matchId");
 
 module.exports = mongoose.model('MatchData', matchDataSchema);

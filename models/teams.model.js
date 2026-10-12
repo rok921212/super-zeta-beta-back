@@ -23,4 +23,8 @@ TeamSchema.index({ teamFullName: 1 });
 TeamSchema.index({ hiddenBy: 1 });
 TeamSchema.index({ createdAt: -1 });
 
+// Team edits change roster names/photos the live tick reads via populated groups.
+const { attachWriteEpochHooks, rosterEpoch } = require("../utils/writeEpoch");
+attachWriteEpochHooks(TeamSchema, rosterEpoch, "tournamentId");
+
 module.exports = mongoose.model('Team', TeamSchema);

@@ -529,7 +529,7 @@ const updateTeam = async (req, res) => {
     // never re-reads from Team afterwards. Re-run the same reconciliation a
     // Group-slot resave already triggers so a rename/logo change here shows
     // up in already-created matches too, instead of only in future ones.
-    if (setOps.teamFullName || setOps.teamTag || setOps.logo !== undefined) {
+    if (setOps.teamFullName || setOps.teamTag || setOps.logo !== undefined || setOps.teamFlag !== undefined) {
       Group.find({ 'slots.team': updatedTeam._id }).select('_id').lean()
         .then(groups => Promise.all(groups.map(g => syncMatchDataTeamsForGroup(g._id))))
         .catch(err => console.error(`[TEAMS] Failed to sync MatchData after team update id=${req.params.id}:`, err.message));

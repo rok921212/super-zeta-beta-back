@@ -15,6 +15,7 @@ const { toProtoMatchDataPayload, toProtoOverallDataPayload } = require('../utils
 const { stripPositionalFields } = require('../utils/matchTeamDiff');
 const { bumpRound } = require('../utils/publicRevision');
 const { notifyRoundStructureChanged } = require('../utils/roundStructure');
+const { getTeamDefaults, realTeamFlag } = require('../services/teamDefaults');
 
 // ─── Shared player-template builder ───────────────────────────────────────────
 // Was previously copy-pasted 3x (create / replace / add) with small drifts
@@ -184,6 +185,7 @@ const createMatchDataForMatchDoc = async (matchOrId) => {
     }).lean();
 
     if (!match) throw new Error('Match not found');
+    await getTeamDefaults(); // warms realTeamFlag's default-flag set
 
     let teams = (match.groups || []).flatMap(group =>
       (group.slots || [])
@@ -192,6 +194,7 @@ const createMatchDataForMatchDoc = async (matchOrId) => {
           slot: slot.slot,
           teamId: slot.team._id,
           teamLogo: slot.team.logo || '',
+          teamFlag: realTeamFlag(slot.team.teamFlag),
           teamName: slot.team.teamFullName || slot.team.teamName || '',
           teamTag: slot.team.teamTag || '',
           players: (slot.team.players || []).slice(0, 4)
@@ -223,6 +226,7 @@ function buildSlotTeam(slot) {
     slot: slot.slot,
     teamId: slot.team._id,
     teamLogo: slot.team.logo || '',
+    teamFlag: realTeamFlag(slot.team.teamFlag),
     teamName,
     teamTag: slot.team.teamTag || '',
     players: (slot.team.players || []).slice(0, 4)
@@ -299,12 +303,14 @@ function refreshTeamMetadata(existing, slot, { keepSlot = false } = {}) {
   const teamName = slot.team.teamFullName || slot.team.teamName || '';
   const teamTag = slot.team.teamTag || '';
   const teamLogo = slot.team.logo || '';
+  const teamFlag = realTeamFlag(slot.team.teamFlag);
   const fieldChanges = {};
   let changed = false;
   if (!keepSlot && existing.slot !== slot.slot) { existing.slot = slot.slot; changed = true; }
   if (existing.teamName !== teamName) { existing.teamName = teamName; changed = true; fieldChanges.teamName = teamName; }
   if (existing.teamTag !== teamTag) { existing.teamTag = teamTag; changed = true; fieldChanges.teamTag = teamTag; }
   if (existing.teamLogo !== teamLogo) { existing.teamLogo = teamLogo; changed = true; fieldChanges.teamLogo = teamLogo; }
+  if ((existing.teamFlag || '') !== teamFlag) { existing.teamFlag = teamFlag; changed = true; fieldChanges.teamFlag = teamFlag; }
   return { changed, fieldChanges };
 }
 
@@ -366,6 +372,7 @@ const syncMatchDataTeamsForGroup = async (groupId) => {
       populate: { path: 'players' },
     }).lean();
     if (!group) return;
+    await getTeamDefaults(); // warms realTeamFlag's default-flag set
 
     // Each match's groups (team ids only) so a slot-swap is only ever
     // resolved against a team that doesn't belong to another group.
@@ -436,8 +443,8 @@ const syncMatchDataTeamsForGroup = async (groupId) => {
           matchData.teams.push(fresh);
         }
         changed = true;
-        const { teamName, teamTag, teamLogo, players } = fresh;
-        changedTeams.push({ teamId: slot.team._id, changes: { teamName, teamTag, teamLogo, players } });
+        const { teamName, teamTag, teamLogo, teamFlag, players } = fresh;
+        changedTeams.push({ teamId: slot.team._id, changes: { teamName, teamTag, teamLogo, teamFlag, players } });
       }
 
       if (changed) {
@@ -465,6 +472,7 @@ const syncMatchDataTeamsForMatch = async (matchId, { reason = 'syncMatch', force
     populate: { path: 'slots.team', populate: { path: 'players' } },
   }).lean();
   if (!match) return { added: 0, deduped: 0 };
+  await getTeamDefaults(); // warms realTeamFlag's default-flag set
 
   const matchData = await MatchData.findOne({ matchId: match._id });
   if (!matchData) {
@@ -535,8 +543,8 @@ const syncMatchDataTeamsForMatch = async (matchId, { reason = 'syncMatch', force
       added++;
       changed = true;
       console.log(`[syncMatch] match=${match._id} re-added team ${fresh.teamName} (slot ${fresh.slot}, group ${group.groupName || group._id})${recovered ? ` with recovered placePoints=${recovered.placePoints}` : ''}`);
-      const { teamName, teamTag, teamLogo, players } = fresh;
-      changedTeams.push({ teamId: slot.team._id, changes: { teamName, teamTag, teamLogo, players } });
+      const { teamName, teamTag, teamLogo, teamFlag, players } = fresh;
+      changedTeams.push({ teamId: slot.team._id, changes: { teamName, teamTag, teamLogo, teamFlag, players } });
     }
   }
 

@@ -28,6 +28,11 @@ const plain = (t) => t && ({
 
 function createMongoThemeStore({ connection } = {}) {
   const CustomTheme = require('../models/customTheme.model.js').modelFor(connection || mongoose.connection);
+  // The unique (ownerId, number) index is what stops two concurrent creates both taking
+  // "Theme 9". Build it now and say so loudly if it cannot be built (duplicates already stored).
+  CustomTheme.init()
+    .then(() => console.log('[custom-theme] indexes ready'))
+    .catch((err) => console.error('[custom-theme] UNIQUE (ownerId, number) INDEX MISSING — duplicate theme numbers are possible:', err.message));
   const opts = { new: true, lean: true };
   return {
     list: async (ownerId) => (await CustomTheme.find({ ownerId }).sort({ number: 1 }).lean()).map(plain),

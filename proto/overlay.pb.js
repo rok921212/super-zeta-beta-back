@@ -1834,6 +1834,7 @@ $root.overlay = (function() {
          * @property {number|null} [wwcd] Team wwcd
          * @property {number|null} [matchesPlayed] Team matchesPlayed
          * @property {Array.<overlay.Player.$Properties>|null} [players] Team players
+         * @property {string|null} [teamFlag] Team teamFlag
          * @property {Array.<Uint8Array>} [$unknowns] Unknown fields preserved while decoding when enabled
          */
 
@@ -1954,6 +1955,14 @@ $root.overlay = (function() {
          */
         Team.prototype.players = $util.emptyArray;
 
+        /**
+         * Team teamFlag.
+         * @member {string|null|undefined} teamFlag
+         * @memberof overlay.Team
+         * @instance
+         */
+        Team.prototype.teamFlag = null;
+
         // OneOf field names bound to virtual getters and setters
         var $oneOfFields;
 
@@ -1972,6 +1981,12 @@ $root.overlay = (function() {
         // Virtual OneOf for proto3 optional field
         $Object.defineProperty(Team.prototype, "_teamLogo", {
             get: $util.oneOfGetter($oneOfFields = ["teamLogo"]),
+            set: $util.oneOfSetter($oneOfFields)
+        });
+
+        // Virtual OneOf for proto3 optional field
+        $Object.defineProperty(Team.prototype, "_teamFlag", {
+            get: $util.oneOfGetter($oneOfFields = ["teamFlag"]),
             set: $util.oneOfSetter($oneOfFields)
         });
 
@@ -2030,6 +2045,8 @@ $root.overlay = (function() {
             if (message.players != null && message.players.length)
                 for (var i = 0; i < message.players.length; ++i)
                     $root.overlay.Player.encode(message.players[i], writer.uint32(/* id 11, wireType 2 =*/90).fork(), _depth + 1).ldelim();
+            if (message.teamFlag != null && $Object.hasOwnProperty.call(message, "teamFlag"))
+                writer.uint32(/* id 12, wireType 2 =*/98).string(message.teamFlag);
             if (message.$unknowns != null && $Object.hasOwnProperty.call(message, "$unknowns"))
                 for (var i = 0; i < message.$unknowns.length; ++i)
                     writer.raw(message.$unknowns[i]);
@@ -2169,6 +2186,13 @@ $root.overlay = (function() {
                         message.players.push($root.overlay.Player.decode(reader, reader.uint32(), $undefined, _depth + 1));
                         continue;
                     }
+                case 12: {
+                        if (wireType !== 2)
+                            break;
+                        message.teamFlag = reader.stringVerify();
+                        message._teamFlag = "teamFlag";
+                        continue;
+                    }
                 }
                 reader.skipType(wireType, _depth, tag);
                 if (!reader.discardUnknown) {
@@ -2258,6 +2282,11 @@ $root.overlay = (function() {
                         return "players." + error;
                 }
             }
+            if (message.teamFlag != null && $Object.hasOwnProperty.call(message, "teamFlag")) {
+                properties._teamFlag = 1;
+                if (!$util.isString(message.teamFlag))
+                    return "teamFlag: string expected";
+            }
             return null;
         };
 
@@ -2316,6 +2345,8 @@ $root.overlay = (function() {
                     message.players[i] = $root.overlay.Player.fromObject(object.players[i], _depth + 1);
                 }
             }
+            if (object.teamFlag != null)
+                message.teamFlag = $String(object.teamFlag);
             return message;
         };
 
@@ -2372,6 +2403,8 @@ $root.overlay = (function() {
                 for (var j = 0; j < message.players.length; ++j)
                     object.players[j] = $root.overlay.Player.toObject(message.players[j], options, _depth + 1);
             }
+            if (message.teamFlag != null && $Object.hasOwnProperty.call(message, "teamFlag"))
+                object.teamFlag = message.teamFlag;
             return object;
         };
 

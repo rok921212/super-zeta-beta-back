@@ -524,6 +524,9 @@ export namespace overlay {
         /** Team players. */
         players: overlay.Player.$Properties[];
 
+        /** Team teamFlag. */
+        teamFlag?: (string|null);
+
         /**
          * Creates a new Team instance using the specified properties.
          * @param [properties] Properties to set
@@ -640,6 +643,9 @@ export namespace overlay {
 
             /** Team players */
             players?: (overlay.Player.$Properties[]|null);
+
+            /** Team teamFlag */
+            teamFlag?: (string|null);
 
             /** Unknown fields preserved while decoding when enabled */
             $unknowns?: Uint8Array[];

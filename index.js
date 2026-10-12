@@ -13,6 +13,7 @@ const config = require('./config');
 
 const express = require('express');
 const mongoose = require('mongoose');
+const { meterMongoCommands } = require('./utils/bwCounters');
 const cors = require('cors');
 const compression = require('compression');
 const http = require('http');
@@ -121,18 +122,7 @@ if (isProduction) {
 
 
 
-// --- CONNECT TO REDIS ---
-const { Redis } = require('@upstash/redis');
-const redisClient = new Redis({
-  url: config.UPSTASH_REDIS_REST_URL,
-  token: config.UPSTASH_REDIS_REST_TOKEN
-});
-
-redisClient.ping().then(() => {
-  console.log('✅ Redis connected (new hosted Upstash)');
-}).catch(err => {
-  console.error('❌ Redis connection error:', err.message);
-});
+// Redis (Upstash) is owned by middleware/cache.js — it pings on load.
 
 // --- MIDDLEWARES ---
 // CORS must come first
@@ -575,6 +565,7 @@ app.get('/api/public/tournaments/:tournamentId/rounds/:roundId/overall', cacheMi
             teamName: team.teamName || '',
             teamTag: team.teamTag || '',
             teamLogo: team.teamLogo || '',
+            teamFlag: team.teamFlag || '',
             slot: Number.isFinite(team.slot) ? team.slot : 0,
             placePoints: 0,
             wwcd: 0,
@@ -585,6 +576,7 @@ app.get('/api/public/tournaments/:tournamentId/rounds/:roundId/overall', cacheMi
         if (!aggTeam.teamName && team.teamName) aggTeam.teamName = team.teamName;
         if (!aggTeam.teamTag && team.teamTag) aggTeam.teamTag = team.teamTag;
         if (!aggTeam.teamLogo && team.teamLogo) aggTeam.teamLogo = team.teamLogo;
+        if (!aggTeam.teamFlag && team.teamFlag) aggTeam.teamFlag = team.teamFlag;
         if (Number.isFinite(team.slot)) {
           aggTeam.slot = Math.min(aggTeam.slot || team.slot, team.slot);
         }
@@ -619,6 +611,7 @@ app.get('/api/public/tournaments/:tournamentId/rounds/:roundId/overall', cacheMi
       teamName: t.teamName,
       teamTag: t.teamTag,
       teamLogo: t.teamLogo,
+      teamFlag: t.teamFlag,
       slot: t.slot || 0,
       placePoints: t.placePoints,
       wwcd: t.wwcd,
@@ -672,10 +665,16 @@ async function startServer() {
       connectTimeoutMS: 10000,
       socketTimeoutMS: 45000,
       bufferTimeoutMS: 30000,
-      family: 4
+      family: 4,
+      // Atlas traffic is billed by Render as service-initiated bandwidth;
+      // zlib wire compression is built into the driver (no extra package).
+      compressors: ['zlib'],
+      // Feeds mongo_out on the [bw][rollup] line below.
+      monitorCommands: true
     });
 
     console.log("✅ MongoDB connected");
+    meterMongoCommands(mongoose.connection.getClient());
 
     // Designer overlays' dedicated cluster. Never fatal: the rest of the app
     // must keep running even if the overlay cluster is unreachable.
@@ -699,10 +698,10 @@ async function startServer() {
     // process open during the SIGTERM drain below.
     const { readAndReset } = require('./utils/bwCounters');
     setInterval(() => {
-      const { httpWire, wsFanout } = readAndReset();
-      if (!httpWire && !wsFanout) return;
+      const { httpWire, wsFanout, upstashOut, mongoOut } = readAndReset();
+      if (!httpWire && !wsFanout && !upstashOut && !mongoOut) return;
       console.log(
-        `[bw][rollup] window=60s http_wire=${httpWire} ws_fanout=${wsFanout} ws_wire_est=${Math.round(wsFanout / 3)}`
+        `[bw][rollup] window=60s http_wire=${httpWire} ws_fanout=${wsFanout} ws_wire_est=${Math.round(wsFanout / 3)} upstash_out=${upstashOut} mongo_out=${mongoOut}`
       );
     }, 60000).unref();
 

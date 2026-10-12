@@ -9,6 +9,7 @@
 //   - A layout sits in at most one slot of one theme.
 
 const { sendConditionalJson } = require('../utils/conditionalJson.js');
+const { uniqueThemeName } = require('../utils/themeName.js');
 
 const OBJECT_ID_RE = /^[a-f0-9]{24}$/i;
 const FIRST_NUMBER = 9;
@@ -21,7 +22,7 @@ const VIEW_KEYS = [
   'Champions', '1stRunnerUp', '2ndRunnerUp', 'EventMvp',
   'CommingUpNext', 'highlightPoints', 'slots', 'RosterShowCase', 'PlayerSwitch',
   // Desktop app tools: drawn by the desktop app itself on the local game feed.
-  'DesktopMap', 'DesktopBattleBar', 'DesktopObserving', 'DesktopMapTimer', 'DesktopTeamSlots',
+  'DesktopMap', 'DesktopBattleBar', 'DesktopPlayerKills', 'DesktopObserving', 'DesktopMapTimer', 'DesktopTeamSlots',
 ];
 const isViewKey = (k) => VIEW_KEYS.includes(k) || /^Custom[1-9]$/.test(k);
 
@@ -87,7 +88,10 @@ function createCustomThemeController({ themeStore, layoutStore }) {
       for (let attempt = 0; attempt < 5; attempt++) {
         const number = Math.max(FIRST_NUMBER - 1, await themeStore.maxNumber(ownerId)) + 1;
         try {
-          const theme = await themeStore.create({ ownerId, number, name: body.name ? body.name.trim() : `Theme ${number}` });
+          // A name asked for (template gallery, typed) never repeats one already in use: the
+          // picker shows names only. The default "Theme N" follows the number, which is unique.
+          const name = body.name ? uniqueThemeName(body.name.trim(), await themeStore.list(ownerId)) : `Theme ${number}`;
+          const theme = await themeStore.create({ ownerId, number, name });
           log('created', { themeId: theme._id, userId: ownerId, number });
           return res.status(201).json(await resolve(theme, ownerId));
         } catch (err) {

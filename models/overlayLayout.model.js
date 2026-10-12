@@ -44,6 +44,19 @@ const overlayLayoutSchema = new mongoose.Schema({
   stage: { width: { type: Number, default: null }, height: { type: Number, default: null } },
   // Not indexed on purpose: adding an index would alter a collection that already exists.
   assetIds: { type: [String], default: [] },
+  // Set when the design came from an overlay package (services/overlayPackage.js):
+  // who made it and under what terms — carried along when it is exported again.
+  source: {
+    type: new mongoose.Schema({
+      format: String,
+      version: Number,
+      kind: String,
+      author: { name: { type: String, default: '' }, url: { type: String, default: '' } },
+      license: { type: String, default: '' },
+      importedAt: Date,
+    }, { _id: false }),
+    default: null,
+  },
 }, { timestamps: true, minimize: false });
 
 // Bound per connection: overlays live on their own cluster (db/overlayConnection.js).

@@ -116,8 +116,11 @@ function usedFamilies(draft, into = new Set()) {
     for (const k of Object.keys(v)) {
       const x = v[k];
       if (typeof x === 'string') {
-        if (/family$/i.test(k)) {
-          for (const part of x.split(',')) {
+        const lists = /family$/i.test(k) ? [x] : [];
+        // An HTML + CSS layer names its fonts in its stylesheet (and inline styles).
+        if (k === 'css' || k === 'html') for (const m of x.matchAll(/font-family\s*:\s*([^;}"]+(?:"[^"]*"[^;}"]*)*)/gi)) lists.push(m[1]);
+        for (const list of lists) {
+          for (const part of list.split(',')) {
             const name = part.trim().replace(/^["']|["']$/g, '').trim().toLowerCase();
             if (name) into.add(name);
           }

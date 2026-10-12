@@ -29,6 +29,11 @@ router.get('/me', adminPanel.me);
 // Per-socket / per-event WebSocket egress since boot (utils/wsAccounting.js).
 router.get('/ws-bandwidth', (req, res) => res.json(require('../utils/wsAccounting').report()));
 
+// Per-account live-tick stats (duration, cache hits, snapshots, relay gaps) —
+// current 60s window + the previous one. See getLiveTickStats.
+router.get('/live-ticks', (req, res) =>
+  res.json(require('../controller/Api_controllers/pubgApiMatchData.controller').getLiveTickStats()));
+
 // Egress per account since the last reset (utils/bwByUser.js): HTTP, WebSocket and cache writes.
 router.get('/bandwidth', adminPanel.bandwidth);
 router.post('/bandwidth/reset', adminPanel.bandwidthReset);

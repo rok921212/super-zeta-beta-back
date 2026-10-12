@@ -31,4 +31,8 @@ const GroupSchema = new Schema({
   createdAt: { type: Date, default: Date.now },
 });
 
+// Invalidates the live tick's roster (groups) cache on every write.
+const { attachWriteEpochHooks, rosterEpoch } = require("../utils/writeEpoch");
+attachWriteEpochHooks(GroupSchema, rosterEpoch, "tournamentId");
+
 module.exports = mongoose.model('Group', GroupSchema);

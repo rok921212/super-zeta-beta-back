@@ -56,4 +56,8 @@ matchSelectionSchema.statics.cleanupByMatch = async function(matchId) {
   return this.deleteMany({ matchId });
 };
 
+// Invalidates the live tick's per-account selection cache on every write.
+const { attachWriteEpochHooks, matchSelectionEpoch } = require("../utils/writeEpoch");
+attachWriteEpochHooks(matchSelectionSchema, matchSelectionEpoch, "userId");
+
 module.exports = mongoose.models.MatchSelection || mongoose.model('MatchSelection', matchSelectionSchema);

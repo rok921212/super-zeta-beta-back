@@ -145,7 +145,7 @@ function stripPositionalFields(teams) {
 // Team display strings — teamLogo is a Cloudinary URL, teamName/teamTag short
 // strings. Same treatment as PLAYER_DISPLAY_FIELDS: an already-known team
 // only re-sends one when it changed. `optional` in overlay.proto.
-const TEAM_DISPLAY_FIELDS = ['teamName', 'teamTag', 'teamLogo'];
+const TEAM_DISPLAY_FIELDS = ['teamName', 'teamTag', 'teamLogo', 'teamFlag'];
 
 function computeChangedTeams(currentTeams, previousTeams) {
   const prevByKey = new Map((previousTeams || []).map((t) => [teamKey(t), t]));

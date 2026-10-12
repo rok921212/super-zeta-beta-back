@@ -76,7 +76,7 @@ function toProtoPlayer(p) {
   return out;
 }
 
-const OPTIONAL_TEAM_STRING_FIELDS = ['teamName', 'teamTag', 'teamLogo'];
+const OPTIONAL_TEAM_STRING_FIELDS = ['teamName', 'teamTag', 'teamLogo', 'teamFlag'];
 
 function toProtoTeam(t) {
   if (!t) return null;

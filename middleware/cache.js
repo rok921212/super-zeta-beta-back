@@ -1,6 +1,8 @@
+const zlib = require('zlib');
 const { Redis } = require('@upstash/redis');
 const { encodeMsgpack } = require('../utils/msgpackCodec');
 const bwByUser = require('../utils/bwByUser');
+const bwCounters = require('../utils/bwCounters');
 
 let getCache, setCache, deleteCache, invalidateScope, invalidateKeysByPrefix, cacheMiddleware, msgpackCacheMiddleware, invalidateCacheMiddleware;
 
@@ -57,21 +59,85 @@ const redisClient = new Redis({
   }
 })();
 
-// In-process fallback used only if a Redis call fails at runtime
-const memoryCache = new Map();
+// ── In-process cache tier ──────────────────────────────────────────────────
+// Holds (a) the memory-only entries — big or short-lived bodies that are not
+// worth uploading to Upstash (see REMOTE_MIN_TTL_SECONDS) — and (b) the
+// fallback copy when a Redis call fails at runtime. Every Upstash SET is
+// billed by Render as service-initiated egress, and this backend runs as a
+// single instance, so a remote copy of a 3-20 s entry was pure upload cost:
+// it expired together with the in-process copy and was almost never read.
+//
+// Byte-budgeted (CACHE_MEMORY_BUDGET_MB, default 64): inserts evict the
+// oldest entries first so this can never grow into an OOM-kill.
+const MEMORY_BUDGET_BYTES = (Number(process.env.CACHE_MEMORY_BUDGET_MB) || 64) * 1024 * 1024;
+// cacheMiddleware entries with a TTL below this stay in memory only.
+const REMOTE_MIN_TTL_SECONDS = 60;
+// Values whose JSON is at least this big go to Upstash brotli-compressed.
+const COMPRESS_MIN_BYTES = 2048;
+
+const memoryCache = new Map(); // key -> value (Map keeps insertion order = eviction order)
+const memoryMeta = new Map(); // key -> { exp, bytes, scope }
 const memoryScopeIndex = new Map(); // scope -> Set(keys)
+let memoryBytes = 0;
 
 // In-flight request coalescing for msgpackCacheMiddleware's MISS path — see
 // its use below. key -> Promise<{ ok, body, rev }>.
 const inFlightBulk = new Map();
 
-const trackMemoryKey = (scope, key, ttlSeconds) => {
+const memDelete = (key) => {
+  const meta = memoryMeta.get(key);
+  if (meta) {
+    memoryBytes -= meta.bytes;
+    memoryScopeIndex.get(meta.scope)?.delete(key);
+    memoryMeta.delete(key);
+  }
+  memoryCache.delete(key);
+};
+
+const memGet = (key) => {
+  const meta = memoryMeta.get(key);
+  if (!meta) return undefined;
+  if (meta.exp <= Date.now()) { memDelete(key); return undefined; }
+  return memoryCache.get(key);
+};
+
+const sizeOf = (value) => {
+  if (Buffer.isBuffer(value)) return value.length;
+  try { return Buffer.byteLength(JSON.stringify(value) ?? ''); } catch { return 1024; }
+};
+
+const memSet = (scope, key, value, ttlSeconds, bytes = sizeOf(value)) => {
+  memDelete(key); // re-insert at the end so eviction order stays oldest-first
+  if (bytes > MEMORY_BUDGET_BYTES) return;
+  while (memoryBytes + bytes > MEMORY_BUDGET_BYTES && memoryCache.size) {
+    memDelete(memoryCache.keys().next().value);
+  }
+  memoryCache.set(key, value);
+  memoryMeta.set(key, { exp: Date.now() + ttlSeconds * 1000, bytes, scope });
   if (!memoryScopeIndex.has(scope)) memoryScopeIndex.set(scope, new Set());
   memoryScopeIndex.get(scope).add(key);
-  setTimeout(() => {
-    memoryCache.delete(key);
-    memoryScopeIndex.get(scope)?.delete(key);
-  }, ttlSeconds * 1000);
+  memoryBytes += bytes;
+};
+
+// Expired entries are also dropped lazily on read; this sweep just returns
+// their memory when nobody reads them again.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, meta] of memoryMeta) if (meta.exp <= now) memDelete(key);
+}, 30000).unref();
+
+// Upstash values: big JSON goes up as { __z: base64(brotli(json)) }.
+// Anything else (old plain entries written before this, small values) is
+// returned as-is.
+const encodeRemote = (json) => {
+  if (json.length < COMPRESS_MIN_BYTES) return null;
+  return { __z: zlib.brotliCompressSync(json, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 } }).toString('base64') };
+};
+const decodeRemote = (value) => {
+  if (value && typeof value === 'object' && typeof value.__z === 'string') {
+    return JSON.parse(zlib.brotliDecompressSync(Buffer.from(value.__z, 'base64')).toString('utf8'));
+  }
+  return value;
 };
 
 // ── Cheap ETag epoch, per cache scope ──────────────────────────────────────
@@ -85,36 +151,48 @@ const etagEpochByScope = new Map(); // scope -> integer
 const getEtagEpoch = (scope) => etagEpochByScope.get(scope) || 0;
 const bumpEtagEpoch = (scope) => etagEpochByScope.set(scope, getEtagEpoch(scope) + 1);
 
+// Memory first: memory-only entries never reach Upstash, and a memory hit
+// saves the Upstash round-trip either way.
 getCache = async (key) => {
+  const local = memGet(key);
+  if (local !== undefined) return local;
   try {
     const value = await redisClient.get(key);
-    return value ?? null;
+    return decodeRemote(value) ?? null;
   } catch (error) {
-    console.warn('Cache get error, using memory:', error.message);
-    return memoryCache.get(key) ?? null;
+    console.warn('Cache get error:', error.message);
+    return null;
   }
 };
 
-setCache = async (key, value, ttlSeconds = 300, scope = 'anon') => {
-  // The value goes to Upstash as an uncompressed JSON body over HTTPS — egress
-  // that no [bw] line counts.
-  try { bwByUser.addCacheWrite(scope, Buffer.byteLength(JSON.stringify(value))); } catch { /* unserialisable */ }
+// opts.remote === false keeps the entry in process memory only (no Upstash
+// SET, no service-initiated egress).
+setCache = async (key, value, ttlSeconds = 300, scope = 'anon', { remote = true } = {}) => {
+  let json;
+  try { json = JSON.stringify(value); } catch { /* unserialisable */ }
+  const jsonBytes = json ? Buffer.byteLength(json) : 1024;
+  if (!remote) {
+    memSet(scope, key, value, ttlSeconds, jsonBytes);
+    return;
+  }
+  let remoteValue = value;
+  try { remoteValue = (json && encodeRemote(json)) || value; } catch { /* send uncompressed */ }
+  const sentBytes = remoteValue === value ? jsonBytes : remoteValue.__z.length;
+  try { bwByUser.addCacheWrite(scope, sentBytes); } catch { /* best effort */ }
+  bwCounters.addUpstashOut(sentBytes);
   try {
     // Bandwidth: one pipelined REST round-trip instead of three separate
-    // Upstash HTTPS requests (SET + SADD + EXPIRE). Every cache MISS on a
-    // hot key (`/bulk`, `/overall`, polled by every overlay) used to cost 3
-    // outbound requests; this makes it 1. Invalidation semantics are
-    // unchanged — the `cache:keys:<scope>` set is still maintained exactly
-    // as before, so invalidateScope()/invalidateKeysByPrefix() keep working.
+    // Upstash HTTPS requests (SET + SADD + EXPIRE). Invalidation semantics
+    // are unchanged — the `cache:keys:<scope>` set is still maintained, so
+    // invalidateScope()/invalidateKeysByPrefix() keep working.
     await redisClient.pipeline()
-      .set(key, value, { ex: ttlSeconds })
+      .set(key, remoteValue, { ex: ttlSeconds })
       .sadd(`cache:keys:${scope}`, key)
       .expire(`cache:keys:${scope}`, ttlSeconds + 60)
       .exec();
   } catch (error) {
     console.warn('Cache set error, falling back to memory:', error.message);
-    memoryCache.set(key, value);
-    trackMemoryKey(scope, key, ttlSeconds);
+    memSet(scope, key, value, ttlSeconds, jsonBytes);
   }
 };
 
@@ -124,7 +202,7 @@ deleteCache = async (key) => {
   } catch (error) {
     console.warn('Cache delete error:', error.message);
   }
-  memoryCache.delete(key); // clear memory copy too, regardless of Redis outcome
+  memDelete(key); // clear memory copy too, regardless of Redis outcome
 };
 
 invalidateScope = async (scope) => {
@@ -136,11 +214,11 @@ invalidateScope = async (scope) => {
   } catch (error) {
     console.warn('Cache scope invalidation error:', error.message);
   }
-  // Always clear the memory-fallback copy for this scope too,
-  // in case some entries were only ever written to memory.
+  // Always clear the in-memory entries for this scope too — memory-only
+  // entries were never written to Redis.
   const memKeys = memoryScopeIndex.get(scope);
   if (memKeys) {
-    for (const k of memKeys) memoryCache.delete(k);
+    for (const k of [...memKeys]) memDelete(k);
     memoryScopeIndex.delete(scope);
   }
 };
@@ -172,10 +250,7 @@ invalidateKeysByPrefix = async (scope, prefixes) => {
   const memKeys = memoryScopeIndex.get(scope);
   if (memKeys) {
     for (const k of [...memKeys]) {
-      if (paths.some(p => k.startsWith(`cache:${scope}:${p}`))) {
-        memoryCache.delete(k);
-        memKeys.delete(k);
-      }
+      if (paths.some(p => k.startsWith(`cache:${scope}:${p}`))) memDelete(k);
     }
   }
 };
@@ -234,7 +309,7 @@ cacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
       // here means every request for this key returns that cached error (with
       // an implicit 200 on the cache-hit path above) until the TTL lapses.
       if (res.statusCode >= 200 && res.statusCode < 300) {
-        setCache(key, data, ttlSeconds, scope).catch(console.warn);
+        setCache(key, data, ttlSeconds, scope, { remote: ttlSeconds >= REMOTE_MIN_TTL_SECONDS }).catch(console.warn);
       }
       res.set('Cache-Control', cacheControl);
       originalJson.call(this, data);
@@ -292,7 +367,7 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null, keyFn = null) => {
     if (req.headers['if-none-match'] === etag) {
       res.locals.__bwBytes = 0;
       res.set('Cache-Control', cacheControl);
-      setRevHeader(memoryCache.get(revKey) ?? 0);
+      setRevHeader(memGet(revKey) ?? 0);
       return res.status(304).end();
     }
 
@@ -307,25 +382,15 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null, keyFn = null) => {
       res.send(body);
     };
 
-    // Serve the encoded body straight from memory — no Upstash GET (that GET
-    // returned the full ~360 KB body over HTTPS on every cache hit, billed
-    // service-initiated).
-    const buffered = memoryCache.get(bufKey);
+    // Serve the encoded body straight from memory. These bodies (/bulk,
+    // /overall — up to ~360 KB) live in process memory only: no Upstash GET
+    // on a hit and no Upstash SET on a miss, both of which were billed as
+    // service-initiated bandwidth while the remote copy expired together
+    // with this one and was almost never read.
+    const buffered = memGet(bufKey);
     if (buffered) {
-      setRevHeader(memoryCache.get(revKey) ?? 0);
+      setRevHeader(memGet(revKey) ?? 0);
       return sendBuffered(buffered);
-    }
-
-    const cached = await getCache(key);
-    if (cached) {
-      const body = encodeMsgpack(cached);
-      const rev = cached?.roundData?.publicRev ?? 0;
-      memoryCache.set(bufKey, body);
-      memoryCache.set(revKey, rev);
-      trackMemoryKey(scope, bufKey, ttlSeconds);
-      trackMemoryKey(scope, revKey, ttlSeconds);
-      setRevHeader(rev);
-      return sendBuffered(body);
     }
 
     // In-flight coalescing: two simultaneous misses for the same key
@@ -367,14 +432,11 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null, keyFn = null) => {
     res.json = function (data) {
       const ok = res.statusCode >= 200 && res.statusCode < 300;
       // See cacheMiddleware above for why this only caches on success.
-      if (ok) setCache(key, data, ttlSeconds, scope).catch(console.warn);
       const body = encodeMsgpack(data);
       const rev = data?.roundData?.publicRev ?? 0;
       if (ok) {
-        memoryCache.set(bufKey, body);
-        memoryCache.set(revKey, rev);
-        trackMemoryKey(scope, bufKey, ttlSeconds);
-        trackMemoryKey(scope, revKey, ttlSeconds);
+        memSet(scope, bufKey, body, ttlSeconds, body.length);
+        memSet(scope, revKey, rev, ttlSeconds, 16);
       }
       setRevHeader(rev);
       sendBuffered(body);

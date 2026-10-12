@@ -55,7 +55,7 @@ const nonNeg = (v) => (typeof v === 'number' && v > 0) ? Math.trunc(v) : 0;
 // aggregateOverallTeams + buildInitialAggPlayer.
 const OVERALL_MATCHDATA_PROJECTION = [
   'matchId', 'createdAt', 'updatedAt',
-  ...['teamId', 'teamName', 'teamTag', 'teamLogo', 'slot', 'placePoints', 'rank']
+  ...['teamId', 'teamName', 'teamTag', 'teamLogo', 'teamFlag', 'slot', 'placePoints', 'rank']
     .map((f) => `teams.${f}`),
   ...['uId', '_id', 'playerName', 'playerOpenId', 'picUrl', 'showPicUrl', 'character', 'playerKey', 'teamIdfromApi']
     .map((f) => `teams.players.${f}`),
@@ -199,6 +199,7 @@ function aggregateOverallTeams(matchDataDocs) {
           teamName: team.teamName || '',
           teamTag: team.teamTag || '',
           teamLogo: team.teamLogo || '',
+          teamFlag: team.teamFlag || '',
           slot: Number.isFinite(team.slot) ? team.slot : 0,
           placePoints: 0,
           wwcd: 0,
@@ -215,6 +216,8 @@ function aggregateOverallTeams(matchDataDocs) {
       if (team.teamName) aggTeam.teamName = team.teamName;
       if (team.teamTag) aggTeam.teamTag = team.teamTag;
       if (team.teamLogo) aggTeam.teamLogo = team.teamLogo;
+      // '' is a real value here (flag removed) — only skip docs that predate the field.
+      if (team.teamFlag !== undefined) aggTeam.teamFlag = team.teamFlag || '';
 
       if (Number.isFinite(team.slot)) {
         aggTeam.slot = Math.min(aggTeam.slot || team.slot, team.slot);
@@ -257,6 +260,7 @@ function aggregateOverallTeams(matchDataDocs) {
     teamName: t.teamName,
     teamTag: t.teamTag,
     teamLogo: t.teamLogo,
+    teamFlag: t.teamFlag,
     slot: t.slot || 0,
     placePoints: t.placePoints,
     wwcd: t.wwcd,

@@ -75,11 +75,18 @@ function publicShape(sync) {
   };
 }
 
-async function announce(userId, payload) {
+// Every round an overlay of this account could be sitting in: rounds it created, rounds of the
+// tournaments it owns (a round made by someone else, or before createdBy existed, still counts),
+// and the round its links showed until now (`previous`), whoever owns it.
+async function announce(userId, payload, previous = null) {
   try {
-    const rounds = await Round.find({ createdBy: userId }).select('_id tournamentId').lean();
-    if (!rounds.length) return;
-    const rooms = rounds.map((r) => `round:${r.tournamentId}:${r._id}:control`);
+    const owned = await Tournament.find({ userId }).select('_id').lean();
+    const rounds = await Round.find({ $or: [{ createdBy: userId }, { tournamentId: { $in: owned.map((t) => t._id) } }] })
+      .select('_id tournamentId').lean();
+    const roomSet = new Set(rounds.map((r) => `round:${r.tournamentId}:${r._id}:control`));
+    if (previous?.tournamentId && previous?.roundId) roomSet.add(`round:${previous.tournamentId}:${previous.roundId}:control`);
+    if (!roomSet.size) return;
+    const rooms = [...roomSet];
     getSocket().to(rooms).emit('publicDataInvalidated', { scope: 'round', reason: 'overlaySync', sync: payload });
     console.log(`[overlay-sync] announced to ${rooms.length} round(s) user=${userId} target=${payload.target ? payload.target.roundId : 'off'}`);
   } catch (err) {
@@ -101,7 +108,7 @@ async function followApiRound(userId, tournamentId, roundId) {
     if (String(cur.roundId) === String(roundId)) return;
     const overlaySync = { tournamentId, roundId, scheduleMatches: [], stamp: Date.now() };
     await User.updateOne({ _id: userId }, { $set: { overlaySync } });
-    await announce(userId, publicShape(overlaySync));
+    await announce(userId, publicShape(overlaySync), cur);
   } catch (err) {
     console.warn('[overlay-sync] follow API round failed:', err.message);
   }
@@ -146,9 +153,10 @@ const setOverlaySync = async (req, res) => {
     const overlaySync = apiRound && String(apiRound._id) !== String(roundId)
       ? { tournamentId: String(apiRound.tournamentId), roundId: String(apiRound._id), scheduleMatches: [], stamp: Date.now() }
       : { tournamentId, roundId, scheduleMatches, stamp: Date.now() };
+    const before = await User.findById(userId).select('overlaySync').lean();
     await User.updateOne({ _id: userId }, { $set: { overlaySync } });
     const payload = publicShape(overlaySync);
-    announce(userId, payload);
+    announce(userId, payload, before?.overlaySync);
     res.json({ ...payload, key });
   } catch (err) {
     console.error('[overlay-sync] set failed:', err);
@@ -160,10 +168,11 @@ const clearOverlaySync = async (req, res) => {
   try {
     const userId = req.session.userId;
     const overlaySync = { tournamentId: null, roundId: null, scheduleMatches: [], stamp: Date.now() };
+    const before = await User.findById(userId).select('overlaySync').lean();
     await User.updateOne({ _id: userId }, { $set: { overlaySync } });
     const user = await User.findById(userId).select('overlayKey').lean();
     const payload = publicShape(overlaySync);
-    announce(userId, payload);
+    announce(userId, payload, before?.overlaySync);
     res.json({ ...payload, key: user?.overlayKey || null });
   } catch (err) {
     console.error('[overlay-sync] clear failed:', err);
@@ -246,8 +255,16 @@ const sendOverlayPage = async (req, res) => {
       return res.status(403).json({ message: 'Not your tournament' });
     }
 
+    // Overlays on a permanent link or a sync redirect render (and sit in the
+    // room of) the account's sync target, not the round picked in the panel,
+    // so the command goes to both rooms.
+    const user = await User.findById(req.session.userId).select('overlaySync').lean();
+    const target = user?.overlaySync;
+    const rooms = new Set([`round:${tournamentId}:${roundId}:control`]);
+    if (target?.tournamentId && target?.roundId) rooms.add(`round:${target.tournamentId}:${target.roundId}:control`);
+
     const pageCmd = { view, page, stamp: Date.now() };
-    getSocket().to(`round:${tournamentId}:${roundId}:control`).emit('publicDataInvalidated', {
+    getSocket().to([...rooms]).emit('publicDataInvalidated', {
       tournamentId, roundId, scope: 'round', reason: 'overlayPage', pageCmd,
     });
     res.json(pageCmd);
