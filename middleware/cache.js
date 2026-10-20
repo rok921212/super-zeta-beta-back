@@ -40,7 +40,7 @@ if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN
   msgpackCacheMiddleware = () => (req, res, next) => next();
   invalidateCacheMiddleware = () => (req, res, next) => next();
 
-  module.exports = { getCache, setCache, deleteCache, invalidateScope, invalidateKeysByPrefix, cacheMiddleware, msgpackCacheMiddleware, invalidateCacheMiddleware };
+  module.exports = { getCache, setCache, deleteCache, invalidateScope, invalidateKeysByPrefix, cacheMiddleware, msgpackCacheMiddleware, invalidateCacheMiddleware, redisStatus: () => null };
   return;
 }
 
@@ -49,15 +49,21 @@ const redisClient = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
+// null until the first ping answers. A failed ping no longer exits: on a cold
+// start a slow Upstash used to crash-loop the service, and every cache call
+// already falls back to the in-process tier below when Redis fails.
+let redisConnected = null;
 (async () => {
   try {
     await redisClient.ping();
+    redisConnected = true;
     console.log('✅ Upstash Redis connected');
   } catch (err) {
-    console.error('❌ Upstash Redis connection failed:', err.message);
-    process.exit(1);
+    redisConnected = false;
+    console.error('❌ Upstash Redis connection failed (running on the in-process cache):', err.message);
   }
 })();
+const redisStatus = () => redisConnected;
 
 // ── In-process cache tier ──────────────────────────────────────────────────
 // Holds (a) the memory-only entries — big or short-lived bodies that are not
@@ -488,4 +494,4 @@ invalidateCacheMiddleware = (keysOrFn) => {
   };
 };
 
-module.exports = { getCache, setCache, deleteCache, invalidateScope, invalidateKeysByPrefix, cacheMiddleware, msgpackCacheMiddleware, invalidateCacheMiddleware };
+module.exports = { getCache, setCache, deleteCache, invalidateScope, invalidateKeysByPrefix, cacheMiddleware, msgpackCacheMiddleware, invalidateCacheMiddleware, redisStatus };

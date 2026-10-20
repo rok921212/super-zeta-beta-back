@@ -4,7 +4,9 @@
 //   overlay.json   required manifest (below)
 //   index.html     markup; a whole document is fine (<style>, <link> to a CSS
 //                  file in the zip and <body> are unpacked; <script> is dropped)
-//   style.css      styles + @keyframes (animation is CSS only — no JavaScript)
+//   style.css      styles + @keyframes
+//   *.ssx          a code layer: <template> + <style> + <script lang="tsx|jsx|js">
+//                  in one file (JavaScript lives only here; it runs sandboxed)
 //   assets/…       png | jpg | webp | gif | svg, referenced relatively (assets/logo.png)
 //   fonts/…        .woff2 (listed in the manifest, or declared with @font-face in the CSS)
 //   preview.png    optional thumbnail (kept for sharing later)
@@ -14,12 +16,16 @@
 //     format: "scoresync-overlay", version: 1, kind: "html" | "design",
 //     name, description?, author?: { name, url? }, license?, tags?: [],
 //     canvas?: { width, height, background? },
-//     layers?: [{ name?, html, css?, x?, y?, width?, height? }],   (kind html; default: index.html + style.css, full canvas)
+//     layers?: [{ name?, html, css?, x?, y?, width?, height? }      (an HTML + CSS layer)
+//              | { name?, code, x?, y?, width?, height? }],          (a code layer: code = "layers/board.ssx")
+//              (kind html; default: index.html + style.css — or index.ssx — full canvas)
 //     fonts?:  [{ family, file }]
 //   }
 //
 // kind "html" -> one `css` layer per entry (the layer type the editor already
 // renders in a sandboxed shadow root); live data uses {{path|format}} tokens.
+// An entry with `code` becomes a `code` layer holding the .ssx source; the
+// editor compiles it (sucrase + Tailwind) the first time the layer is saved.
 // kind "design" -> design.json as-is, images under assets/<24-hex id>.<ext>.
 // Either way an image comes back as { id, name, data } and the draft refers to
 // it as `asset:<id>`; the controller swaps those ids for the importing
@@ -211,7 +217,7 @@ function unpackDocument(text, base, files, warnings) {
   const linked = new Set();
   if (/<\s*script\b/i.test(html)) {
     html = html.replace(/<\s*script\b[\s\S]*?<\s*\/\s*script\s*>/gi, '').replace(/<\s*script\b[^>]*\/?>/gi, '');
-    warnings.push('Scripts were removed: packages animate with CSS only.');
+    warnings.push('Scripts were removed from the HTML: JavaScript goes in an .ssx code layer.');
   }
   html = html.replace(/<link\b[^>]*>/gi, (tag) => {
     const href = /href\s*=\s*(["'])([^"']*)\1/i.exec(tag);
@@ -238,13 +244,37 @@ function htmlDraft(files, rawManifest, manifest, warnings) {
   const { width: W, height: H } = manifest.canvas;
   const rawLayers = Array.isArray(rawManifest.layers) && rawManifest.layers.length
     ? rawManifest.layers
-    : [{ name: manifest.name, html: 'index.html', css: files.has('style.css') ? 'style.css' : undefined }];
+    : !files.has('index.html') && files.has('index.ssx')
+      ? [{ name: manifest.name, code: 'index.ssx' }]
+      : [{ name: manifest.name, html: 'index.html', css: files.has('style.css') ? 'style.css' : undefined }];
   if (rawLayers.length > MAX_LAYERS) return { error: `Package has more than ${MAX_LAYERS} layers` };
 
   const elements = [];
   for (let i = 0; i < rawLayers.length; i++) {
     const l = isPlainObject(rawLayers[i]) ? rawLayers[i] : {};
     const label = str(l.name, 80) || `Layer ${i + 1}`;
+    const num = (v, d) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : d);
+    if (l.code != null) {
+      const codePath = typeof l.code === 'string' ? cleanPath(l.code) : null;
+      if (!codePath || !files.has(codePath)) return { error: `Layer "${label}": code file "${l.code}" is not in the package` };
+      if (ext(codePath) !== 'ssx') return { error: `Layer "${label}": "${codePath}" must be an .ssx file` };
+      const cbase = path.dirname(codePath);
+      const text = textOf(files, codePath, warnings);
+      if (text == null) return { error: `Layer "${label}": "${codePath}" could not be read` };
+      // Package-relative images (src="assets/x.png", url(assets/x.png)) and @font-face files, as for HTML layers.
+      const source = rewriteHtml(rewriteCss(extractFontFaces(text, cbase, files, fonts, warnings), cbase, resolve), cbase, resolve);
+      if (source.length > schema.LIMITS.maxCodeSourceLength) return { error: `Layer "${label}": the .ssx file can be at most ${schema.LIMITS.maxCodeSourceLength.toLocaleString('en-US')} characters` };
+      const langM = /<script\b[^>]*\blang\s*=\s*["']?(tsx|jsx|js)\b/i.exec(source);
+      const lang = langM ? langM[1].toLowerCase() : /<script\b/i.test(source) ? 'tsx' : 'js';
+      const size = /<overlay\b[^>]*>/i.exec(source);
+      const attr = (n) => { const m = size && new RegExp(`\\b${n}\\s*=\\s*["']?(\\d+)`, 'i').exec(size[0]); return m ? Number(m[1]) : undefined; };
+      elements.push({
+        id: `code_${i + 1}`, type: 'code', name: label, x: num(l.x, 0), y: num(l.y, 0),
+        w: Math.max(1, num(l.width ?? l.w, attr('width') || W)), h: Math.max(1, num(l.height ?? l.h, attr('height') || H)),
+        code: { source, lang },
+      });
+      continue;
+    }
     const htmlPath = typeof l.html === 'string' ? cleanPath(l.html) : null;
     if (!htmlPath || !files.has(htmlPath)) return { error: `Layer "${label}": HTML file "${l.html || 'index.html'}" is not in the package` };
     if (!/^html?$/.test(ext(htmlPath))) return { error: `Layer "${label}": "${htmlPath}" must be an .html file` };
@@ -262,7 +292,6 @@ function htmlDraft(files, rawManifest, manifest, warnings) {
     if (!html) return { error: `Layer "${label}": the HTML has no content inside <body>` };
     const max = schema.LIMITS.maxCssLayerLength;
     if (html.length > max || css.length > max) return { error: `Layer "${label}": HTML and CSS can each be at most ${max.toLocaleString('en-US')} characters` };
-    const num = (v, d) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : d);
     const w = Math.max(1, num(l.width ?? l.w, W));
     const h = Math.max(1, num(l.height ?? l.h, H));
     elements.push({ id: `css_${i + 1}`, type: 'css', name: label, x: num(l.x, 0), y: num(l.y, 0), w, h, css: css ? { html, css } : { html } });
@@ -310,7 +339,7 @@ function decodePackage(buf) {
   const manifest = cleanManifest(raw);
 
   for (const p of files.keys()) {
-    if (/\.(m?js|jsx|ts|wasm)$/i.test(p)) warnings.push(`"${p}" was skipped: scripts are not supported, animate with CSS.`);
+    if (/\.(m?js|jsx|tsx?|wasm)$/i.test(p)) warnings.push(`"${p}" was skipped: put JavaScript inside an .ssx code layer instead.`);
   }
 
   const built = manifest.kind === 'design' ? designDraft(files, warnings) : htmlDraft(files, raw, manifest, warnings);

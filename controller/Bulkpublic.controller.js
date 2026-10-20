@@ -407,6 +407,11 @@ function updateDeadTeamList(matchId, matchData) {
     const teamKey = (team.teamId ?? team._id)?.toString();
     if (!teamKey) continue;
 
+    // No players on this tick says nothing about life or death (a relay
+    // restart can briefly deliver a team with none): leave its state alone.
+    // Before, it counted as "not all dead" and brought a dead team back.
+    if (!Array.isArray(team.players) || team.players.length === 0) continue;
+
     if (!isTeamAllDead(team)) {
       state.everAlive.add(teamKey);
       state.dead.delete(teamKey);

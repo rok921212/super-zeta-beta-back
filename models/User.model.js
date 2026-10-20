@@ -14,6 +14,10 @@ const userSchema = new mongoose.Schema({
   // entirely for full admins (isAdmin), who are always unlimited. Enforced in
   // controller/match.controller.js#createMatchInRoundInTournament.
   maxMatches: { type: Number, default: 0, min: 0 },
+  // Built-in themes (Theme1..ThemeN) this account may pick, set by an admin.
+  // Absent = every theme. Only the theme pickers and the Designer read it;
+  // overlay links keep rendering whatever theme they name.
+  allowedThemes: { type: [String], default: undefined },
   // Set on every successful loginUser (atomic $set, never via save()).
   lastLoginAt: { type: Date },
   loginCount: { type: Number, default: 0 },
@@ -41,6 +45,30 @@ const userSchema = new mongoose.Schema({
   // render whatever `overlaySync` points at. Created the first time permanent
   // links are switched on and never changed, so the links in OBS stay valid.
   overlayKey: { type: String, unique: true, sparse: true, select: false },
+  // Director lock (route/directorLock.route.js): while `locked`, the desktop
+  // app refuses changes to its OB director. `hash` is this account's own
+  // bcrypt-hashed password, set by an admin; null = the deployment default
+  // (DIRECTOR_LOCK_DEFAULT_HASH). `version` goes up on every password change
+  // so desktops can tell a reset happened. select: false keeps the whole
+  // thing, the hash above all, out of ordinary user reads.
+  directorLock: {
+    type: new mongoose.Schema({
+      hash: { type: String, default: null },
+      locked: { type: Boolean, default: false },
+      version: { type: Number, default: 0 },
+      changedAt: { type: Date, default: null },
+      lockedAt: { type: Date, default: null },
+      // What the one account lock covers, set by an admin. Absent = both.
+      scope: {
+        director: { type: Boolean, default: true },
+        designer: { type: Boolean, default: true },
+      },
+    }, { _id: false }),
+    select: false,
+  },
+  // Admin-managed Director settings (route/directorSettings.route.js): absent /
+  // managed false = every PC keeps its own. Validated by services/directorSettings.js.
+  directorSettings: { type: mongoose.Schema.Types.Mixed, default: undefined, select: false },
 }, { timestamps: true });
 
 // Hash password before saving.

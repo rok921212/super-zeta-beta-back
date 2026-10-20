@@ -168,7 +168,24 @@ function computeChangedTeams(currentTeams, previousTeams) {
   return changed;
 }
 
+// Keyframe change detection. Fields that change on (nearly) every tick for a
+// living player are left out: hashing them made every keyframe look
+// "changed", so the full roster went out every LIVE_KEYFRAME_MS per room per
+// account. Safe: a value a dropped delta carried is re-sent by the next delta,
+// since these fields move again. stable=false hashes every field.
+const crypto = require('crypto');
+const KEYFRAME_HASH_SKIP = new Set(['survivalTime', 'location', 'marchDistance', 'driveDistance', 'outsideBlueCircleTime']);
+function keyframeHashOf(teams, stable = true) {
+  const json = stable
+    // A dead player's values stop moving, so they stay in the hash: the keyframe
+    // after death then carries the final survivalTime even if that delta dropped.
+    ? JSON.stringify(teams, function (k, v) { return KEYFRAME_HASH_SKIP.has(k) && !this.bHasDied ? undefined : v; })
+    : JSON.stringify(teams);
+  return crypto.createHash('sha1').update(json).digest('base64');
+}
+
 module.exports = {
+  keyframeHashOf,
   computeChangedTeams,
   computeChangedPlayers,
   computeChangedPlayerFields,

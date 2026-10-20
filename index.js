@@ -3,10 +3,15 @@ require('dotenv').config({ path: './.env' });
 
 const dns = require("dns");
 
-dns.setServers([
-  "8.8.8.8",
-  "8.8.4.4",
-]);
+// Local one-off scripts need Google DNS (the local resolver refuses SRV
+// lookups). In production it only added a slower resolver to every lookup,
+// including the Atlas SRV records on a cold start.
+if (process.env.NODE_ENV === 'test' || process.env.FORCE_GOOGLE_DNS === '1') {
+  dns.setServers([
+    "8.8.8.8",
+    "8.8.4.4",
+  ]);
+}
 
 // Load configuration
 const config = require('./config');
@@ -46,11 +51,31 @@ const { createOverlayCategoryRouter } = require('./route/overlayCategory.route.j
 const { createMongoCategoryStore } = require('./services/overlayCategoryStore.js');
 const { getOverlayConnection, connectOverlayDb, overlayDbState } = require('./db/overlayConnection.js');
 
-const { cacheMiddleware } = require('./middleware/cache.js');
+const { cacheMiddleware, redisStatus } = require('./middleware/cache.js');
 
 // --- DECLARE APP AND PORT ---
 const app = express();
 const port = process.env.PORT || 3000;
+
+// Set once Mongo is connected (startServer). Requests and socket handshakes
+// that arrive earlier wait on it or get a 503 (see "COLD START" below).
+const backendReady = { done: false, readyInMs: null, waiters: [] };
+const markBackendReady = () => {
+  backendReady.done = true;
+  backendReady.readyInMs = Math.round(process.uptime() * 1000);
+  for (const w of backendReady.waiters.splice(0)) w(true);
+};
+const waitForBackendReady = (timeoutMs) => {
+  if (backendReady.done) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const t = setTimeout(() => {
+      backendReady.waiters = backendReady.waiters.filter((w) => w !== done);
+      resolve(false);
+    }, timeoutMs);
+    const done = (v) => { clearTimeout(t); resolve(v); };
+    backendReady.waiters.push(done);
+  });
+};
 
 // Trust proxy (required for Render.com and other cloud platforms)
 app.set('trust proxy', 1);
@@ -242,6 +267,31 @@ app.use((req, res, next) => {
 });
 
 
+// --- COLD START ---
+// The server listens before the databases are connected (see startServer),
+// so a request that wakes a sleeping Render instance gets an answer at once.
+// Until Mongo is ready every /api route answers 503 + Retry-After (clients
+// and the relay retry it); /api/wake waits for ready and is what the
+// keep-awake pinger and the apps' wake call hit.
+const NOT_GATED = new Set(['/api/health', '/api/wake', '/api/version', '/']);
+app.use((req, res, next) => {
+  if (backendReady.done || NOT_GATED.has(req.path) || req.method === 'OPTIONS') return next();
+  res.set('Retry-After', '2');
+  res.status(503).json({ error: 'Server is starting', starting: true });
+});
+
+app.get('/api/wake', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const ready = await waitForBackendReady(25000);
+  res.status(ready ? 200 : 503).json({
+    ready,
+    mongo: mongoose.connection.readyState === 1,
+    overlayDb: overlayDbState(),
+    uptime: Math.round(process.uptime()),
+    readyInMs: backendReady.readyInMs,
+  });
+});
+
 // --- REGISTER ROUTES ---
 // Unauthenticated: lets a curl confirm which commit is actually live,
 // instead of inferring it from route behavior after the fact.
@@ -253,6 +303,16 @@ app.use('/api/users', userRoutes);
 // requireAdminPanel (panel cookie + existing Bearer JWT + User.isAdmin).
 // Mounted after the Bearer-JWT shim above so req.session.userId is populated.
 app.use('/api/admin-panel', adminPanelRoutes);
+// Director lock for the desktop app's OB director (services/directorLock.js).
+{
+  const { createDirectorLockRouter, getDirectorLockService } = require('./route/directorLock.route.js');
+  app.use('/api/director-lock', createDirectorLockRouter({ service: getDirectorLockService() }));
+}
+// Admin-managed Director settings + recent switch decisions (services/directorSettings.js).
+{
+  const { createDirectorSettingsRouter, getDirectorSettingsService } = require('./route/directorSettings.route.js');
+  app.use('/api/director-settings', createDirectorSettingsRouter({ service: getDirectorSettingsService() }));
+}
 app.use('/api', groupRoutes);
 // Mount matchRoutes before tournamentRoutes to handle nested routes
 app.use('/api', matchRoutes);
@@ -266,6 +326,8 @@ app.use('/api/public', bulkRoutes);
 // SYNC OVERLAY: operator set/clear + the public resolve the overlay pages call.
 app.use('/api/overlay-sync', overlaySyncRoutes.router);
 app.use('/api/public', overlaySyncRoutes.publicRouter);
+// The event the home page simulation shows (picked in the admin panel). No auth.
+app.get('/api/public/home-showcase', require('./controller/homeShowcase.controller.js').getPublic);
 // Designer layouts (ScoreSync Graphics Engine). The public render route is
 // deliberately NOT under /api/public, so overlays fetch it straight from the
 // cloud instead of through the local relay's public-feed cache.
@@ -281,17 +343,19 @@ app.use('/api/public', overlaySyncRoutes.publicRouter);
   // creating a collection on the main cluster (which is at its collection cap).
   // The stores are not even built then: registering a model is enough for mongoose to create its collection.
   const overlayDedicated = overlayDbState().dedicated;
+  // The account lock, when it covers the Designer, makes every write below a 423 (reads stay open).
+  const requireDesignerUnlocked = require('./middleware/requireDesignerUnlocked.js');
   const assetStore = overlayDedicated ? withAssetCache(createMongoAssetStore({ connection: getOverlayConnection() })) : null;
   const categoryStore = overlayDedicated ? withCategoryCache(createMongoCategoryStore({ connection: getOverlayConnection() })) : null;
   const overlayLayoutRouters = createOverlayLayoutRouters({ store: layoutStore, themeStore, fontStore, assetStore, categoryStore });
-  app.use('/api/overlay-assets', createOverlayAssetRouter({ assetStore, layoutStore, available: () => overlayDedicated }));
-  app.use('/api/overlay-categories', createOverlayCategoryRouter({ categoryStore, layoutStore, available: () => overlayDedicated }));
-  app.use('/api/overlay-layouts', overlayLayoutRouters.layouts);
+  app.use('/api/overlay-assets', requireDesignerUnlocked, createOverlayAssetRouter({ assetStore, layoutStore, available: () => overlayDedicated }));
+  app.use('/api/overlay-categories', requireDesignerUnlocked, createOverlayCategoryRouter({ categoryStore, layoutStore, available: () => overlayDedicated }));
+  app.use('/api/overlay-layouts', requireDesignerUnlocked, overlayLayoutRouters.layouts);
   app.use('/api/overlay-render', overlayLayoutRouters.render);
   // Uploaded .woff2 fonts for the Designer (per-account library; the file route is public).
-  app.use('/api/overlay-fonts', createOverlayFontRouter({ fontStore }));
+  app.use('/api/overlay-fonts', requireDesignerUnlocked, createOverlayFontRouter({ fontStore }));
   // Custom themes (Theme9, Theme10, …) = groups of published layouts, one per overlay view.
-  app.use('/api/custom-themes', createCustomThemeRouter({ themeStore, layoutStore, fontStore, assetStore }));
+  app.use('/api/custom-themes', requireDesignerUnlocked, createCustomThemeRouter({ themeStore, layoutStore, fontStore, assetStore }));
 }
 
 // --- PUBLIC ROUTES (No Authentication Required) ---
@@ -636,7 +700,9 @@ app.get('/api/health', (req, res) => {
     dbConnected: mongoose.connection.readyState === 1,
     overlayDb: overlayDbState(),
     designerCache: designerCacheStats,
-    redisConnected: false // Add redis check if needed
+    ready: backendReady.done,
+    // null = no Upstash configured, or its first ping has not answered yet.
+    redisConnected: redisStatus()
   });
 });
 
@@ -660,6 +726,26 @@ async function startServer() {
       process.exit(1);
     }
 
+    // Listen first: a request that woke this instance gets an answer (503 +
+    // Retry-After, or /api/wake waiting) instead of hanging on the platform
+    // proxy until both databases are connected. Socket handshakes wait for
+    // ready in the io.use() gate below, so every socket handler still runs
+    // with Mongo connected.
+    server = http.createServer(app);
+    io = initializeSocket(server);
+    io.use(async (socket, next) => {
+      if (backendReady.done) return next();
+      const ready = await waitForBackendReady(25000);
+      next(ready ? undefined : new Error('Server is starting'));
+    });
+    server.listen(port, '0.0.0.0', () => {
+      console.log(`🚀 Server listening on ${port} (databases connecting)`);
+    });
+
+    // The overlay cluster connects alongside the main one. Never fatal: the
+    // rest of the app must keep running even if it is unreachable.
+    const overlayDbReady = connectOverlayDb();
+
     await mongoose.connect(config.MONGODB_URI, {
       serverSelectionTimeoutMS: 10000,
       connectTimeoutMS: 10000,
@@ -668,6 +754,8 @@ async function startServer() {
       family: 4,
       // Atlas traffic is billed by Render as service-initiated bandwidth;
       // zlib wire compression is built into the driver (no extra package).
+      // Measured 2026-10-19: the current cluster sends identical bytes with
+      // zlib, zstd or none (it does not compress); kept for a cluster that does.
       compressors: ['zlib'],
       // Feeds mongo_out on the [bw][rollup] line below.
       monitorCommands: true
@@ -676,21 +764,15 @@ async function startServer() {
     console.log("✅ MongoDB connected");
     meterMongoCommands(mongoose.connection.getClient());
 
-    // Designer overlays' dedicated cluster. Never fatal: the rest of the app
-    // must keep running even if the overlay cluster is unreachable.
-    await connectOverlayDb();
-
-    server = http.createServer(app);
-    io = initializeSocket(server);
+    await overlayDbReady;
 
     console.log('🚀 Starting live match updater now that DB is ready');
 
     const { startLiveMatchUpdater } = require('./controller/Api_controllers/pubgApiMatchData.controller.js');
     startLiveMatchUpdater();
 
-    server.listen(port, '0.0.0.0', () => {
-      console.log(`🚀 Server running on ${port}`);
-    });
+    markBackendReady();
+    console.log(`✅ Ready ${backendReady.readyInMs} ms after process start`);
 
     // Periodic real-bandwidth rollup. http_wire is exact post-compression
     // egress; ws_fanout is pre-perMessageDeflate (encoded length x recipients)

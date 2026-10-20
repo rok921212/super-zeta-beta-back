@@ -15,7 +15,7 @@
 //   setFields(id, ownerId, set, {unlockedOnly})  -> layout | null
 //   remove(id, ownerId)                          -> boolean        (also drops revisions)
 //   insertRevision({layoutId, rev, schemaVersion, document, publishedBy}) -> revision  (dup (layoutId,rev) throws code 11000)
-//   markPublished(id, ownerId, fromRev, toRev, revisionId) -> layout | null (needs publishedRev === fromRev and !locked)
+//   markPublished(id, ownerId, fromRev, toRev, revisionId, draftRev) -> layout | null (needs publishedRev === fromRev and !locked)
 //   listRevisions(layoutId)                      -> [{rev, createdAt, publishedBy}] newest first
 //   getRevision(layoutId, rev)                   -> revision | null
 //   assetUsage(ownerId, assetId)                 -> { drafts, published }   (how many designs / revisions use an image)
@@ -23,7 +23,7 @@
 
 const mongoose = require('mongoose');
 
-const SUMMARY_FIELDS = 'name publicId schemaVersion draftRev publishedRev publishedAt productionLocked defaults assetBase createdAt updatedAt ownerId description categoryId tags archivedAt isTemplate stage';
+const SUMMARY_FIELDS = 'name publicId schemaVersion draftRev publishedRev publishedDraftRev publishedAt productionLocked defaults assetBase createdAt updatedAt ownerId description categoryId tags archivedAt isTemplate stage';
 
 function createMongoStore({ connection } = {}) {
   const OverlayLayout = require('../models/overlayLayout.model.js').modelFor(connection || mongoose.connection);
@@ -52,9 +52,9 @@ function createMongoStore({ connection } = {}) {
       return res.deletedCount > 0;
     },
     insertRevision: async (rev) => (await OverlayLayoutRevision.create(rev)).toObject(),
-    markPublished: (id, ownerId, fromRev, toRev, revisionId) => OverlayLayout.findOneAndUpdate(
+    markPublished: (id, ownerId, fromRev, toRev, revisionId, draftRev = null) => OverlayLayout.findOneAndUpdate(
       { _id: id, ownerId, publishedRev: fromRev, productionLocked: false },
-      { $set: { publishedRev: toRev, publishedRevisionId: revisionId, publishedAt: new Date() } },
+      { $set: { publishedRev: toRev, publishedRevisionId: revisionId, publishedDraftRev: draftRev, publishedAt: new Date() } },
       opts
     ),
     listRevisions: (layoutId) => OverlayLayoutRevision.find({ layoutId }).select('rev createdAt publishedBy').sort({ rev: -1 }).lean(),
@@ -141,10 +141,10 @@ function createMemoryStore() {
       revisions.push(r);
       return clone(r);
     },
-    async markPublished(id, ownerId, fromRev, toRev, revisionId) {
+    async markPublished(id, ownerId, fromRev, toRev, revisionId, draftRev = null) {
       const l = find(id, ownerId);
       if (!l || l.publishedRev !== fromRev || l.productionLocked) return null;
-      Object.assign(l, { publishedRev: toRev, publishedRevisionId: String(revisionId), publishedAt: new Date().toISOString() });
+      Object.assign(l, { publishedRev: toRev, publishedRevisionId: String(revisionId), publishedDraftRev: draftRev, publishedAt: new Date().toISOString() });
       touch(l);
       return clone(l);
     },

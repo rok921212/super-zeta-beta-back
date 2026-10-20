@@ -46,6 +46,16 @@ router.get('/team-defaults', adminPanel.getTeamDefaults);
 router.put('/team-defaults', adminPanel.updateTeamDefaults);
 router.post('/team-defaults/apply', invalidateCacheMiddleware(['cache:/api/teams', 'cache:/api/matches', 'cache:/api/groups']), adminPanel.applyTeamDefaults);
 
+// ── Home page simulation: which event it shows ─────────────────────────
+{
+  const homeShowcase = require('../controller/homeShowcase.controller.js');
+  router.get('/home-showcase', homeShowcase.get);
+  router.put('/home-showcase', homeShowcase.set);
+  router.post('/home-showcase/refresh', homeShowcase.refresh);
+  router.delete('/home-showcase', homeShowcase.clear);
+  router.get('/home-showcase/groups', homeShowcase.groups);   // ?roundId=
+}
+
 // ── Cross-user overview (read-only) ────────────────────────────────────
 router.get('/overview', adminPanel.overview);                        // every user + totals + last login + active API round
 router.get('/users/:id/activity', adminPanel.userActivity);          // one user's tournament -> round -> match-count tree
@@ -53,7 +63,24 @@ router.get('/users/:id/activity', adminPanel.userActivity);          // one user
 // ── User management ────────────────────────────────────────────────────
 router.get('/users', getAllUsers);                                   // existing controller
 router.post('/users', adminPanel.createUser);                        // normal / sub-admin / admin user
-router.put('/users/:id/access', adminPanel.setUserAccess);           // isSubAdmin + maxMatches only (NOT isAdmin)
+router.put('/users/:id/access', adminPanel.setUserAccess);           // isSubAdmin + maxMatches + allowedThemes (NOT isAdmin)
+// Director lock password of one account (route/directorLock.route.js).
+{
+  const { createDirectorLockAdminHandlers, getDirectorLockService } = require('./directorLock.route.js');
+  const lock = createDirectorLockAdminHandlers(getDirectorLockService());
+  router.get('/users/:id/director-lock', lock.get);
+  router.put('/users/:id/director-lock', lock.set);
+  router.post('/users/:id/director-lock/reset', lock.reset);
+  router.put('/users/:id/director-lock/scope', lock.scope);      // { director?, designer? }
+}
+// Director (Auto Switcher) settings of one account (route/directorSettings.route.js).
+{
+  const { createDirectorSettingsAdminHandlers, getDirectorSettingsService } = require('./directorSettings.route.js');
+  const settings = createDirectorSettingsAdminHandlers(getDirectorSettingsService());
+  router.get('/users/:id/director-settings', settings.get);
+  router.put('/users/:id/director-settings', settings.set);
+  router.post('/users/:id/director-settings/reset', settings.reset);
+}
 router.put('/users/:id', adminPanel.guardSelfDemote, updateUser);    // update / change password / grant-revoke admin
 router.delete('/users/:id', adminPanel.guardSelfDelete, deleteUser); // existing controller
 

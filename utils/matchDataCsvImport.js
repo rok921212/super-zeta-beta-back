@@ -11,11 +11,16 @@
 //  - A team holds at most MAX_TEAM_PLAYERS. When it is full, a new player
 //    takes the seat of a current player the CSV does not list; if every seat
 //    is a CSV player, the row is skipped.
+//  - An optional `rank` (1-MAX_RANK) sets the finishing rank of the team the
+//    row resolves to. Rows of one team that disagree resolve to the best
+//    (lowest) rank, with a note. A bad rank is ignored, not a skip.
 
 const MAX_TEAM_PLAYERS = 4;
 
 // Same rule as PLAYER_ID_FORMAT in teams.controller.js.
 const PLAYER_ID_FORMAT = /^\d{5,20}$/;
+
+const MAX_RANK = 32;
 
 // Lowercase + strip all whitespace, so "CYBER HERO" / "CyberHero" match.
 const normalizeForMatch = (s) => String(s || '').toLowerCase().replace(/\s+/g, '');
@@ -29,6 +34,15 @@ function parseKills(value) {
   if (!raw) return null;
   if (!/^\d+$/.test(raw)) return NaN;
   return parseInt(raw, 10);
+}
+
+// '' / undefined -> null; otherwise an integer 1..MAX_RANK, or NaN.
+function parseRank(value) {
+  const raw = str(value);
+  if (!raw) return null;
+  if (!/^\d+$/.test(raw)) return NaN;
+  const rank = parseInt(raw, 10);
+  return rank >= 1 && rank <= MAX_RANK ? rank : NaN;
 }
 
 const hasStats = (p) =>
@@ -68,11 +82,17 @@ function planCsvImport(teams, rows) {
       return skip(row, rowNum, 'duplicate_uid', `UID ${playerUid} appears more than once in the file — first row kept`);
     }
     seenUids.add(playerUid);
+    let rank = parseRank(row?.rank);
+    if (Number.isNaN(rank)) {
+      notes.push({ row: rowNum, message: `rank "${str(row?.rank)}" isn't a whole number from 1 to ${MAX_RANK} — rank ignored` });
+      rank = null;
+    }
     valid.push({
       rowNum,
       row,
       playerUid,
       kills,
+      rank,
       playerName: str(row?.playerName),
       teamTag: str(row?.teamTag),
       teamName: str(row?.teamName),
@@ -96,6 +116,15 @@ function planCsvImport(teams, rows) {
       null;
   };
 
+  // String(team._id) -> { team, ranks: [{ rank, rowNum }] }
+  const rankVotes = new Map();
+  const voteRank = (team, v) => {
+    if (v.rank === null) return;
+    const key = String(team._id);
+    if (!rankVotes.has(key)) rankVotes.set(key, { team, ranks: [] });
+    rankVotes.get(key).ranks.push({ rank: v.rank, rowNum: v.rowNum });
+  };
+
   // Pass 2: updates, and collect would-be adds per team.
   const pendingByTeam = new Map(); // String(team._id) -> { team, rows: [] }
   valid.forEach((v) => {
@@ -117,6 +146,7 @@ function planCsvImport(teams, rows) {
         playerName: v.playerName || null,
         kills: v.kills,
       });
+      voteRank(found.team, v);
       return;
     }
 
@@ -127,6 +157,7 @@ function planCsvImport(teams, rows) {
     if (!v.playerName) {
       return skip(v.row, v.rowNum, 'missing_name', `new player ${v.playerUid} needs a player name`);
     }
+    voteRank(team, v);
     const key = String(team._id);
     if (!pendingByTeam.has(key)) pendingByTeam.set(key, { team, rows: [] });
     pendingByTeam.get(key).rows.push(v);
@@ -167,7 +198,19 @@ function planCsvImport(teams, rows) {
     });
   }
 
-  return { updates, adds, skipped, notes };
+  const teamRanks = [];
+  for (const { team, ranks } of rankVotes.values()) {
+    const rank = Math.min(...ranks.map(r => r.rank));
+    if (ranks.some(r => r.rank !== rank)) {
+      notes.push({
+        row: ranks[0].rowNum,
+        message: `rows for "${team.teamTag || team.teamName}" give different ranks (${[...new Set(ranks.map(r => r.rank))].join(', ')}) — used ${rank}`,
+      });
+    }
+    teamRanks.push({ teamId: String(team.teamId), teamSubId: String(team._id), rank });
+  }
+
+  return { updates, adds, skipped, notes, teamRanks };
 }
 
-module.exports = { planCsvImport, MAX_TEAM_PLAYERS, PLAYER_ID_FORMAT };
+module.exports = { planCsvImport, MAX_TEAM_PLAYERS, PLAYER_ID_FORMAT, MAX_RANK };

@@ -51,10 +51,16 @@ function initializeSocket(server) {
     // JWT into socket.request.session; on a recovery there's no new
     // socket.data.userId to set anyway (it's restored), and the public
     // overlay path is anonymous — nothing to re-run.
+    // 10 min (was 2): a laptop that slept a few minutes resumes its session
+    // instead of re-joining and re-hydrating from scratch.
     connectionStateRecovery: {
-      maxDisconnectionDuration: 120000,
+      maxDisconnectionDuration: 600000,
       skipMiddlewares: true,
     },
+    // Dead-peer detection after a sleep / network drop: about 18 s instead of
+    // the 25 s + 20 s defaults (about 45 s). Pings are a few bytes each.
+    pingInterval: 10000,
+    pingTimeout: 8000,
   });
 
   // JWT handshake auth: populates socket.request.session = { userId } from

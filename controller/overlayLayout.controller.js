@@ -40,6 +40,8 @@ function toSummary(l) {
     schemaVersion: l.schemaVersion,
     draftRev: l.draftRev,
     publishedRev: l.publishedRev,
+    // The draft revision that was published; draftRev > this = unpublished changes. null = published before this was recorded.
+    publishedDraftRev: l.publishedDraftRev ?? null,
     publishedAt: l.publishedAt || null,
     productionLocked: !!l.productionLocked,
     defaults: l.defaults || { tournamentId: null, roundId: null, matchMode: 'selectedMatch' },
@@ -125,11 +127,40 @@ function isCollectionLimitError(err) {
   return /cannot create a new collection|collections? of \d+|too many collections/i.test(String(err.message));
 }
 
-/** Normalize + validate an untrusted draft. Returns { doc } or { errors }. */
-function checkDraft(raw) {
+// Code layers (designer-written TSX / JS, run in a sandboxed iframe on the
+// overlay page). CODE_LAYERS_ENABLED=false turns them off server-wide: a draft
+// holding one can then be neither saved nor published.
+const codeLayersEnabled = () => String(process.env.CODE_LAYERS_ENABLED ?? 'true').toLowerCase() !== 'false';
+
+/** Every code layer in a document (top level, groups, components). */
+function codeLayersOf(doc) {
+  const out = [];
+  const walk = (list) => (Array.isArray(list) ? list : []).forEach((el) => {
+    if (!el || typeof el !== 'object') return;
+    if (el.type === 'code') out.push(el);
+    walk(el.children);
+  });
+  walk(doc && doc.elements);
+  if (doc && doc.components && typeof doc.components === 'object') Object.values(doc.components).forEach((c) => walk(c && c.elements));
+  return out;
+}
+
+/**
+ * Normalize + validate an untrusted draft. Returns { doc } or { errors }.
+ * `publish`: also refuse code layers that were never compiled (the editor
+ * compiles on save; an imported .ssx is source only until then).
+ */
+function checkDraft(raw, opts = {}) {
   const doc = schema.normalizeLayout(raw);
   const result = schema.validateLayout(doc);
-  return result.ok ? { doc } : { errors: result.errors };
+  if (!result.ok) return { errors: result.errors };
+  const code = codeLayersOf(doc);
+  if (code.length && !codeLayersEnabled()) return { errors: [{ path: 'elements', message: 'Code layers are turned off on this server' }] };
+  if (opts.publish) {
+    const uncompiled = code.filter((el) => !(el.code && (el.code.compiledJs || el.code.html)));
+    if (uncompiled.length) return { errors: uncompiled.map((el) => ({ path: el.id, message: `Code layer "${el.name || el.id}" is not compiled: open it in the Designer and save it` })) };
+  }
+  return { doc };
 }
 
 /** Validate the optional non-document fields. Returns { set } or { errors }. */
@@ -205,7 +236,7 @@ async function publishLayout(store, fontStore, layout, userId, doc) {
     if (err && err.code === 11000) return { conflict: true, rev: nextRev };
     throw err;
   }
-  const updated = await store.markPublished(layout._id, userId, layout.publishedRev, nextRev, revision._id);
+  const updated = await store.markPublished(layout._id, userId, layout.publishedRev, nextRev, revision._id, layout.draftRev);
   if (!updated) return { missed: true, rev: nextRev };
   return { layout: updated, rev: nextRev };
 }
@@ -344,7 +375,7 @@ function createOverlayLayoutController(store, { themeStore = null, fontStore = n
       if (body.expectedRev != null && body.expectedRev !== layout.draftRev) {
         return res.status(409).json({ message: 'Layout changed since you loaded it', currentRev: layout.draftRev, publishedRev: layout.publishedRev });
       }
-      const draft = checkDraft(layout.draft);
+      const draft = checkDraft(layout.draft, { publish: true });
       if (draft.errors) return res.status(400).json({ message: 'Draft is not publishable', errors: draft.errors });
       // Every uploaded image the draft uses must still be in the owner's library:
       // a published overlay must never point at a picture that is not there.
@@ -449,7 +480,9 @@ function createOverlayLayoutController(store, { themeStore = null, fontStore = n
       if (!PUBLIC_ID_RE.test(publicId || '')) return res.status(404).json({ message: 'Overlay not found' });
       const layout = await store.getByPublicId(publicId);
       if (!layout || !layout.publishedRev) return res.status(404).json({ message: 'Overlay not found or not published' });
-      const etag = `"${publicId}-${layout.publishedRev}"`;
+      // The category is in the tag too: it decides whether the hide-On-air
+      // hotkey hides this page, and it can change without a publish.
+      const etag = `"${publicId}-${layout.publishedRev}-${layout.categoryId || ''}"`;
       res.set('ETag', etag);
       res.set('Cache-Control', 'public, max-age=10, stale-while-revalidate=60');
       res.removeHeader('Pragma');
@@ -466,6 +499,7 @@ function createOverlayLayoutController(store, { themeStore = null, fontStore = n
         stage: revision.document.stage,
         defaults: layout.defaults || { tournamentId: null, roundId: null, matchMode: 'selectedMatch' },
         assetBase: layout.assetBase || '',
+        categoryId: layout.categoryId || null,
         fonts: revision.fonts || [],
         published: revision.document,
       });

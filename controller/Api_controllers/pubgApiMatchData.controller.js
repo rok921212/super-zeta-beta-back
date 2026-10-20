@@ -18,12 +18,14 @@ const { emitToRoomSplitByFormat, roomSize, countNonRelaySockets } = require('../
 const { addWsFanout } = require('../../utils/bwCounters');
 const wsAccounting = require('../../utils/wsAccounting');
 const { toProtoMatchDataPayload, toProtoOverallDataPayload } = require('../../utils/protobufCodec');
-const { computeChangedTeams, TRACKED_FIELDS, stripPositionalFields } = require('../../utils/matchTeamDiff');
+const { computeChangedTeams, TRACKED_FIELDS, stripPositionalFields, keyframeHashOf } = require('../../utils/matchTeamDiff');
 const { getRoundStructureVersion } = require('../../utils/roundStructure');
 const { getPublicRev, bumpRound } = require('../../utils/publicRevision');
 const MatchModel = require('../../models/match.model');
 const { matchDataEpoch, matchSelectionEpoch, rosterEpoch } = require('../../utils/writeEpoch');
 const { monitorEventLoopDelay } = require('perf_hooks');
+const { applyFullSnapshot } = require('../../utils/liveSnapshot');
+const { rankToPlacePoints } = require('../../utils/placePoints');
 
 // ─── In-Memory Live Match Cache ───────────────────────────────────────────────
 const liveMatchCache = new Map();
@@ -869,6 +871,8 @@ const lastKeyframeAtByUserMatch = new Map();
 // cacheKey -> sha1 of the last keyframe's teams, so an unchanged roster is
 // not re-broadcast every LIVE_KEYFRAME_MS.
 const lastKeyframeHashByUserMatch = new Map();
+// keyframeHashOf (utils/matchTeamDiff.js): per-tick fields left out of the hash.
+const KEYFRAME_STABLE_HASH = process.env.LIVE_KEYFRAME_STABLE_HASH !== 'false';
 const SNAPSHOT_REQUEST_MIN_INTERVAL_MS = 1000;
 
 // A delta that carries any liveState/bHasDied change (knock, death, revive)
@@ -991,6 +995,22 @@ function evictLiveMatchKey(cacheKey) {
 
 // socket.id -> userId, so disconnect can clean up the right entries
 const socketIdToUserId = new Map();
+
+// The desktop relay sends registerRelay once per connection and never reads
+// the ack. If that one registration fails (cold Atlas lookup timing out on
+// the first start of the day), the socket stays connected but unregistered
+// and every tick is dropped until Render happens to close the WS minutes
+// later. Pushing this event makes fetcher.rs re-send registerRelay. At most
+// one ask every 2s per socket.
+const REREGISTER_ASK_MIN_GAP_MS = 2000;
+function askReregister(socket, why) {
+  if (!socket.connected || socket.data.userId || socket.data.relayTokenRejected) return;
+  const now = Date.now();
+  if (now - (socket.data.lastReregisterAskAt || 0) < REREGISTER_ASK_MIN_GAP_MS) return;
+  socket.data.lastReregisterAskAt = now;
+  console.warn(c('yellow', `[socket] asking ${socket.id} to re-register (${why})`));
+  socket.emit('relayReregister', { why });
+}
 
 // ─── Binary Payload Decode Helper ──────────────────────────────────────────
 // The relay now sends 'totalPlayerList' as MessagePack-encoded binary
@@ -1143,7 +1163,12 @@ function startLiveMatchUpdater() {
           console.log(c('dim', `[socket] user-room hydration -> ${socket.id} cacheKey=${cacheKey}`));
         }
       };
-      replayUserHydration();
+      // A client that connects with ?userFeed=0 (current dashboard + desktop
+      // hub builds) starts with the feed OFF: no replay now, it comes with its
+      // first setUserFeed {on:true}. Before, every idle/hidden dashboard tab
+      // and every hub reconnect paid a full hydration it then ignored.
+      if (socket.handshake.query?.userFeed === '0') socket.data.userFeed = false;
+      else replayUserHydration();
 
       // Dashboard feed gate: a dashboard tab only needs the user:<id>
       // liveMatchUpdate stream while the match-data page is open and visible
@@ -1192,6 +1217,9 @@ function startLiveMatchUpdater() {
   // that never gets this far (vs. one that arrives but then stalls/dies
   // inside the DB lookup below) is distinguishable from the outside.
   const registerStartedAt = Date.now();
+  // Marks this socket as a relay (the desktop hub socket also sends
+  // relayPing but never registers) so askReregister's ping path skips hubs.
+  socket.data.relayRegisterAttempted = true;
   console.log(c('dim', `[socket][registerRelay] received from ${socket.id} (mongoose readyState=${mongoose.connection.readyState})`));
 
   // The entire handler used to run with no try/catch. If User.findOne below
@@ -1239,7 +1267,10 @@ function startLiveMatchUpdater() {
     // before this line would have thrown or resolved on its own. Racing it
     // against an explicit 3s timeout makes the failure fast and LOUD
     // instead of silently outliving the caller.
-    const REGISTER_DB_LOOKUP_TIMEOUT_MS = 3000;
+    // 8s, not 3s: the relay never waits on this handler's ack, so a longer
+    // timeout costs nothing and lets a cold Atlas connection (first start
+    // of the day) actually finish instead of leaving the socket unregistered.
+    const REGISTER_DB_LOOKUP_TIMEOUT_MS = 8000;
     const user = await Promise.race([
       User.findOne({ relayToken }).select('_id').lean(),
       new Promise((_, reject) =>
@@ -1253,6 +1284,7 @@ function startLiveMatchUpdater() {
 
     if (!user) {
       console.warn(c('yellow', `[socket] registerRelay from ${socket.id} presented an unknown relayToken`));
+      socket.data.relayTokenRejected = true; // retrying can't help — see askReregister
       ack({ ok: false, reason: 'unknown relayToken' });
       return;
     }
@@ -1357,6 +1389,7 @@ function startLiveMatchUpdater() {
   } catch (err) {
     console.error(c('red', `[socket][registerRelay] handler FAILED for ${socket.id} after ${Date.now() - registerStartedAt}ms: ${err.message}`));
     ack({ ok: false, reason: 'internal error' });
+    askReregister(socket, 'register failed');
   }
 });
 
@@ -1367,6 +1400,9 @@ function startLiveMatchUpdater() {
 // socket is still alive. registerRelay itself is unchanged and still
 // fires on an actual (re)connect.
 socket.on('relayPing', (cb) => {
+  if (socket.data.relayRegisterAttempted && !socket.data.userId) {
+    askReregister(socket, 'ping from unregistered relay');
+  }
   if (typeof cb === 'function') cb();
 });
 
@@ -1374,6 +1410,7 @@ socket.on('relayPing', (cb) => {
       const userId = socket.data.userId;
       if (!userId) {
         console.warn(c('yellow', `[socket] totalPlayerList from unregistered socket ${socket.id} — ignored`));
+        askReregister(socket, 'data from unregistered socket');
         return;
       }
 
@@ -1448,10 +1485,15 @@ socket.on('relayPing', (cb) => {
           }
           console.debug(`[socket] stale full snapshot (wireSeq=${wireSeq} < ${state.lastReceivedSeq}) user=${userId} — merged unseen players only, did not overwrite`);
         } else {
-          state.players = new Map();
-          for (const p of incomingPlayers) {
-            const uid = playerKeyOf(p);
-            if (uid != null) state.players.set(uid, p);
+          // Same game: keep the dead players the snapshot lacks (PCOB drops
+          // them, and a restarted desktop relay has not seen them). A new
+          // game replaces the map outright (utils/liveSnapshot.js).
+          const { players, sameGame, keptDead } = applyFullSnapshot(state.players, incomingPlayers, playerKeyOf);
+          state.players = players;
+          if (keptDead > 0) {
+            console.log(c('cyan', `[live][snapshot] user=${userId} same-game full snapshot kept ${keptDead} dead player(s) it lacked`));
+          } else if (!sameGame && players.size > 0) {
+            console.log(c('cyan', `[live][game] user=${userId} full snapshot starts a new game (${players.size} players)`));
           }
         }
         if (wireSeq != null) {
@@ -1970,12 +2012,18 @@ socket.on('relayPing', (cb) => {
 
         let finalPlayer;
         if (matchPlayer || grpPlayer) {
+          // The in-game name wins: the same uId can carry a newer name than
+          // the roster. This is also what lets playerCheckandSwitch's
+          // [NAME-SYNC] see the change and update the Team roster (it used
+          // to get the roster's own name back and never saw a difference).
+          // An empty or missing live name keeps the stored one.
+          const liveName = typeof apiPlayer.playerName === 'string' ? apiPlayer.playerName.trim() : '';
           finalPlayer = {
             ...apiPlayer,
             _id:                   matchPlayer?._id || new mongoose.Types.ObjectId(),
             uId:                   uid,
             playerOpenId:          matchPlayer?.playerOpenId  || grpPlayer?.playerOpenId  || apiPlayer.playerOpenId || '',
-            playerName:            matchPlayer?.playerName?.trim() || grpPlayer?.playerName?.trim() || apiPlayer.playerName,
+            playerName:            liveName || matchPlayer?.playerName?.trim() || grpPlayer?.playerName?.trim() || apiPlayer.playerName,
             picUrl:                matchPlayer?.picUrl?.trim() || grpPlayer?.photo?.trim() || apiPlayer.picUrl || '',
             showPicUrl:            '',
             teamIdfromApi:         team.slot,
@@ -2041,19 +2089,7 @@ socket.on('relayPing', (cb) => {
       // allowed to go empty without that being read as "eliminated."
       if (!team.placePointsLocked && teamRank !== null) {
         team.rank = teamRank;
-        team.placePoints = ((rank) => {
-          switch (rank) {
-            case 1: return 10;
-            case 2: return 6;
-            case 3: return 5;
-            case 4: return 4;
-            case 5: return 3;
-            case 6: return 2;
-            case 7: return 1;
-            case 8: return 1;
-            default: return 0;
-          }
-        })(teamRank);
+        team.placePoints = rankToPlacePoints(teamRank);
       }
 
       // team.players reflects only players actually reported live by the
@@ -2403,6 +2439,12 @@ socket.on('relayPing', (cb) => {
             for (const id of userRoomIds) {
               const s = io.sockets.sockets.get(id);
               if (!s || s.data?.userId) continue;
+              // The desktop hub never uses dataHeartbeat (not forwarded to its
+              // windows): it is only a consumer while it holds the live feed.
+              if (s.handshake.query?.client === 'hub') {
+                if (s.data?.userFeed !== false) feedTargets.push(id);
+                continue;
+              }
               userTargets.push(id);
               if (s.data?.userFeed !== false) feedTargets.push(id);
             }
@@ -2411,7 +2453,7 @@ socket.on('relayPing', (cb) => {
           const positionalSize = roomSize(io, matchDataPositionalRoom);
           const overallSize = roomSize(io, overallRoom);
 
-          if (userTargets.length === 0 && matchDataSize === 0 && positionalSize === 0 && overallSize === 0) {
+          if (userTargets.length === 0 && feedTargets.length === 0 && matchDataSize === 0 && positionalSize === 0 && overallSize === 0) {
             cloudLiveTicksSkippedNoConsumers++;
             return;
           }
@@ -2441,7 +2483,9 @@ socket.on('relayPing', (cb) => {
               matchId: String(selected.matchId),
               at: Date.now(),
             });
+          }
 
+          {
             if (changedTeams.length > 0 && feedTargets.length > 0) {
               // location stripped: no user:-room consumer renders player
               // position off THIS feed — ObservingPlayer.tsx and both
@@ -2508,7 +2552,7 @@ socket.on('relayPing', (cb) => {
             if ((matchDataSize > 0 || positionalSize > 0) &&
                 now - (lastKeyframeAtByUserMatch.get(cacheKey) || 0) >= LIVE_KEYFRAME_MS) {
               lastKeyframeAtByUserMatch.set(cacheKey, now);
-              const keyframeHash = crypto.createHash('sha1').update(JSON.stringify(memoryMatch.teams)).digest('base64');
+              const keyframeHash = keyframeHashOf(memoryMatch.teams, KEYFRAME_STABLE_HASH);
               if (lastKeyframeHashByUserMatch.get(cacheKey) !== keyframeHash) {
                 lastKeyframeHashByUserMatch.set(cacheKey, keyframeHash);
                 if (matchDataSize > 0) emitLiveSnapshot(io, matchDataRoom, memoryMatch, selected.matchId, seq, false);

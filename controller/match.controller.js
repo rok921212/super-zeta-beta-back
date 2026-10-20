@@ -16,6 +16,7 @@ const {
 } = require('./matchData.controller.js');
 const { getSocket } = require('../socket.js');
 const { notifyRoundStructureChanged } = require('../utils/roundStructure.js');
+const { normalizeSmashPoint } = require('../utils/smashPoint.js');
 const { saveLiveMatchSnapshot } = require('./Api_controllers/pubgApiMatchData.controller.js');
 const { bumpRound } = require('../utils/publicRevision.js');
 
@@ -184,6 +185,13 @@ const updateMatch = async (req, res) => {
       match.groups = req.body.groupIds;
     }
     delete req.body.groupIds;
+
+    if (req.body.smashPoint !== undefined) {
+      const sp = normalizeSmashPoint(req.body.smashPoint);
+      if (sp.error) return res.status(400).json({ error: sp.error });
+      match.smashPoint = sp.value;
+      delete req.body.smashPoint;
+    }
 
     Object.assign(match, req.body);
     const updatedMatch = await match.save();

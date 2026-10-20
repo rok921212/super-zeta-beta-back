@@ -34,6 +34,18 @@ function parseMaxMatches(raw) {
   return { ok: true, value: n };
 }
 
+// Normalise allowedThemes: undefined = not sent, null = every theme (unset),
+// otherwise a de-duplicated list of built-in theme ids (Theme1, Theme2, …).
+const THEME_ID_RE = /^Theme[1-9]d{0,2}$/;
+function parseAllowedThemes(raw) {
+  if (raw === undefined) return { ok: true, value: undefined };
+  if (raw === null) return { ok: true, value: null };
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 50 || !raw.every((t) => typeof t === 'string' && THEME_ID_RE.test(t))) {
+    return { ok: false };
+  }
+  return { ok: true, value: [...new Set(raw)] };
+}
+
 function sanitizeUser(doc) {
   if (!doc) return null;
   const o = typeof doc.toObject === 'function' ? doc.toObject() : doc;
@@ -99,7 +111,8 @@ const createUser = async (req, res) => {
 };
 
 // ── set the sub-admin flag and/or the match quota on a user ────────────
-// PUT /api/admin-panel/users/:id/access  body { isSubAdmin?, maxMatches? }
+// PUT /api/admin-panel/users/:id/access  body { isSubAdmin?, maxMatches?, allowedThemes? }
+// allowedThemes: array of built-in theme ids, or null for every theme.
 // Deliberately does NOT touch isAdmin — that stays on PUT /users/:id
 // (guardSelfDemote -> updateUser) so the last-admin lockout guard is kept.
 const setUserAccess = async (req, res) => {
@@ -109,6 +122,10 @@ const setUserAccess = async (req, res) => {
     const maxMatches = parseMaxMatches(req.body?.maxMatches);
     if (!maxMatches.ok) {
       return res.status(400).json({ message: 'maxMatches must be a whole number >= 0 (0 = unlimited)' });
+    }
+    const allowedThemes = parseAllowedThemes(req.body?.allowedThemes);
+    if (!allowedThemes.ok) {
+      return res.status(400).json({ message: 'allowedThemes must be null (every theme) or a list like ["Theme1","Theme3"]' });
     }
 
     const target = await User.findById(id).select('isAdmin').maxTimeMS(5000);
@@ -120,16 +137,22 @@ const setUserAccess = async (req, res) => {
       $set.isSubAdmin = target.isAdmin ? false : !!isSubAdmin;
     }
     if (maxMatches.value !== undefined) $set.maxMatches = maxMatches.value;
+    const $unset = {};
+    if (allowedThemes.value === null) $unset.allowedThemes = 1;
+    else if (allowedThemes.value !== undefined) $set.allowedThemes = allowedThemes.value;
 
-    if (Object.keys($set).length === 0) {
-      return res.status(400).json({ message: 'Nothing to update (send isSubAdmin and/or maxMatches)' });
+    if (Object.keys($set).length === 0 && Object.keys($unset).length === 0) {
+      return res.status(400).json({ message: 'Nothing to update (send isSubAdmin, maxMatches and/or allowedThemes)' });
     }
 
-    const updated = await User.findByIdAndUpdate(id, { $set }, { new: true })
-      .select('username email isAdmin isSubAdmin maxMatches lastLoginAt loginCount createdAt')
+    const update = {};
+    if (Object.keys($set).length) update.$set = $set;
+    if (Object.keys($unset).length) update.$unset = $unset;
+    const updated = await User.findByIdAndUpdate(id, update, { new: true })
+      .select('username email isAdmin isSubAdmin maxMatches allowedThemes lastLoginAt loginCount createdAt')
       .maxTimeMS(5000);
 
-    console.log(`[admin-panel] access set id=${id} ${JSON.stringify($set)} by=${req.authUser._id}`);
+    console.log(`[admin-panel] access set id=${id} ${JSON.stringify(update)} by=${req.authUser._id}`);
     return res.json(sanitizeUser(updated));
   } catch (err) {
     return res.status(400).json({ message: err.message });
@@ -209,7 +232,7 @@ const overview = async (req, res) => {
   try {
     const [users, tAgg, rAgg, mAgg, apiRounds] = await Promise.all([
       User.find()
-        .select('username email isAdmin isSubAdmin maxMatches lastLoginAt loginCount createdAt')
+        .select('username email isAdmin isSubAdmin maxMatches allowedThemes lastLoginAt loginCount createdAt')
         .sort({ createdAt: 1 })
         .lean(),
       // Tournament.userId, Round.createdBy, Match.userId are the owner fields.
@@ -244,6 +267,7 @@ const overview = async (req, res) => {
         isAdmin: !!u.isAdmin,
         isSubAdmin: !!u.isSubAdmin,
         maxMatches: u.maxMatches || 0,
+        allowedThemes: Array.isArray(u.allowedThemes) ? u.allowedThemes : null,
         lastLoginAt: u.lastLoginAt || null,
         loginCount: u.loginCount || 0,
         createdAt: u.createdAt,
@@ -509,6 +533,7 @@ const applyTeamDefaults = async (req, res) => {
 };
 
 module.exports = {
+  parseAllowedThemes,
   me,
   storage,
   bandwidth,

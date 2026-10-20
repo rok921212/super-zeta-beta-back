@@ -89,3 +89,34 @@ test('bad UID, bad kills, duplicate UID and nameless new player are skipped', ()
   assert.deepEqual(plan.skipped.map(s => s.row), [2, 3, 5, 6]);
   assert.equal(plan.updates.length, 1);
 });
+
+test('rank: one rank per team, taken from the rows that resolve to it', () => {
+  const plan = planCsvImport(makeTeams(), [
+    { ...row('ALP', '100001'), rank: '3' },
+    { ...row('ALP', '200001', 'Fresh'), rank: '3' },
+    { ...row('BRV', '100003'), rank: '' },
+  ]);
+  assert.deepEqual(plan.teamRanks, [{ teamId: 'tA', teamSubId: 'mA', rank: 3 }]);
+  assert.equal(plan.notes.length, 0);
+});
+
+test('rank: conflicting rows use the best rank and leave a note', () => {
+  const plan = planCsvImport(makeTeams(), [
+    { ...row('BRV', '100003'), rank: '5' },
+    { ...row('BRV', '100004'), rank: '2' },
+  ]);
+  assert.deepEqual(plan.teamRanks, [{ teamId: 'tB', teamSubId: 'mB', rank: 2 }]);
+  assert.equal(plan.notes.length, 1);
+});
+
+test('rank: a bad rank is ignored with a note, the row still applies', () => {
+  const plan = planCsvImport(makeTeams(), [{ ...row('ALP', '100001', 'X', '4'), rank: '40' }]);
+  assert.equal(plan.updates.length, 1);
+  assert.equal(plan.teamRanks.length, 0);
+  assert.equal(plan.notes.length, 1);
+});
+
+test('rank: rows without a rank column produce no ranks', () => {
+  const plan = planCsvImport(makeTeams(), [row('ALP', '100001')]);
+  assert.deepEqual(plan.teamRanks, []);
+});

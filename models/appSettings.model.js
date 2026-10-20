@@ -16,6 +16,9 @@ const appSettingsSchema = new mongoose.Schema({
     photo: { type: [String], default: [] },
     flag: { type: [String], default: [] },
   },
+  // Only on the doc with key 'homeShowcase': the event the home page
+  // simulation shows (services/homeShowcase.js).
+  showcase: { type: mongoose.Schema.Types.Mixed, default: undefined },
 }, { timestamps: true });
 
 // Bound per connection: the main cluster is at its collection cap, so this

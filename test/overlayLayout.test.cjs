@@ -172,14 +172,18 @@ test('publish creates an immutable revision; later autosaves never change what i
   const p1 = await call('POST', `/api/overlay-layouts/${l._id}/publish`, { user: ALICE, body: { expectedRev: 1 } });
   assert.equal(p1.status, 200, JSON.stringify(p1.json));
   assert.equal(p1.json.publishedRev, 1);
+  assert.equal(p1.json.publishedDraftRev, 1, 'the published draft revision is recorded');
 
   await call('PUT', `/api/overlay-layouts/${l._id}`, { user: ALICE, body: { expectedRev: 1, draft: draftWith(textEl('v2')) } });
   const live = await call('GET', `/api/overlay-render/${l.publicId}`);
   assert.equal(live.status, 200);
   assert.equal(live.json.published.elements[0].id, 'v1', 'draft edit did not leak to the live revision');
 
+  const edited = await call('GET', `/api/overlay-layouts/${l._id}`, { user: ALICE });
+  assert.ok(edited.json.draftRev > edited.json.publishedDraftRev, 'a saved edit after publishing shows as unpublished');
   const p2 = await call('POST', `/api/overlay-layouts/${l._id}/publish`, { user: ALICE, body: {} });
   assert.equal(p2.json.publishedRev, 2);
+  assert.equal(p2.json.publishedDraftRev, 2);
   const rev1 = await store.getRevision(l._id, 1);
   assert.equal(rev1.document.elements[0].id, 'v1', 'revision 1 unchanged');
 
@@ -231,7 +235,8 @@ test('public render: 404 until published, then ETag / 304, and new ETag after re
   const r = await call('GET', `/api/overlay-render/${l.publicId}`);
   assert.equal(r.status, 200);
   const etag = r.headers.get('etag');
-  assert.equal(etag, `"${l.publicId}-1"`);
+  // The category is part of the tag (it decides whether hide-On-air hides the page).
+  assert.equal(etag, `"${l.publicId}-1-"`);
   assert.match(r.headers.get('cache-control'), /max-age=10/);
   assert.equal(r.json.defaults.tournamentId, ALICE);
   assert.equal(r.json.assetBase, 'https://cdn.example.com');
@@ -242,7 +247,7 @@ test('public render: 404 until published, then ETag / 304, and new ETag after re
   await call('POST', `/api/overlay-layouts/${l._id}/publish`, { user: ALICE, body: {} });
   const again = await call('GET', `/api/overlay-render/${l.publicId}`, { headers: { 'If-None-Match': etag } });
   assert.equal(again.status, 200);
-  assert.equal(again.headers.get('etag'), `"${l.publicId}-2"`);
+  assert.equal(again.headers.get('etag'), `"${l.publicId}-2-"`);
 });
 
 test('duplicate makes an unpublished copy with a new publicId; delete removes revisions', async () => {

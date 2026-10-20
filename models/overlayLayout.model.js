@@ -22,6 +22,8 @@ const overlayLayoutSchema = new mongoose.Schema({
   draftRev: { type: Number, required: true, default: 1 },
   publishedRev: { type: Number, required: true, default: 0 },
   publishedRevisionId: { type: mongoose.Schema.Types.ObjectId, ref: 'OverlayLayoutRevision', default: null },
+  // draftRev at the last publish (null on layouts published before it was recorded).
+  publishedDraftRev: { type: Number, default: null },
   publishedAt: { type: Date, default: null },
   productionLocked: { type: Boolean, default: false },
   defaults: {

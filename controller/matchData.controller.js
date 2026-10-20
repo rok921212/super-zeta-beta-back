@@ -6,6 +6,8 @@ const Group = require('../models/group.model.js');
 const Team = require('../models/teams.model.js');
 const User = require('../models/User.model.js');
 const { planCsvImport } = require('../utils/matchDataCsvImport');
+const { buildUidDirectory } = require('../utils/uidDirectory');
+const { rankToPlacePoints } = require('../utils/placePoints');
 const { getSocket } = require('../socket.js');
 const mongoose = require('mongoose');
 const { computeOverallMatchDataForRound } = require('./overall.controller');
@@ -1187,14 +1189,35 @@ const copyRosterFromPreviousMatch = async (req, res) => {
     const currentMatch = await Match.findById(matchData.matchId).lean();
     if (!currentMatch) return res.status(404).json({ error: 'Match not found for this MatchData' });
 
-    const previousMatch = await Match.findOne({
-      tournamentId: currentMatch.tournamentId,
-      roundId: currentMatch.roundId,
-      userId: req.session.userId,
-      matchNo: { $lt: currentMatch.matchNo },
-    }).sort({ matchNo: -1, _id: -1 }).lean();
-    if (!previousMatch) {
-      return res.status(404).json({ error: 'No previous match found in this round', reason: 'no_previous_match' });
+    // Optional body.sourceMatchId picks the match to copy from (any match of
+    // the same tournament). Without it: the previous match in this round.
+    const { sourceMatchId } = req.body || {};
+    let previousMatch;
+    if (sourceMatchId) {
+      if (!mongoose.Types.ObjectId.isValid(sourceMatchId)) {
+        return res.status(400).json({ error: 'Invalid sourceMatchId', reason: 'source_not_found' });
+      }
+      if (String(sourceMatchId) === String(currentMatch._id)) {
+        return res.status(400).json({ error: 'Cannot copy a match onto itself', reason: 'same_match' });
+      }
+      previousMatch = await Match.findOne({
+        _id: sourceMatchId,
+        tournamentId: currentMatch.tournamentId,
+        userId: req.session.userId,
+      }).lean();
+      if (!previousMatch) {
+        return res.status(404).json({ error: 'Source match not found in this tournament', reason: 'source_not_found' });
+      }
+    } else {
+      previousMatch = await Match.findOne({
+        tournamentId: currentMatch.tournamentId,
+        roundId: currentMatch.roundId,
+        userId: req.session.userId,
+        matchNo: { $lt: currentMatch.matchNo },
+      }).sort({ matchNo: -1, _id: -1 }).lean();
+      if (!previousMatch) {
+        return res.status(404).json({ error: 'No previous match found in this round', reason: 'no_previous_match' });
+      }
     }
 
     const previousMatchData = await MatchData.findOne({ matchId: previousMatch._id, userId: req.session.userId }).lean();
@@ -1305,7 +1328,7 @@ const importMatchDataCsv = async (req, res) => {
     if (!matchData) return res.status(404).json({ error: 'MatchData not found or not yours' });
 
     const plan = planCsvImport(matchData.toObject().teams, rows);
-    const { updates, adds, skipped, notes } = plan;
+    const { updates, adds, skipped, notes, teamRanks } = plan;
 
     // ── Teams catalog: make sure every new player exists on its team ──────
     // Includes adds that found no seat in the match (team_full) — they're
@@ -1432,6 +1455,22 @@ const importMatchDataCsv = async (req, res) => {
       changedTeamIds.add(String(team._id));
     }
 
+    // Ranks from the file (screenshot import): score them the same way the
+    // live loop does, and lock them like a manual updateTeamPoints so the
+    // next live tick doesn't revert them.
+    let rankedCount = 0;
+    const rankedTeamIds = new Set();
+    for (const tr of teamRanks) {
+      const team = matchData.teams.id(tr.teamSubId);
+      if (!team) continue;
+      team.rank = tr.rank;
+      team.placePoints = rankToPlacePoints(tr.rank);
+      team.placePointsLocked = true;
+      rankedCount += 1;
+      rankedTeamIds.add(String(team._id));
+      changedTeamIds.add(String(team._id));
+    }
+
     const changedTeams = [];
     if (changedTeamIds.size > 0) {
       matchData.markModified('teams');
@@ -1442,12 +1481,15 @@ const importMatchDataCsv = async (req, res) => {
       for (const team of matchData.teams) {
         if (!changedTeamIds.has(String(team._id))) continue;
         const players = team.toObject().players;
-        changedTeams.push({ teamId: team.teamId, teamName: team.teamName, players });
+        const changes = rankedTeamIds.has(String(team._id))
+          ? { players, rank: team.rank, placePoints: team.placePoints, placePointsLocked: true }
+          : { players };
+        changedTeams.push({ teamId: team.teamId, teamName: team.teamName, ...changes });
         console.log(`[socket] matchDataUpdated -> user:${userId} team=${team.teamId} csv-import`);
         io.to(`user:${userId}`).emit('matchDataUpdated', {
           matchDataId,
           teamId: team.teamId,
-          changes: { players },
+          changes,
         });
       }
       emitOverallUpdateAsync(io, matchData.matchId, userId, matchData.toObject());
@@ -1468,13 +1510,14 @@ const importMatchDataCsv = async (req, res) => {
     const { getLiveMatchData } = require('./Api_controllers/pubgApiMatchData.controller.js');
     const liveActive = !!getLiveMatchData(matchData.matchId);
 
-    console.log(`[MATCHDATA] csv-import matchData=${matchDataId} rows=${rows.length} updated=${updatedCount} added=${addedCount} replaced=${replacedCount} catalogAdded=${catalogAddedCount} skipped=${skipped.length}`);
+    console.log(`[MATCHDATA] csv-import matchData=${matchDataId} rows=${rows.length} updated=${updatedCount} added=${addedCount} replaced=${replacedCount} ranked=${rankedCount} catalogAdded=${catalogAddedCount} skipped=${skipped.length}`);
     return res.json({
       message: 'CSV import finished',
       matchDataId,
       updatedCount,
       addedCount,
       replacedCount,
+      rankedCount,
       catalogAddedCount,
       skipped: skipped.sort((a, b) => a.row - b.row),
       catalogSkipped,
@@ -1487,6 +1530,73 @@ const importMatchDataCsv = async (req, res) => {
     return res.status(500).json({ error: error.message });
   } finally {
     releaseLock(lockKey);
+  }
+};
+
+// ─── UID directory (screenshot import) ────────────────────────────────────
+// GET ?source=<matchId>|all — known names + UIDs per team of this match, so
+// the website can turn OCR'd names into UIDs. Merge rules live in
+// utils/uidDirectory.js. `all` reads every other match of the tournament,
+// newest first.
+const getUidDirectory = async (req, res) => {
+  try {
+    const { matchDataId } = req.params;
+    if (!req.session || !req.session.userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!mongoose.Types.ObjectId.isValid(matchDataId)) {
+      return res.status(400).json({ error: 'Invalid ObjectId format for matchDataId' });
+    }
+    const userId = req.session.userId;
+    const source = String(req.query.source || 'all');
+
+    const matchData = await MatchData.findOne({ _id: matchDataId, userId })
+      .select('matchId teams.teamId teams.teamName teams.teamTag teams.slot teams.players.playerName teams.players.uId')
+      .lean();
+    if (!matchData) return res.status(404).json({ error: 'MatchData not found or not yours' });
+
+    const currentMatch = await Match.findById(matchData.matchId).select('tournamentId').lean();
+    if (!currentMatch) return res.status(404).json({ error: 'Match not found for this MatchData' });
+
+    const matchFilter = { tournamentId: currentMatch.tournamentId, userId, _id: { $ne: currentMatch._id } };
+    if (source !== 'all') {
+      if (!mongoose.Types.ObjectId.isValid(source)) {
+        return res.status(400).json({ error: 'source must be a match id or "all"' });
+      }
+      if (source === String(currentMatch._id)) {
+        return res.status(400).json({ error: 'source must be a different match' });
+      }
+      matchFilter._id = source;
+    }
+    const sourceMatchDocs = await Match.find(matchFilter).select('matchNo').sort({ _id: -1 }).lean();
+    if (source !== 'all' && sourceMatchDocs.length === 0) {
+      return res.status(404).json({ error: 'Source match not found in this tournament' });
+    }
+
+    const sourceData = sourceMatchDocs.length
+      ? await MatchData.find({ matchId: { $in: sourceMatchDocs.map(m => m._id) }, userId })
+        .select('matchId teams.teamId teams.players.playerName teams.players.uId')
+        .lean()
+      : [];
+    const dataByMatch = new Map(sourceData.map(md => [String(md.matchId), md]));
+    const sourceMatches = sourceMatchDocs
+      .filter(m => dataByMatch.has(String(m._id)))
+      .map(m => ({ matchId: m._id, matchNo: m.matchNo, teams: dataByMatch.get(String(m._id)).teams }));
+
+    const teamIds = (matchData.teams || []).map(t => t.teamId).filter(Boolean);
+    const catalogTeams = teamIds.length
+      ? await Team.find({ _id: { $in: teamIds } }).select('players.playerName players.playerId').lean()
+      : [];
+
+    return res.json({
+      matchDataId,
+      source,
+      sourceMatchCount: sourceMatches.length,
+      teams: buildUidDirectory(matchData.teams, sourceMatches, catalogTeams),
+    });
+  } catch (error) {
+    console.error('Error building UID directory:', error);
+    return res.status(500).json({ error: error.message });
   }
 };
 
@@ -1529,6 +1639,7 @@ module.exports = {
   removePlayersFromTeamInMatchData,
   copyRosterFromPreviousMatch,
   importMatchDataCsv,
+  getUidDirectory,
   updateTeamPlayersBulkStats,
   getUnmatchedPlayersForMatch,
 };

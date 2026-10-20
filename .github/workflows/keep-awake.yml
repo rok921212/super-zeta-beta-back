@@ -1,0 +1,29 @@
+# Keeps the Render free-plan instance from sleeping (it spins down after
+# about 15 minutes with no HTTP request). /api/wake answers once Mongo is
+# connected, so a run that lands on a sleeping instance also warms it fully.
+#
+# GitHub may delay or skip scheduled runs under load, so also point an outside
+# monitor (cron-job.org or UptimeRobot, every 10 minutes) at the same URL.
+# Override the URL with the repository variable KEEPALIVE_URL.
+name: keep-awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Wake the backend
+        env:
+          URL: ${{ vars.KEEPALIVE_URL || 'https://super-zeta-beta-back-jttd.onrender.com/api/wake' }}
+        run: |
+          for i in 1 2 3; do
+            if curl -fsS --max-time 60 "$URL"; then echo; exit 0; fi
+            sleep 10
+          done
+          echo "backend did not answer" >&2
+          exit 1

@@ -198,8 +198,8 @@ function withLayoutCache(store, { backend = redis } = {}) {
       if (updated) await invalidate(id, ownerId);
       return updated;
     },
-    async markPublished(id, ownerId, fromRev, toRev, revisionId) {
-      const updated = await store.markPublished(id, ownerId, fromRev, toRev, revisionId);
+    async markPublished(id, ownerId, fromRev, toRev, revisionId, draftRev) {
+      const updated = await store.markPublished(id, ownerId, fromRev, toRev, revisionId, draftRev);
       if (updated) await invalidate(id, ownerId);
       return updated;
     },
