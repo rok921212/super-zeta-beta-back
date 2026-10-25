@@ -570,7 +570,10 @@ const getMatchDataByMatchId = async (req, res) => {
       if (!round) return res.status(404).json({ error: 'Round not found' });
       const tournament = await Tournament.findById(round.tournamentId).lean();
       if (!tournament) return res.status(404).json({ error: 'Tournament not found' });
-      userId = tournament.createdBy;
+      // The tournament's owner field is `userId`; no tournament has
+      // `createdBy`, so reading only that left userId undefined and every
+      // anonymous call (the desktop relay strips auth) 404'd "not yours".
+      userId = tournament.userId || tournament.createdBy || round.createdBy;
     }
 
     let match = await Match.findOne({ _id: matchId, userId }).lean();

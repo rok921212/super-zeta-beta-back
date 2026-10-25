@@ -24,7 +24,6 @@ const RECOMMENDED = Object.freeze({
   fightDwellS: 9,
   idleDwellS: 20,
   minKeyGapS: 1,
-  manualHoldS: 20,
   fightMargin: 0.25,
   playerMargin: 1,
   resolveAfterS: 6,
@@ -44,7 +43,6 @@ const RANGES = {
   fightDwellS: [1, 120],
   idleDwellS: [3, 300],
   minKeyGapS: [0.5, 10],
-  manualHoldS: [0, 600],
   fightMargin: [0, 5],
   playerMargin: [0, 10],
   resolveAfterS: [2, 30],
@@ -55,6 +53,8 @@ const RANGES = {
   leadTicks: [1, 20, true],
 };
 const IDLE_POLICIES = ['rotate', 'stay'];
+// Settings the desktop app no longer has; an older admin page may still send them.
+const RETIRED = new Set(['manualHoldS']);
 const DECISIONS_KEPT = 40;
 const DECISION_BATCH = 20;
 
@@ -63,6 +63,7 @@ function validConfig(input) {
   if (input == null || typeof input !== 'object' || Array.isArray(input)) throw new LockError(400, 'config must be an object');
   const out = { ...RECOMMENDED };
   for (const [k, v] of Object.entries(input)) {
+    if (RETIRED.has(k)) continue;
     if (RANGES[k]) {
       const [min, max, int] = RANGES[k];
       if (typeof v !== 'number' || !Number.isFinite(v) || v < min || v > max || (int && !Number.isInteger(v))) {

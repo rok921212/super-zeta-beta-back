@@ -40,11 +40,12 @@ function convertTo12Hour(time24) {
 // one round). Dropped entirely; matchData for a specific match/round is
 // what /api/public/bulk and matchDataController.tsx already fetch
 // separately when actually needed.
+// Groups: only their name. Every caller (Match.tsx ×2, DisplayHud,
+// LiveSourceBar, activeMatch.ts, useTournamentMatches) reads groups[]._id /
+// groupName — the full Team docs under slots.team were repeated for every
+// match in the list (561 KB raw for one round) and never read.
 async function fetchMatchWithData(match) {
-  const populatedMatch = await match.populate({
-    path: 'groups',
-    populate: { path: 'slots.team', model: 'Team' },
-  });
+  const populatedMatch = await match.populate({ path: 'groups', select: 'groupName' });
   const obj = populatedMatch.toObject();
   // autoLocked: the match has results, so group edits no longer reach it
   // (see isMatchLocked). Lean projection — just enough to decide.

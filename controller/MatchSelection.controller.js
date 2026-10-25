@@ -7,7 +7,11 @@ const { notifyRoundStructureChanged } = require('../utils/roundStructure.js');
 const getAllSelectedMatches = async (req, res) => {
   try {
     const userId = req.session.userId;
+    // Polled by several dashboard/desktop windows; one row per round the
+    // account ever selected in, so drop the fields nobody reads.
     const selectedMatches = await MatchSelection.find({ isSelected: true, userId })
+      .select('tournamentId roundId matchId isSelected isPollingActive')
+      .lean()
       .populate({
         path: 'roundId',
         select: 'apiEnable roundName'

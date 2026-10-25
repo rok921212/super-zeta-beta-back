@@ -42,8 +42,19 @@ function bulkCacheKey(req) {
 // a mount/reconnect seed anyway (the socket delta stream + joinRoundRoom
 // hydration correct them within ~2s), and a manual dashboard edit still
 // clears this key immediately via invalidateScope('round:<tid>:<rid>').
+// X-Bulk-Shape: the canonical view this response is byte-identical to. The
+// desktop relay keys its own cache on it, so ~25 overlay views cost ~11 cloud
+// requests per refresh instead of one each. Set before the cache middleware so
+// cache hits carry it too.
+const exposeBulkShape = (req, res, next) => {
+  const v = req.query.view;
+  if (typeof v === 'string' && v) res.setHeader('X-Bulk-Shape', canonicalBulkView(v));
+  next();
+};
+
 router.get(
   '/bulk/:tournamentId/:roundId/:matchId',
+  exposeBulkShape,
   msgpackCacheMiddleware(20, req => `round:${req.params.tournamentId}:${req.params.roundId}`, bulkCacheKey),
   getBulkData
 );

@@ -361,9 +361,10 @@ app.get('/api/public/home-showcase', require('./controller/homeShowcase.controll
 // --- PUBLIC ROUTES (No Authentication Required) ---
 const Tournament = require('./models/tournament.model');
 const Match = require('./models/match.model');
+const { publicDocScope } = require('./utils/publicRevision');
 
 // Public tournament data
-app.get('/api/public/tournaments/:tournamentId', cacheMiddleware(), async (req, res) => {
+app.get('/api/public/tournaments/:tournamentId', cacheMiddleware(300, publicDocScope), async (req, res) => {
   try {
     const tournament = await Tournament.findById(req.params.tournamentId);
     if (!tournament) {
@@ -376,7 +377,7 @@ app.get('/api/public/tournaments/:tournamentId', cacheMiddleware(), async (req, 
 });
 
 // Public round data
-app.get('/api/public/tournaments/:tournamentId/rounds/:roundId', cacheMiddleware(), async (req, res) => {
+app.get('/api/public/tournaments/:tournamentId/rounds/:roundId', cacheMiddleware(300, publicDocScope), async (req, res) => {
   try {
     const Round = require('./models/round.model');
     const round = await Round.findById(req.params.roundId);
@@ -390,7 +391,7 @@ app.get('/api/public/tournaments/:tournamentId/rounds/:roundId', cacheMiddleware
 });
 
 // Public match data
-app.get('/api/public/matches/:matchId', cacheMiddleware(), async (req, res) => {
+app.get('/api/public/matches/:matchId', cacheMiddleware(300, publicDocScope), async (req, res) => {
   try {
     const match = await Match.findById(req.params.matchId);
     if (!match) {

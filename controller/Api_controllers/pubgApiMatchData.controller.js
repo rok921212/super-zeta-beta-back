@@ -16,6 +16,7 @@ const { VIEWS_NEEDING_OVERALL, VIEWS_NEEDING_MATCH_DATA, VIEWS_NEEDING_POSITIONA
 const { setSocketWireFormat, clearSocketWireFormat } = require('../../utils/socketFormatRegistry');
 const { emitToRoomSplitByFormat, roomSize, countNonRelaySockets } = require('../../utils/roomEmit');
 const { addWsFanout } = require('../../utils/bwCounters');
+const { wantsZFeed, splitZFeedTargets, deflateFeed } = require('../../utils/hubFeedZlib');
 const wsAccounting = require('../../utils/wsAccounting');
 const { toProtoMatchDataPayload, toProtoOverallDataPayload } = require('../../utils/protobufCodec');
 const { computeChangedTeams, TRACKED_FIELDS, stripPositionalFields, keyframeHashOf } = require('../../utils/matchTeamDiff');
@@ -26,6 +27,7 @@ const { matchDataEpoch, matchSelectionEpoch, rosterEpoch } = require('../../util
 const { monitorEventLoopDelay } = require('perf_hooks');
 const { applyFullSnapshot } = require('../../utils/liveSnapshot');
 const { rankToPlacePoints } = require('../../utils/placePoints');
+const { realPlayerPhoto } = require('../../services/teamDefaults');
 
 // ─── In-Memory Live Match Cache ───────────────────────────────────────────────
 const liveMatchCache = new Map();
@@ -1159,7 +1161,8 @@ function startLiveMatchUpdater() {
           // location stripped to match the user:<id> delta stream (see
           // emitUpdates) — no dashboard consumer renders position off this
           // feed, they read it from the local :10086 PCOB feed.
-          socket.emit('liveMatchUpdate', encodeMsgpack({ ...fullMatch, teams: stripPositionalFields(fullMatch.teams), matchId: hydratedMatchId, seq: currentLiveSeq(cacheKey) }));
+          const encoded = encodeMsgpack({ ...fullMatch, teams: stripPositionalFields(fullMatch.teams), matchId: hydratedMatchId, seq: currentLiveSeq(cacheKey) });
+          socket.emit('liveMatchUpdate', wantsZFeed(socket) ? deflateFeed(encoded) : encoded);
           console.log(c('dim', `[socket] user-room hydration -> ${socket.id} cacheKey=${cacheKey}`));
         }
       };
@@ -2024,7 +2027,10 @@ socket.on('relayPing', (cb) => {
             uId:                   uid,
             playerOpenId:          matchPlayer?.playerOpenId  || grpPlayer?.playerOpenId  || apiPlayer.playerOpenId || '',
             playerName:            liveName || matchPlayer?.playerName?.trim() || grpPlayer?.playerName?.trim() || apiPlayer.playerName,
-            picUrl:                matchPlayer?.picUrl?.trim() || grpPlayer?.photo?.trim() || apiPlayer.picUrl || '',
+            // A real photo wins (per-match override first, then the current
+            // roster); a stored placeholder only when neither has one — else
+            // a photo uploaded after the match data existed never showed.
+            picUrl:                realPlayerPhoto(matchPlayer?.picUrl) || realPlayerPhoto(grpPlayer?.photo) || matchPlayer?.picUrl?.trim() || grpPlayer?.photo?.trim() || apiPlayer.picUrl || '',
             showPicUrl:            '',
             teamIdfromApi:         team.slot,
             location:              apiPlayer.location || { x: 0, y: 0, z: 0 },
@@ -2495,11 +2501,21 @@ socket.on('relayPing', (cb) => {
               // by id, so an absent field just keeps its last-known value.
               const encoded = encodeMsgpack({ ...memoryMatch, teams: stripPositionalFields(changedTeams), matchId: String(selected.matchId), seq });
               console.log(`[bw][emit] liveMatchUpdate (delta) -> ${userRoom}: sockets=${feedTargets.length}/${userTargets.length} teams=${changedTeams.length}/${memoryMatch.teams.length} bytes=${encoded.length}`);
-              io.to(feedTargets).volatile.emit('liveMatchUpdate', encoded);
+              // zfeed hub sockets can't use permessage-deflate (see
+              // utils/hubFeedZlib.js) — they get the same bytes zlib'd.
+              const { plain, z } = splitZFeedTargets(io, feedTargets);
+              if (plain.length > 0) io.to(plain).volatile.emit('liveMatchUpdate', encoded);
+              let zBytes = 0;
+              if (z.length > 0) {
+                const deflated = deflateFeed(encoded);
+                zBytes = deflated.length;
+                io.to(z).volatile.emit('liveMatchUpdate', deflated);
+                console.log(`[bw][emit] liveMatchUpdate (zfeed) -> ${userRoom}: sockets=${z.length} bytes=${encoded.length}->${zBytes}`);
+              }
               // Count this fan-out into [bw][rollup]'s ws_fanout — this
               // direct emit bypasses emitToRoomSplitByFormat, so it was
               // previously invisible there (a ~10x under-report).
-              addWsFanout(encoded.length * feedTargets.length);
+              addWsFanout(encoded.length * plain.length + zBytes * z.length);
             }
           }
 

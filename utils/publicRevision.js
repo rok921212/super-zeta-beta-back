@@ -42,6 +42,24 @@ async function getPublicRev(roundId) {
   }
 }
 
+// The public tournament / round / match documents (index.js) are the same for
+// every caller, so they are cached in one shared scope instead of per user or
+// 'anon': the local relay strips auth, and an 'anon' copy was never cleared by
+// an edit. Tournament and round documents share a scope per tournament; match
+// documents carry no tournament in their URL, so they share one scope.
+const MATCH_DOCS_SCOPE = 'pubdoc:matches';
+const tournamentDocsScope = (tournamentId) => `pubdoc:${tournamentId}`;
+const publicDocScope = (req) =>
+  req.params.matchId ? MATCH_DOCS_SCOPE : tournamentDocsScope(req.params.tournamentId);
+
+async function clearPublicDocs(tournamentId) {
+  try {
+    await Promise.all([invalidateScope(tournamentDocsScope(tournamentId)), invalidateScope(MATCH_DOCS_SCOPE)]);
+  } catch (err) {
+    console.warn('[bw][rev] public document cache clear failed:', err.message);
+  }
+}
+
 function emitInvalidated(io, { tournamentId, roundId, matchId, scope, rev, reason }) {
   if (!io) return;
   try {
@@ -83,6 +101,7 @@ async function bumpRound(io, { tournamentId, roundId, matchId = null, reason, sc
     } catch (err) {
       console.warn('[bw][rev] invalidateScope failed:', err.message);
     }
+    await clearPublicDocs(tid);
 
     emitInvalidated(io, {
       tournamentId: tid,
@@ -109,6 +128,7 @@ async function bumpTournament(io, { tournamentId, reason } = {}) {
   if (!tournamentId) return;
   try {
     await Round.updateMany({ tournamentId }, { $inc: { publicRev: 1 } });
+    await clearPublicDocs(tournamentId);
     const rounds = await Round.find({ tournamentId }).select('_id publicRev').lean();
     for (const r of rounds) {
       publicRevByRound.set(String(r._id), r.publicRev);
@@ -131,4 +151,4 @@ async function bumpTournament(io, { tournamentId, reason } = {}) {
   }
 }
 
-module.exports = { bumpRound, bumpTournament, getPublicRev, publicRevByRound };
+module.exports = { bumpRound, bumpTournament, getPublicRev, publicRevByRound, publicDocScope };

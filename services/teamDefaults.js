@@ -24,8 +24,12 @@ let memo = null; // { at, doc }
 // default + retired defaults). Refreshed on each settings read so the
 // synchronous realTeamFlag() below can be used from MatchData copy code.
 let defaultFlags = new Set([BUILT_IN.defaultTeamFlag]);
+// Same for player photos: realPlayerPhoto() lets the live merge skip a stored
+// placeholder so a photo uploaded later on the roster still shows.
+let defaultPhotos = new Set([BUILT_IN.defaultPlayerPhoto]);
 const rememberDefaultFlags = (doc) => {
   defaultFlags = new Set([BUILT_IN.defaultTeamFlag, effective(doc).defaultTeamFlag, ...(doc?.retired?.flag || [])].filter(Boolean));
+  defaultPhotos = new Set([BUILT_IN.defaultPlayerPhoto, effective(doc).defaultPlayerPhoto, ...(doc?.retired?.photo || [])].filter(Boolean));
 };
 
 const AppSettings = () => modelFor(getOverlayConnection());
@@ -105,4 +109,10 @@ function realTeamFlag(flag) {
   return v && !defaultFlags.has(v) ? v : '';
 }
 
-module.exports = { BUILT_IN, FIELDS, getTeamDefaults, setTeamDefaults, getDefaultsWithRetired, realTeamFlag };
+// A player photo, or '' when it is empty or only a default placeholder.
+function realPlayerPhoto(photo) {
+  const v = typeof photo === 'string' ? photo.trim() : '';
+  return v && !defaultPhotos.has(v) ? v : '';
+}
+
+module.exports = { BUILT_IN, FIELDS, getTeamDefaults, setTeamDefaults, getDefaultsWithRetired, realTeamFlag, realPlayerPhoto };
