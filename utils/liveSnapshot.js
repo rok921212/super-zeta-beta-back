@@ -20,6 +20,16 @@
 
 const isDeadPlayer = (p) => p?.bHasDied === true || Number(p?.liveState) === 5;
 
+// Player objects a full snapshot lacked and the same-game rule kept. Slot
+// routing trusts the feed's slot for a player the game just reported, but not
+// for one of these: it may be a previous game's squad (utils/slotRouting.js).
+// A WeakSet so no extra field reaches payloads or hashes; a delta or a later
+// snapshot builds a new object, which clears the mark.
+const carriedOver = new WeakSet();
+
+/** Whether the game has not reported this player since a snapshot kept it. */
+const isCarriedOver = (p) => !!p && typeof p === 'object' && carriedOver.has(p);
+
 /** Whether `incoming` (array) continues the game held in `prev` (Map uid → player). */
 function isSameGame(prev, incoming, keyOf) {
   if (!prev || prev.size === 0 || !incoming.length) return false;
@@ -55,6 +65,7 @@ function applyFullSnapshot(prev, incoming, keyOf, opts = {}) {
     for (const [uid, p] of prev) {
       if (!players.has(uid) && isDeadPlayer(p)) {
         players.set(uid, p);
+        carriedOver.add(p);
         keptDead++;
       }
     }
@@ -62,4 +73,4 @@ function applyFullSnapshot(prev, incoming, keyOf, opts = {}) {
   return { players, sameGame, keptDead };
 }
 
-module.exports = { isDeadPlayer, isSameGame, applyFullSnapshot };
+module.exports = { isDeadPlayer, isSameGame, applyFullSnapshot, isCarriedOver };

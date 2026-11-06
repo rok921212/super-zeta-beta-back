@@ -2,7 +2,7 @@
 // same-game snapshot keeps the dead players it lacks, a new game replaces.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { applyFullSnapshot, isSameGame } = require('../utils/liveSnapshot');
+const { applyFullSnapshot, isSameGame, isCarriedOver } = require('../utils/liveSnapshot');
 
 const keyOf = (p) => (p.uId != null ? String(p.uId) : null);
 const p = (uId, killNum, dead = false) => ({ uId, killNum, liveState: dead ? 5 : 0, bHasDied: dead });
@@ -49,4 +49,16 @@ test('a snapshot marked newMatch drops the old game\'s dead, even when it looks 
   assert.equal(sameGame, false);
   assert.equal(keptDead, 0);
   assert.deepEqual([...players.keys()], ['1', '2']);
+});
+
+test('a kept dead player is carried over until the game reports them again', () => {
+  const prev = mapOf([p(1, 1), p(2, 0, true)]);
+  const { players, keptDead } = applyFullSnapshot(prev, [p(1, 1)], keyOf);
+  assert.equal(keptDead, 1);
+  assert.equal(isCarriedOver(players.get('2')), true);
+  assert.equal(isCarriedOver(players.get('1')), false);
+  // The controller's delta merge builds a new object.
+  assert.equal(isCarriedOver({ ...players.get('2'), health: 0 }), false);
+  const next = applyFullSnapshot(players, [p(1, 1), p(2, 0, true)], keyOf);
+  assert.equal(isCarriedOver(next.players.get('2')), false, 'in the snapshot again');
 });

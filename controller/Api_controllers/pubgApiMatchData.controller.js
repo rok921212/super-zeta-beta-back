@@ -25,7 +25,7 @@ const { getPublicRev, bumpRound } = require('../../utils/publicRevision');
 const MatchModel = require('../../models/match.model');
 const { matchDataEpoch, matchSelectionEpoch, rosterEpoch } = require('../../utils/writeEpoch');
 const { monitorEventLoopDelay } = require('perf_hooks');
-const { applyFullSnapshot } = require('../../utils/liveSnapshot');
+const { applyFullSnapshot, isCarriedOver } = require('../../utils/liveSnapshot');
 const { buildRosterOwners, slotPlayersForTeam } = require('../../utils/slotRouting');
 
 // Matches already warned about two teams sharing a slot number.
@@ -2031,11 +2031,13 @@ socket.on('relayPing', (cb) => {
     // trigger an emit every tick.
     let unmatchedSetChanged = false;
 
-    // Slot routing guard (utils/slotRouting.js): another team's roster
-    // players never land on this slot, own roster first, newest first — so
-    // a previous game's squad or a shared slot number can't fake an
-    // elimination and hand over its rank as place points.
+    // Slot routing guard (utils/slotRouting.js): a team sharing this slot
+    // number or a carried-over dead player can't land on it, own roster
+    // first, newest first — so neither can fake an elimination and hand over
+    // its rank as place points. A player the game reports here this game
+    // stays, even if an old roster elsewhere still lists them.
     const rosterOwnerByUid = buildRosterOwners(teamGroupPlayers, normalizeId);
+    const slotByTeamId = new Map(matchData.teams.map(t => [String(t.teamId), Number(t.slot)]));
     const liveOrder = new Map(apiPlayers.map((p, i) => [p, i]));
 
     // Two teams on one slot number can only be told apart by roster uids;
@@ -2063,6 +2065,8 @@ socket.on('relayPing', (cb) => {
         ownTeamId: team.teamId,
         groupPlayers,
         rosterOwners: rosterOwnerByUid,
+        slotByTeamId,
+        isCarriedOver,
         liveOrder,
         normalizeId,
         normalizeName: normalizeNameForMatch,
