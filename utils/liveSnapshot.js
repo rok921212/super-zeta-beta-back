@@ -11,6 +11,12 @@
 // Rule: a full snapshot of the SAME game keeps the dead players it lacks. Any
 // sign of a different game (no player in common, a kill count gone down, a
 // dead player alive again) replaces the map outright, as before.
+//
+// A snapshot the desktop marks `newMatch` (fetcher.rs, on its confirmed
+// kill-count reset) always replaces the map. The guess alone was fooled at a
+// match boundary: the first zero-kill tick arrives as a delta that resets the
+// shared players' kills, so the next full snapshot looked like the same game
+// and kept the old game's dead squads, on slots nobody plays this game.
 
 const isDeadPlayer = (p) => p?.bHasDied === true || Number(p?.liveState) === 5;
 
@@ -34,10 +40,11 @@ function isSameGame(prev, incoming, keyOf) {
 
 /**
  * The player map after a full (non-stale) snapshot.
+ * @param {{ newMatch?: boolean }} [opts] newMatch: the desktop says this roster starts a new game.
  * @returns {{ players: Map, sameGame: boolean, keptDead: number }}
  */
-function applyFullSnapshot(prev, incoming, keyOf) {
-  const sameGame = isSameGame(prev, incoming, keyOf);
+function applyFullSnapshot(prev, incoming, keyOf, opts = {}) {
+  const sameGame = !opts.newMatch && isSameGame(prev, incoming, keyOf);
   const players = new Map();
   for (const p of incoming) {
     const uid = keyOf(p);

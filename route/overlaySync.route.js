@@ -8,6 +8,7 @@ router.get('/', requireAuth, overlaySyncController.getOverlaySync);
 router.put('/', requireAuth, overlaySyncController.setOverlaySync);
 router.delete('/', requireAuth, overlaySyncController.clearOverlaySync);
 router.post('/page', requireAuth, overlaySyncController.sendOverlayPage);
+router.put('/logo-flag', requireAuth, overlaySyncController.setLogoFlag);
 
 // Overlay side — mounted at /api/public, so it rides the local relay's public
 // proxy like /api/public/bulk does.

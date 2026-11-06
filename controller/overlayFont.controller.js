@@ -110,9 +110,18 @@ function createOverlayFontController(store) {
      */
     file: wrap(async (req, res) => {
       if (!OBJECT_ID_RE.test(req.params.id || '')) return res.status(404).json({ message: 'Font not found' });
+      // The id names the bytes for good, so it is the ETag: a browser that
+      // still has the file is answered 304 without reading it from the store.
+      const etag = `"font-${req.params.id.toLowerCase()}"`;
+      if (req.get('If-None-Match') === etag) {
+        res.set('ETag', etag);
+        res.set('Cache-Control', 'public, max-age=31536000, immutable');
+        return res.status(304).end();
+      }
       const font = await store.getFile(req.params.id);
       if (!font) return res.status(404).json({ message: 'Font not found' });
       res.set('Content-Type', 'font/woff2');
+      res.set('ETag', etag);
       res.set('Cache-Control', 'public, max-age=31536000, immutable');
       res.removeHeader('Pragma');
       res.removeHeader('Expires');

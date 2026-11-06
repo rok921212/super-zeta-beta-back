@@ -40,6 +40,16 @@ const userSchema = new mongoose.Schema({
     }, { _id: false }),
     select: false,
   },
+  // SWITCH FLAGS on DisplayHud (overlaySync.controller.js setLogoFlag): while
+  // `on`, every theme alternates each team's logo with its flag; off = logo
+  // only. `stamp` (ms) lets an overlay tell a newer answer from an older one.
+  logoFlag: {
+    type: new mongoose.Schema({
+      on: { type: Boolean, default: true },
+      stamp: { type: Number, default: 0 },
+    }, { _id: false }),
+    select: false,
+  },
   // Permanent overlay links: the public id in /public/live/<overlayKey> and
   // /o/<publicId>?k=<overlayKey>. Those links name no tournament or round and
   // render whatever `overlaySync` points at. Created the first time permanent

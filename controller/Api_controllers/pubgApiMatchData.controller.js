@@ -26,6 +26,18 @@ const MatchModel = require('../../models/match.model');
 const { matchDataEpoch, matchSelectionEpoch, rosterEpoch } = require('../../utils/writeEpoch');
 const { monitorEventLoopDelay } = require('perf_hooks');
 const { applyFullSnapshot } = require('../../utils/liveSnapshot');
+const { buildRosterOwners, slotPlayersForTeam } = require('../../utils/slotRouting');
+
+// Matches already warned about two teams sharing a slot number.
+const warnedDuplicateSlotMatches = new Set();
+
+// "<boot hex>:<n>" from fetcher.rs's game_epoch(); null when absent/malformed
+// (older desktop builds don't send it).
+function parseGameEpoch(raw) {
+  if (typeof raw !== 'string') return null;
+  const m = /^([0-9a-f]+):([0-9]+)$/i.exec(raw);
+  return m ? { boot: m[1], n: Number(m[2]) } : null;
+}
 const { rankToPlacePoints } = require('../../utils/placePoints');
 const { realPlayerPhoto } = require('../../services/teamDefaults');
 
@@ -1353,6 +1365,7 @@ function startLiveMatchUpdater() {
       socketId: socket.id,
       lastReceivedSeq: null,
       players: existing?.players ?? new Map(),
+      gameEpoch: existing?.gameEpoch ?? null,
     });
     // A genuine (re)connect — not the keepalive re-emit above. Arm a
     // one-shot autosave so the first tick this relay actually processes
@@ -1465,6 +1478,13 @@ socket.on('relayPing', (cb) => {
       // back-compat during a mixed-version rollout, regardless of
       // data.isFull's value.
       const isFull = data?.isFull === true || wireSeq === null;
+      // fetcher.rs stamps every full snapshot with "<boot>:<n>"; n goes up
+      // on each new match. Same boot + different n = a new game, even when
+      // the one newMatch:true snapshot was superseded/paused/retried away.
+      // A different boot (desktop app restarted) proves nothing — left to
+      // applyFullSnapshot's own same-game check.
+      const epoch = parseGameEpoch(data?.gameEpoch);
+      const sameBoot = !!(epoch && state.gameEpoch && epoch.boot === state.gameEpoch.boot);
 
       if (isFull) {
         // Never regress: the pending-retry path on the relay can deliver a
@@ -1481,7 +1501,11 @@ socket.on('relayPing', (cb) => {
         // a stale full snapshot only backfills players not already known,
         // it never overwrites fresher data.
         const isStaleFull = wireSeq != null && state.lastReceivedSeq != null && wireSeq < state.lastReceivedSeq;
-        if (isStaleFull) {
+        if (isStaleFull && sameBoot && epoch.n !== state.gameEpoch.n) {
+          // A late retry from another game — backfilling would put that
+          // game's players back on this game's slots (ghost eliminations).
+          console.debug(`[socket] stale full snapshot from game ${epoch.n} (now ${state.gameEpoch.n}) user=${userId} — ignored`);
+        } else if (isStaleFull) {
           for (const p of incomingPlayers) {
             const uid = playerKeyOf(p);
             if (uid != null && !state.players.has(uid)) state.players.set(uid, p);
@@ -1491,8 +1515,10 @@ socket.on('relayPing', (cb) => {
           // Same game: keep the dead players the snapshot lacks (PCOB drops
           // them, and a restarted desktop relay has not seen them). A new
           // game replaces the map outright (utils/liveSnapshot.js).
-          const { players, sameGame, keptDead } = applyFullSnapshot(state.players, incomingPlayers, playerKeyOf);
+          const epochNewGame = sameBoot && epoch.n !== state.gameEpoch.n;
+          const { players, sameGame, keptDead } = applyFullSnapshot(state.players, incomingPlayers, playerKeyOf, { newMatch: data?.newMatch === true || epochNewGame });
           state.players = players;
+          if (epoch) state.gameEpoch = epoch;
           if (keptDead > 0) {
             console.log(c('cyan', `[live][snapshot] user=${userId} same-game full snapshot kept ${keptDead} dead player(s) it lacked`));
           } else if (!sameGame && players.size > 0) {
@@ -1980,12 +2006,42 @@ socket.on('relayPing', (cb) => {
     // trigger an emit every tick.
     let unmatchedSetChanged = false;
 
+    // Slot routing guard (utils/slotRouting.js): another team's roster
+    // players never land on this slot, own roster first, newest first — so
+    // a previous game's squad or a shared slot number can't fake an
+    // elimination and hand over its rank as place points.
+    const rosterOwnerByUid = buildRosterOwners(teamGroupPlayers, normalizeId);
+    const liveOrder = new Map(apiPlayers.map((p, i) => [p, i]));
+
+    // Two teams on one slot number can only be told apart by roster uids;
+    // say so once per match so the operator can fix the slots.
+    if (!warnedDuplicateSlotMatches.has(String(matchId))) {
+      const slotOwners = new Map();
+      for (const t of matchData.teams) {
+        const slot = Number(t.slot);
+        if (slotOwners.has(slot)) {
+          warnedDuplicateSlotMatches.add(String(matchId));
+          console.warn(c('yellow', `[live][slots] match=${matchId} slot ${slot} is used by two teams (${slotOwners.get(slot)} and ${t.teamName || t.teamId}) — live players are routed by roster uid only`));
+          break;
+        }
+        slotOwners.set(slot, t.teamName || String(t.teamId));
+      }
+    }
+
     for (const team of matchData.teams) {
       const newTeamPlayers = [];
       const usedUIds = new Set();
 
       const groupPlayers = teamGroupPlayers.get(String(team.teamId)) || [];
-      const teamApiPlayers = apiPlayersByTeamId.get(Number(team.slot)) || [];
+      const teamApiPlayers = slotPlayersForTeam({
+        slotPlayers: apiPlayersByTeamId.get(Number(team.slot)),
+        ownTeamId: team.teamId,
+        groupPlayers,
+        rosterOwners: rosterOwnerByUid,
+        liveOrder,
+        normalizeId,
+        normalizeName: normalizeNameForMatch,
+      });
       const matchDataByUid = new Map((team.players || []).map(p => [normalizeId(p.uId), p]));
 
       for (const apiPlayer of teamApiPlayers) {

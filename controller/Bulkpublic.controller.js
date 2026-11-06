@@ -24,6 +24,9 @@ const { aggregateOverallTeams } = require('./overall.controller');
 const { VIEWS_NEEDING_OVERALL, VIEWS_NEEDING_MATCH_DATA } = require('../utils/viewDataTiers');
 const VIEWS_NEEDING_MATCHES_LIST = new Set([
   'Lower', 'Schedule', 'HighlightSchedule', 'OverAllData', 'OverallFrags', 'highlightPoints', 'EventMvp',
+  // Up Next picks the match after the current one from this list; without
+  // it the view always said "No upcoming match".
+  'CommingUpNext',
 ]);
 const VIEWS_NEEDING_ALL_MATCH_DATAS = new Set([
   'Schedule', 'highlightPoints', 'HighlightSchedule', 'OverAllData', 'OverallFrags',
@@ -105,7 +108,8 @@ const VIEW_PLAYER_TIER = {
   mapPreview: 'identity',
 
   Alerts: 'light',
-  LiveFrags: 'light',
+  // mid: the ranking tiebreaks need damage, knockouts and assists.
+  LiveFrags: 'mid',
   Recall: 'light',
   LiveData: 'light',
 

@@ -38,3 +38,15 @@ test('a new game replaces the map: kills down, dead alive again, or no player in
 test('an empty previous map is not the same game', () => {
   assert.equal(isSameGame(new Map(), [p(1, 0)], keyOf), false);
 });
+
+test('a snapshot marked newMatch drops the old game\'s dead, even when it looks like the same game', () => {
+  // The first zero-kill tick already arrived as a delta, so the shared
+  // players look unchanged; slot 8's squad from the old game is all dead.
+  const prev = mapOf([p(1, 0), p(2, 0), { ...p(80, 0, true), teamId: 8 }, { ...p(81, 0, true), teamId: 8 }]);
+  const incoming = [p(1, 0), p(2, 0)];
+  assert.equal(applyFullSnapshot(prev, incoming, keyOf).keptDead, 2, 'without the mark the guess keeps them');
+  const { players, sameGame, keptDead } = applyFullSnapshot(prev, incoming, keyOf, { newMatch: true });
+  assert.equal(sameGame, false);
+  assert.equal(keptDead, 0);
+  assert.deepEqual([...players.keys()], ['1', '2']);
+});

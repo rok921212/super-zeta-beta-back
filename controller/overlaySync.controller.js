@@ -78,21 +78,29 @@ function publicShape(sync) {
 // Every round an overlay of this account could be sitting in: rounds it created, rounds of the
 // tournaments it owns (a round made by someone else, or before createdBy existed, still counts),
 // and the round its links showed until now (`previous`), whoever owns it.
+async function controlRoomsOf(userId, previous = null) {
+  const owned = await Tournament.find({ userId }).select('_id').lean();
+  const rounds = await Round.find({ $or: [{ createdBy: userId }, { tournamentId: { $in: owned.map((t) => t._id) } }] })
+    .select('_id tournamentId').lean();
+  const roomSet = new Set(rounds.map((r) => `round:${r.tournamentId}:${r._id}:control`));
+  if (previous?.tournamentId && previous?.roundId) roomSet.add(`round:${previous.tournamentId}:${previous.roundId}:control`);
+  return [...roomSet];
+}
+
 async function announce(userId, payload, previous = null) {
   try {
-    const owned = await Tournament.find({ userId }).select('_id').lean();
-    const rounds = await Round.find({ $or: [{ createdBy: userId }, { tournamentId: { $in: owned.map((t) => t._id) } }] })
-      .select('_id tournamentId').lean();
-    const roomSet = new Set(rounds.map((r) => `round:${r.tournamentId}:${r._id}:control`));
-    if (previous?.tournamentId && previous?.roundId) roomSet.add(`round:${previous.tournamentId}:${previous.roundId}:control`);
-    if (!roomSet.size) return;
-    const rooms = [...roomSet];
+    const rooms = await controlRoomsOf(userId, previous);
+    if (!rooms.length) return;
     getSocket().to(rooms).emit('publicDataInvalidated', { scope: 'round', reason: 'overlaySync', sync: payload });
     console.log(`[overlay-sync] announced to ${rooms.length} round(s) user=${userId} target=${payload.target ? payload.target.roundId : 'off'}`);
   } catch (err) {
     console.warn('[overlay-sync] announce failed:', err.message);
   }
 }
+
+// SWITCH FLAGS (DisplayHud): whether the themes alternate each team's logo
+// with its flag. Unset = on, the behaviour before the switch existed.
+const logoFlagShape = (lf) => ({ on: lf?.on !== false, stamp: Number(lf?.stamp) || 0 });
 
 // The account's API-enabled round, if it has one.
 const apiRoundOf = (userId) => Round.findOne({ createdBy: userId, apiEnable: true }).select('_id tournamentId').lean();
@@ -116,8 +124,8 @@ async function followApiRound(userId, tournamentId, roundId) {
 
 const getOverlaySync = async (req, res) => {
   try {
-    const user = await User.findById(req.session.userId).select('overlaySync overlayKey').lean();
-    res.json({ ...publicShape(user?.overlaySync), key: user?.overlayKey || null });
+    const user = await User.findById(req.session.userId).select('overlaySync overlayKey logoFlag').lean();
+    res.json({ ...publicShape(user?.overlaySync), key: user?.overlayKey || null, logoFlag: logoFlagShape(user?.logoFlag) });
   } catch (err) {
     console.error('[overlay-sync] get failed:', err);
     res.status(500).json({ message: 'Server error' });
@@ -199,8 +207,8 @@ const resolveOverlaySync = async (req, res) => {
     const tournament = await Tournament.findById(tournamentId).select('userId').lean();
     if (!tournament?.userId) return res.json({ target: null, stamp: 0 });
 
-    const user = await User.findById(tournament.userId).select('overlaySync').lean();
-    res.json(await liveShape(user?.overlaySync));
+    const user = await User.findById(tournament.userId).select('overlaySync logoFlag').lean();
+    res.json({ ...(await liveShape(user?.overlaySync)), logoFlag: logoFlagShape(user?.logoFlag) });
   } catch (err) {
     console.error('[overlay-sync] resolve failed:', err);
     res.status(500).json({ error: err.message });
@@ -214,9 +222,9 @@ const resolveOverlaySyncByKey = async (req, res) => {
     const { key } = req.params;
     if (!KEY_RE.test(String(key))) return res.status(400).json({ error: 'Invalid key' });
 
-    const user = await User.findOne({ overlayKey: key }).select('overlaySync').lean();
+    const user = await User.findOne({ overlayKey: key }).select('overlaySync logoFlag').lean();
     if (!user) return res.json({ target: null, stamp: 0 });
-    res.json(await liveShape(user.overlaySync));
+    res.json({ ...(await liveShape(user.overlaySync)), logoFlag: logoFlagShape(user.logoFlag) });
   } catch (err) {
     console.error('[overlay-sync] resolve by key failed:', err);
     res.status(500).json({ error: err.message });
@@ -274,4 +282,28 @@ const sendOverlayPage = async (req, res) => {
   }
 };
 
-module.exports = { getOverlaySync, setOverlaySync, clearOverlaySync, sendOverlayPage, resolveOverlaySync, resolveOverlaySyncByKey, followApiRound };
+// SWITCH FLAGS (DisplayHud): stored, so an overlay opened later reads it from
+// the resolve answers above, and pushed live to every round of the account
+// as a rev-less `publicDataInvalidated` with reason 'logoFlag'
+// (front/src/Themes/shared/hooks/logoFlagSwitch.ts listens for it).
+const setLogoFlag = async (req, res) => {
+  try {
+    const userId = req.session.userId;
+    if (typeof req.body?.on !== 'boolean') return res.status(400).json({ message: 'on must be true or false' });
+    const logoFlag = { on: req.body.on, stamp: Date.now() };
+    const before = await User.findById(userId).select('overlaySync').lean();
+    await User.updateOne({ _id: userId }, { $set: { logoFlag } });
+    res.json(logoFlag);
+    try {
+      const rooms = await controlRoomsOf(userId, before?.overlaySync);
+      if (rooms.length) getSocket().to(rooms).emit('publicDataInvalidated', { scope: 'round', reason: 'logoFlag', logoFlag });
+    } catch (err) {
+      console.warn('[overlay-sync] logo/flag announce failed:', err.message);
+    }
+  } catch (err) {
+    console.error('[overlay-sync] logo/flag set failed:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+module.exports = { getOverlaySync, setOverlaySync, clearOverlaySync, sendOverlayPage, setLogoFlag, resolveOverlaySync, resolveOverlaySyncByKey, followApiRound };
