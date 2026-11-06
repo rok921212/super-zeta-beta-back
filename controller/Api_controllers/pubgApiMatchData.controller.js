@@ -912,6 +912,31 @@ function emitLiveSnapshot(io, target, memoryMatch, matchId, seq, positional) {
   });
 }
 
+// A manual correction was written to Mongo: apply it to the live copy too (see
+// utils/liveManualEdit.js) and put it on screen, since after the match no tick
+// will. `mutate(teams)` returns the new teams. Does nothing for a match with no
+// live copy. Only the selected match is pushed: the round's rooms show that one.
+async function patchLiveMatch({ matchId, userId, tournamentId, roundId }, mutate) {
+  const cacheKey = `${String(userId)}:${String(matchId)}`;
+  const entry = liveMatchCache.get(cacheKey);
+  if (!entry || !Array.isArray(entry.teams)) return false;
+  const patched = { ...entry, teams: mutate(entry.teams) };
+  liveMatchCache.set(cacheKey, patched);
+  // The next keyframe must go out even if this edit is all that changed.
+  lastKeyframeHashByUserMatch.delete(cacheKey);
+
+  if (!tournamentId || !roundId) return true;
+  const selected = await MatchSelection.exists({ matchId, userId, isSelected: true });
+  if (!selected) return true;
+  const io = getSocket();
+  const seq = currentLiveSeq(cacheKey);
+  const room = `round:${tournamentId}:${roundId}:matchData`;
+  const positionalRoom = `round:${tournamentId}:${roundId}:matchDataPositional`;
+  if (roomSize(io, room) > 0) emitLiveSnapshot(io, room, patched, matchId, seq, false);
+  if (roomSize(io, positionalRoom) > 0) emitLiveSnapshot(io, positionalRoom, patched, matchId, seq, true);
+  return true;
+}
+
 // Full-roster catch-up send to ONE socket from liveMatchCache — shared by
 // joinRoundRoom (instant hydration, deduped per socket+match+tier via
 // hydratedMatches) and requestLiveSnapshot (force: the client detected a gap
@@ -2767,4 +2792,4 @@ socket.on('relayPing', (cb) => {
   setInterval(discoverAndStartPollingUsers, 60000);
 }
 
-module.exports = { startLiveMatchUpdater, getUnmatchedPlayers, markUserActiveForPolling, markUserInactiveForPolling, saveLiveMatchSnapshot, getLiveMatchData, getLiveTickStats };
+module.exports = { startLiveMatchUpdater, getUnmatchedPlayers, markUserActiveForPolling, markUserInactiveForPolling, saveLiveMatchSnapshot, getLiveMatchData, getLiveTickStats, patchLiveMatch };

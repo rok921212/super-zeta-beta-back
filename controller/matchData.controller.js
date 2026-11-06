@@ -18,6 +18,9 @@ const { stripPositionalFields } = require('../utils/matchTeamDiff');
 const { bumpRound } = require('../utils/publicRevision');
 const { notifyRoundStructureChanged } = require('../utils/roundStructure');
 const { getTeamDefaults, realTeamFlag } = require('../services/teamDefaults');
+const {
+  editLiveTeam, editLivePlayer, editLiveTeamPlayers, addLivePlayers, removeLivePlayers,
+} = require('../utils/liveManualEdit');
 
 // ─── Shared player-template builder ───────────────────────────────────────────
 // Was previously copy-pasted 3x (create / replace / add) with small drifts
@@ -87,6 +90,14 @@ function toObjectIdOrNull(id) {
 }
 function matchesTeamId(team, teamId) {
   return String(team._id) === String(teamId) || String(team.teamId) === String(teamId);
+}
+
+// Carries a manual correction over to the live match. The edit is already saved
+// by now, so a failure here is logged and never fails the request.
+function patchLive(ids, mutate) {
+  // Lazy require: the live controller loads modules that load this file.
+  const { patchLiveMatch } = require('./Api_controllers/pubgApiMatchData.controller.js');
+  patchLiveMatch(ids, mutate).catch((err) => console.warn('[patchLive]', err.message));
 }
 
 // ─── In-memory per-resource update lock (unchanged behavior, shared helper) ──
@@ -680,6 +691,13 @@ const updateTeamPoints = async (req, res) => {
     // secondary "overall standings" recompute below.
     res.json({ message: 'Team placePoints updated', matchDataId, teamId, changes: { placePoints } });
 
+    patchLive({ matchId, userId, tournamentId: req.params.tournamentId, roundId: req.params.roundId }, (teams) =>
+      editLiveTeam(teams, teamId, (team) => ({
+        ...team,
+        placePoints,
+        placePointsLocked: unlock !== true,
+        ...(typeof rank === 'number' ? { rank } : {}),
+      })));
     emitOverallUpdateAsync(io, matchId, userId, result);
     bumpRound(io, {
       tournamentId: req.params.tournamentId,
@@ -872,6 +890,14 @@ const updatePlayerStats = async (req, res) => {
 
     res.json({ message: 'Player stats updated', player });
 
+    // updates.killNum is Mongo's count, which can be behind the live one.
+    const { killNum: _mongoKillNum, ...liveFields } = updates;
+    if (updateData.killNumChange === undefined && updateData.killNum !== undefined) liveFields.killNum = player.killNum;
+    patchLive({ matchId, userId, tournamentId: req.params.tournamentId, roundId: req.params.roundId }, (teams) =>
+      editLivePlayer(teams, teamId, { playerId, uId: player.uId }, {
+        fields: liveFields,
+        killNumChange: updateData.killNumChange !== undefined ? Number(updateData.killNumChange) || 0 : undefined,
+      }));
     emitOverallUpdateAsync(io, matchId, userId, updated);
     bumpRound(io, {
       tournamentId: req.params.tournamentId,
@@ -952,6 +978,8 @@ const updateTeamPlayersBulkStats = async (req, res) => {
 
     res.json({ message: 'Team players updated', teamId, bHasDied });
 
+    patchLive({ matchId, userId, tournamentId: req.params.tournamentId, roundId: req.params.roundId }, (teams) =>
+      editLiveTeamPlayers(teams, teamId, { bHasDied }));
     emitOverallUpdateAsync(io, matchId, userId, result);
     bumpRound(io, {
       tournamentId: req.params.tournamentId,
@@ -1089,9 +1117,8 @@ const addPlayersToTeamInMatchData = async (req, res) => {
       return res.status(400).json({ error: 'All players are already in the team or invalid' });
     }
 
-    playersToAdd.forEach(newPlayer => {
-      team.players.push(buildFreshPlayer(newPlayer, team.slot, team.teamName));
-    });
+    const freshPlayers = playersToAdd.map(newPlayer => buildFreshPlayer(newPlayer, team.slot, team.teamName));
+    team.players.push(...freshPlayers);
 
     matchData.markModified('teams');
     await matchData.save();
@@ -1100,6 +1127,9 @@ const addPlayersToTeamInMatchData = async (req, res) => {
     console.log(`[socket] matchDataUpdated -> user:${req.session.userId} team=${teamId} added`);
     io.to(`user:${req.session.userId}`).emit('matchDataUpdated', { matchDataId, teamId, changes: { players: team.players } });
 
+    patchLive({
+      matchId: matchData.matchId, userId: req.session.userId, tournamentId: match.tournamentId, roundId: match.roundId,
+    }, (teams) => addLivePlayers(teams, teamId, freshPlayers));
     bumpRound(io, {
       tournamentId: match.tournamentId,
       roundId: match.roundId,
@@ -1140,6 +1170,9 @@ const removePlayersFromTeamInMatchData = async (req, res) => {
     const team = matchData.teams.find(t => matchesTeamId(t, teamId));
     if (!team) return res.status(404).json({ error: 'Team not found in this MatchData' });
 
+    const removedPlayers = team.players
+      .filter(p => playerIds.includes(p._id.toString()))
+      .map(p => ({ _id: p._id, uId: p.uId }));
     team.players = team.players.filter(p => !playerIds.includes(p._id.toString()));
 
     matchData.markModified('teams');
@@ -1151,6 +1184,9 @@ const removePlayersFromTeamInMatchData = async (req, res) => {
     console.log(`[socket] matchDataUpdated -> user:${req.session.userId} team=${teamId} removed`);
     io.to(`user:${req.session.userId}`).emit('matchDataUpdated', { matchDataId, teamId, changes: { players: team.players } });
 
+    patchLive({
+      matchId: matchData.matchId, userId: req.session.userId, tournamentId: match?.tournamentId, roundId: match?.roundId,
+    }, (teams) => removeLivePlayers(teams, teamId, removedPlayers));
     if (match) {
       bumpRound(io, {
         tournamentId: match.tournamentId,
